@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+.npm-cache/
+
+# 运行时数据：账号凭据、API Key、用量库
+# ⚠️ 绝不能提交：内含 refresh token 等账号凭证
+data/
+*.log
+
+# 本地工具的临时产物（如 AI 会话草稿 .zcode/plans/），非项目源码
+.zcode/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
