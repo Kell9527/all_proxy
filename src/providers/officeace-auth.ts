@@ -319,8 +319,16 @@ async function fetchModelInfo(credential: OfficeAceCredential): Promise<void> {
   const j = JSON.parse(text) as PermissionResponse
   const modelInfo = j.subscription?.model_info
   const auth = modelInfo?.model_auth_info
-  if (typeof auth?.model_app_key !== 'string' || typeof auth?.model_app_secret !== 'string') {
-    throw new Error('华为云未返回 MaaS 凭据（账号可能未订阅 ModelArts MaaS）')
+  if (typeof auth?.model_app_key !== 'string' || typeof auth.model_app_secret !== 'string') {
+    // ⚠️ 2026-10-14 用户连续三次报障「授权成功但账号没加进来」的真相：
+    // 他用**另一个华为账号**授权，授权与 token 交换都成功，但这个账号
+    // **没有开通 ModelArts MaaS** ⇒ permission-validate 不下发推理凭据。
+    // 文案必须讲清「是什么 + 怎么办」，否则用户只会反复重试同一个账号。
+    throw new Error(
+      '华为云未返回 MaaS 推理凭据 —— 该华为账号尚未开通 ModelArts MaaS'
+      + '（OfficeAce 的推理走 ModelArts MaaS）。请在华为云控制台开通后重试，'
+      + '或换一个已开通的华为账号。',
+    )
   }
   credential.modelAppKey = auth.model_app_key
   credential.modelAppSecret = auth.model_app_secret

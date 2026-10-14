@@ -164,6 +164,15 @@ UTC+8 当日 24:00）。
   链接提示与判重提示的文案（用户看不到区别就会一直困惑）。另：`completeLogin`
   成功后 `cancelled`（会话被 TTL 取消/服务重启）时必须留痕，静默丢弃凭据会把
   「授权成功但账号没进来」变成无头案。
+  **「另一个账号也加不进来」的真相**（2026-10-14 用户三次报障，`err.log` 实证）：
+  授权与 token 交换都成功，但 `fetchModelInfo` 拿不到 `model_app_key/secret` ——
+  **那个华为账号没有开通 ModelArts MaaS**（OfficeAce 的推理走 MaaS）。后端早
+  就明确 reject 了，是**前端把失败吞了**（rpc-bridge 的 `login.poll` 对业务
+  failed 用 throw，而 `createAccount` 的 catch 静默继续轮询）⇒ 用户只看到华为
+  云「欢迎使用」页和沉默的界面。已修：业务失败返回 `failed` 标记（不再 throw）、
+  前端停损并显示原因；`fetchModelInfo` 的错误文案讲清「未开通 + 怎么办」。
+  ⚠️ 排查这类问题的顺序：先看 `data/run/all-proxy.out.log` / `all-proxy.err.log`
+  （console 日志走 stdout，proxy.bat 只重定向 out/err 两个文件，**warn 在 out**）。
 - **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
   `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts` / **`accio-credits.ts`**）：
   标准 OAuth 2.0 + **PKCE**（回调落本项目自己的 loopback），推理是 **Gemini 族协议**
@@ -187,7 +196,7 @@ UTC+8 当日 24:00）。
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
 `login-window-policy` / `officeace-dedupe` / `officeace-login`）。
-当前 **139 个文件 3280 条用例**（2026-10-14 实测；其中
+当前 **139 个文件 3282 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 

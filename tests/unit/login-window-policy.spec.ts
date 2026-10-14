@@ -106,3 +106,34 @@ describe('授权等待时长（源码级断言）', () => {
     expect(hubSource).toContain('等待已超时（30 分钟），此链接已失效')
   })
 })
+
+describe('登录失败必须停损并显示（源码级断言）', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const hubSource = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+  const bridgeSource = readFileSync(resolve(here, '../../web/src/rpc-bridge.js'), 'utf8')
+
+  it('rpc-bridge 的业务失败返回标记而不是 throw', () => {
+    // 2026-10-14 用户连续三次报障「授权成功但账号没加进来」的真相：
+    // 另一个华为账号没开通 ModelArts MaaS，后端明确 reject 了，但这里
+    // throw 之后被 createAccount 的 catch 静默吞掉，用户只看到沉默。
+    expect(bridgeSource).toContain("failed: true")
+    expect(bridgeSource).not.toContain("if (r.status === 'failed') throw new Error")
+    // 会话不存在（重启/超时）也是终态：转成 failed 标记，别每秒重放 404
+    expect(bridgeSource).toContain('登录会话不存在')
+  })
+
+  it('createAccount 收到 failed 后停损（停轮询）+ 显示原因', () => {
+    const start = hubSource.indexOf('const createAccount = async (region)')
+    expect(start).toBeGreaterThan(-1)
+    const body = hubSource.slice(start, hubSource.indexOf('\n  };', start))
+    expect(body).toContain('pollRes.failed === true')
+    // 停损：清掉轮询与计时器（不能继续轮到一个已失败的会话）
+    const failIndex = body.indexOf('pollRes.failed === true')
+    const afterFail = body.slice(failIndex, failIndex + 1200)
+    expect(afterFail).toContain('clearInterval(pollTimer)')
+    expect(afterFail).toContain('clearInterval(waitTicker)')
+    // 显示：错误原因 + 可操作的下一步
+    expect(afterFail).toContain('登录失败')
+    expect(afterFail).toContain('新建账号')
+  })
+})

@@ -85,8 +85,30 @@ export function createRpcBridge() {
         }, signal)
       }
       case 'login.poll': {
-        const r = await post('/api/login/poll', { sessionId: payload.accountId }, signal)
-        if (r.status === 'failed') throw new Error(r.message || '登录失败')
+        let r;
+        try {
+          r = await post('/api/login/poll', { sessionId: payload.accountId }, signal)
+        } catch (caught) {
+          // ⚠️ 会话不存在（服务重启 / 已超时清理）是**终态**：返回 failed 标记
+          // 让调用方停损，而不是每秒重放一个必然 404 的请求直到前端超时。
+          // 网络抖动才 throw 给调用方静默重试（两者必须分开）。
+          const message = caught?.message || '';
+          if (message.includes('登录会话不存在')) {
+            return {
+              done: false,
+              failed: true,
+              message: '登录会话已过期（服务可能重启过），请重新点「+ 新建账号」。',
+              reused: false,
+            };
+          }
+          throw caught;
+        }
+        // 业务失败（如「华为云未返回 MaaS 凭据」）**不 throw**：返回标记让
+        // 调用方停损并显示原因。早期这里 throw，而调用方 catch 里静默继续
+        // 轮询 ⇒ 用户看到的是沉默（报障「授权成功但账号没加进来」的形态）。
+        if (r.status === 'failed') {
+          return { done: false, failed: true, message: r.message || '登录失败', reused: false };
+        }
         // reused：判重命中（该账号已在池中，未新建条目）——前端据此提示，
         // 否则用户登完发现账号没多一个，会以为操作失败了。
         return { done: r.status === 'done', account: r.account, reused: r.reused === true }

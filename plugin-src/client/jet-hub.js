@@ -1616,8 +1616,25 @@ function ProviderPanel({ provider, rpcCall }) {
                 });
               }
               await loadAccounts();
+            } else if (pollRes.failed === true) {
+              // ⚠️ 后端明确失败（如「华为云未返回 MaaS 凭据」）必须**停损并
+              // 显示原因**。早期这里静默继续轮询，用户对着沉默的界面等到
+              // 超时，只会看到华为云的「欢迎使用」页，完全不知道真正原因
+              // （2026-10-14 用户连续三次报障「授权成功但账号没加进来」，
+              // 真相是另一个账号没开通 ModelArts MaaS，错误一直被吞）。
+              clearInterval(pollTimer);
+              clearInterval(waitTicker);
+              pollTimer = undefined;
+              waitTicker = undefined;
+              setLoginUrlForManual(null);
+              setWaitSeconds(0);
+              setProbeNotice({
+                tone: 'error',
+                text: `登录失败：${pollRes.message || '未知原因'}`,
+                details: ['可修正后重新点「+ 新建账号」再试（每次都会生成新的授权链接）。'],
+              });
             }
-          } catch { /* 继续轮询 */ }
+          } catch { /* 网络抖动：继续轮询 */ }
         }, 1000);
         // 「已等待」计时器：让用户知道服务端还在等（授权链可能几分钟）。
         let waitTicker = setInterval(() => {
