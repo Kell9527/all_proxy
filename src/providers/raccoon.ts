@@ -32,6 +32,15 @@ export const RACCOON_LLM_PREFIX = '/api/web/llm/v2'
 export const RACCOON_POINTS_PREFIX = '/api/web/points/v1'
 /** 桌面端端点前缀（含一次性登录奖励）。 */
 export const RACCOON_DESKTOP_PREFIX = '/api/web/desktop/v1'
+/**
+ * 个人版「办公」端点前缀（`setting_info` 等）。
+ *
+ * ⚠️ 与 `RACCOON_AUTH_PREFIX` 分开：`setting_info` 挂在 **office** 下而不是
+ * auth 下（客户端模块 79746 的 `e9()` 拼的就是 `/api/web/office/v3`，
+ * 团队版则换成 `/api/web/org`）。个人账号实测 `GET …/office/v3/setting_info`
+ * 返回 200。
+ */
+export const RACCOON_OFFICE_PREFIX = '/api/web/office/v3'
 
 /**
  * 手机号传输层加密密钥。

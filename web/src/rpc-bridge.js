@@ -71,6 +71,15 @@ export function createRpcBridge() {
         }, signal)
         return { accountId: r.sessionId, loginUrl: r.loginUrl ?? '', userCode: r.userCode }
       }
+      case 'account.addKey': {
+        // 静态 API Key 建号（仅 SenseNova 等）：直接写凭据 + 落账号，无登录。
+        // ⚠️ apiKey 明文只在本次请求体里出现，返回体不含它（见后端 /api/accounts）。
+        return post('/api/accounts', {
+          provider: payload.provider,
+          apiKey: payload.apiKey,
+          ...(payload.nickname ? { nickname: payload.nickname } : {}),
+        }, signal)
+      }
       case 'login.poll': {
         const r = await post('/api/login/poll', { sessionId: payload.accountId }, signal)
         if (r.status === 'failed') throw new Error(r.message || '登录失败')
@@ -145,6 +154,9 @@ export function createRpcBridge() {
         return post('/api/credits/claim-all', { provider: payload.provider }, signal)
       case 'onboarding.claim':
         return post('/api/credits/onboarding', { provider: payload.provider, accountId: payload.accountId }, signal)
+      case 'credits.dailyKeepalive':
+        // 每日积分保活（仅 raccoon）：模拟「当日登录」把每日积分有效期延长到 7 天。
+        return post('/api/credits/daily-keepalive', { provider: payload.provider }, signal)
       default:
         throw new Error(`未知管理方法: ${method}`)
     }

@@ -12,6 +12,14 @@ data/
 # 本地工具的临时产物（如 AI 会话草稿 .zcode/plans/），非项目源码
 .zcode/
 
+# 本地排查草稿：git 输出转储、来源仓库文件副本、编辑器备份包
+.tmp-st.txt
+out_*.txt
+out_base_methods.txt
+base_account_pool.ts
+head_account_pool.ts
+.recovery/
+
 # 编辑器
 .idea/
 .vscode/

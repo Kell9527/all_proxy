@@ -2,7 +2,7 @@
   "name": "all-proxy",
   "version": "0.1.0",
   "private": true,
-  "description": "all_proxy — 把 10 个 AI 平台账号聚合成标准 OpenAI / Anthropic 兼容 API 的本地网关（含网页管理端）",
+  "description": "all_proxy — 把 11 个 AI 平台账号聚合成标准 OpenAI / Anthropic 兼容 API 的本地网关（含网页管理端）",
   "type": "module",
   "main": "dist/index.js",
   "exports": {

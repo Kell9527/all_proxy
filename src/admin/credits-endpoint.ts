@@ -42,7 +42,13 @@ import { LOOMY_TASK_TITLES, claimAllLoomyOnboardingTasks } from '../providers/lo
 import { claimLoomyDailyQuota, fetchLoomyCreditBalance } from '../providers/loomy-credits.js'
 import type { LoomyCredential } from '../providers/loomy.js'
 import { RACCOON } from '../providers/raccoon-product.js'
-import { claimRaccoonLoginReward, fetchRaccoonCreditBalance, fetchRaccoonOnboardingStatus } from '../providers/raccoon-credits.js'
+import {
+  claimRaccoonLoginReward,
+  fetchRaccoonCreditBalance,
+  fetchRaccoonOnboardingStatus,
+  keepAliveRaccoonDailyPoints,
+  type RaccoonKeepaliveOutcome,
+} from '../providers/raccoon-credits.js'
 import type { RaccoonCredential } from '../providers/raccoon.js'
 import { credentialRef } from '../providers/credential-ref.js'
 import type { ProviderAccountEntry } from '../providers/types.js'
@@ -385,4 +391,100 @@ export async function claimOnboarding(
     earned: result.earned,
     total: result.total,
   }
+}
+
+// ───────────────────────── 每日积分保活（仅 raccoon）─────────────────────────
+
+/** 单账号的保活结果。 */
+export interface KeepaliveResultItem {
+  accountId: string
+  nickname: string
+  outcome: RaccoonKeepaliveOutcome | null
+  /** 失败原因（凭据损坏 / 请求异常）；成功时为 undefined。 */
+  error?: string
+}
+
+export interface KeepaliveSummary {
+  /** 本次真正触发延长（`kind === 'extended'`）的账号数。 */
+  extended: number
+  /** 当天早已延长（官方客户端登录过，或本操作之前跑过）的账号数。 */
+  alreadyExtended: number
+  /** 候选端点**调用成功**但都没触发延长的账号数。 */
+  notExtended: number
+  /**
+   * 候选端点**全部因服务级错误失败**（如上游整体 503 / `code=200903`）的账号数。
+   *
+   * ⚠️ 与 `notExtended` **必须分开**：这不是「端点无效」，而是**上游暂时不可用**，
+   * 用户应稍后重试。混为一谈会把服务端故障说成功能结论。
+   */
+  unavailable: number
+  failed: number
+}
+
+export interface KeepaliveResponse {
+  summary: KeepaliveSummary
+  results: KeepaliveResultItem[]
+}
+
+/**
+ * 对 raccoon 的全部账号执行「每日积分保活」。
+ *
+ * ## 它解决什么
+ *
+ * 每日 300 积分由服务端自动发放，但**不登录就当天 24:00 清零**。用户
+ * 「半夜电脑没开机」时，第二天醒来积分已经作废。本操作模拟一次「当日登录」
+ * 把有效期延长到 7 天 —— 供用户在方便的时候手动点一下。
+ *
+ * ## 为什么需要手动按钮而不是定时任务
+ *
+ * 定时任务在服务进程里跑，而用户常关机；**手动按钮不依赖机器整夜开机**，
+ * 且语义明确（用户点一下 = 我知道现在要保活）。将来若确证了触发端点，
+ * 可在此之上再加定时器，本函数即为那层的现成实现。
+ *
+ * ## 为什么逐个账号串行 + 不抛错
+ *
+ * 与 `claimAll` 同构：单账号失败（凭据过期、网络抖动）不应中断整批，
+ * 且失败要带**可读原因**——用户需要区分「凭据坏了」与「端点没触发」。
+ */
+export async function keepAliveDailyPoints(provider: string, deps: CreditsEndpointDeps): Promise<KeepaliveResponse> {
+  const fetcher = deps.fetcher ?? fetch
+  if (provider !== RACCOON.id) {
+    throw new Error(`provider ${provider} 不支持每日积分保活（目前仅 Raccoon Work）`)
+  }
+  const accounts = await deps.pool.listAccounts(provider)
+  const results: KeepaliveResultItem[] = []
+  const summary: KeepaliveSummary = { extended: 0, alreadyExtended: 0, notExtended: 0, unavailable: 0, failed: 0 }
+
+  for (const entry of accounts) {
+    try {
+      const credential = await resolveJson(deps, entry)
+      if (credential === undefined) {
+        summary.failed += 1
+        results.push({ accountId: entry.id, nickname: entry.nickname, outcome: null, error: '凭据未配置或已损坏' })
+        continue
+      }
+      const outcome = await keepAliveRaccoonDailyPoints(
+        RACCOON,
+        credential as unknown as RaccoonCredential,
+        fetcher,
+      )
+      switch (outcome.kind) {
+        case 'extended': summary.extended += 1; break
+        case 'already-extended': summary.alreadyExtended += 1; break
+        case 'unavailable': summary.unavailable += 1; break
+        default: summary.notExtended += 1
+      }
+      results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
+    } catch (error) {
+      deps.warn?.(`[credits] keepalive 账号 ${entry.id} 失败: ${String(error)}`)
+      summary.failed += 1
+      results.push({
+        accountId: entry.id,
+        nickname: entry.nickname,
+        outcome: null,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  return { summary, results }
 }

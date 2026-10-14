@@ -27,9 +27,9 @@ function jsonResp(body: unknown, status = 200): Response {
 }
 
 describe('provider 续期接线', () => {
-  it('九个可续期 provider 全部接线（loomy 除外：无 refresh 端点）', () => {
+  it('十一个可续期 provider 全部接线（loomy 除外：无 refresh 端点）', () => {
     expect([...REFRESH_SUPPORTED_PROVIDERS].sort()).toEqual(
-      ['buddy', 'cline', 'codearts', 'lobsterai', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy'].sort(),
+      ['accio', 'buddy', 'cline', 'codearts', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy'].sort(),
     )
   })
 

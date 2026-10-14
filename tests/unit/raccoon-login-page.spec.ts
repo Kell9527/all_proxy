@@ -35,7 +35,7 @@ function jwtWithExp(expSeconds: number): string {
 }
 
 describe('RACCOON_LOGIN_PAGE_PATHS', () => {
-  it('四条路径都是 /raccoon 前缀', () => {
+  it('五条路径都是 /raccoon 前缀', () => {
     for (const p of Object.values(RACCOON_LOGIN_PAGE_PATHS)) {
       expect(p.startsWith('/raccoon/')).toBe(true)
     }
@@ -51,9 +51,17 @@ describe('renderRaccoonLoginPage', () => {
     expect(html).toContain('charset="utf-8"')
   })
 
-  it('有两个 Tab：微信扫码与短信登录', () => {
+  it('有三个 Tab：微信扫码、短信登录与密码登录', () => {
     expect(html).toContain('微信扫码')
     expect(html).toContain('短信登录')
+    expect(html).toContain('密码登录')
+    expect(html).toContain('id="tabPwd"')
+    expect(html).toContain('id="panePwd"')
+    // 密码 pane 有手机号与密码两个输入
+    expect(html).toContain('id="pwdPhone"')
+    expect(html).toContain('id="password"')
+    // 提交目标走宿主侧密码登录路由
+    expect(html).toContain('paths.passwordLogin')
   })
 
   it('有合法的内联二维码（**必须是可解析的 SVG**，不是被转义的字符串）', () => {
@@ -306,6 +314,91 @@ describe('startRaccoonLoginFlow', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ smsCode: '000001' }),
+    })
+    expect(second.status).toBe(200)
+  })
+
+  it('密码登录端点成功后 result 解析出凭据', async () => {
+    const exp = Math.floor(Date.now() / 1000) + 3600
+    const token = jwtWithExp(exp)
+    const fetcher = vi.fn(async (url: string) => {
+      if (String(url).includes('/login_with_password')) {
+        return jsonResponse({
+          code: 0,
+          data: { access_token: token, refresh_token: 'r', office_identity: 'personal' },
+        })
+      }
+      return jsonResponse({ code: 0, data: { status: 'pending' } })
+    })
+    started = await startRaccoonLoginFlow({ fetcher: fetcher as unknown as typeof fetch })
+    const base = originOf(started.loginUrl)
+    const response = await fetch(`${base}${RACCOON_LOGIN_PAGE_PATHS.passwordLogin}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '13800000000', password: 'Passw0rd!' }),
+    })
+    expect((await response.json() as { ok: boolean }).ok).toBe(true)
+    // 调用了官方密码登录端点
+    const call = fetcher.mock.calls.find((c) => String(c[0]).includes('/login_with_password'))
+    expect(call).toBeDefined()
+    const body = JSON.parse(String((call?.[1] as RequestInit).body)) as Record<string, unknown>
+    expect(body.nation_code).toBe('86')
+    // 手机号与密码在宿主侧加密（都不是明文）
+    expect(body.phone).not.toBe('13800000000')
+    expect(body.password).not.toBe('Passw0rd!')
+    const credential = await started.result
+    expect(credential.access_token).toBe(token)
+    expect(credential.office_identity).toBe('personal')
+  })
+
+  it('密码登录端点拒绝非法手机号', async () => {
+    const fetcher = vi.fn(async () => jsonResponse({ code: 0, message: 'success' }))
+    started = await startRaccoonLoginFlow({ fetcher: fetcher as unknown as typeof fetch })
+    const base = originOf(started.loginUrl)
+    const response = await fetch(`${base}${RACCOON_LOGIN_PAGE_PATHS.passwordLogin}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '123', password: 'Passw0rd!' }),
+    })
+    expect(response.status).toBe(400)
+    // 手机号非法时不应打扰上游
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('密码登录端点拒绝空密码', async () => {
+    const fetcher = vi.fn(async () => jsonResponse({ code: 0, message: 'success' }))
+    started = await startRaccoonLoginFlow({ fetcher: fetcher as unknown as typeof fetch })
+    const base = originOf(started.loginUrl)
+    const response = await fetch(`${base}${RACCOON_LOGIN_PAGE_PATHS.passwordLogin}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '13800000000', password: '' }),
+    })
+    expect(response.status).toBe(400)
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('密码错误时不终止流程（用户可重试）', async () => {
+    const fetcher = vi.fn(async (url: string) => {
+      if (String(url).includes('/login_with_password')) {
+        return jsonResponse({ code: 200004, message: 'phone_or_password_verify_error' }, 400)
+      }
+      return jsonResponse({ code: 0, data: { status: 'pending' } })
+    })
+    started = await startRaccoonLoginFlow({ fetcher: fetcher as unknown as typeof fetch })
+    const base = originOf(started.loginUrl)
+    const first = await fetch(`${base}${RACCOON_LOGIN_PAGE_PATHS.passwordLogin}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '13800000000', password: 'WrongPass1' }),
+    })
+    const payload = await first.json() as { ok: boolean; message?: string }
+    expect(payload.ok).toBe(false)
+    expect(String(payload.message)).toMatch(/verify/)
+    const second = await fetch(`${base}${RACCOON_LOGIN_PAGE_PATHS.passwordLogin}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '13800000000', password: 'RightPass1' }),
     })
     expect(second.status).toBe(200)
   })

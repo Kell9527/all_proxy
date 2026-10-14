@@ -42,8 +42,10 @@ import { LOOMY_SESSION_TTL_SECONDS, loginLoomyBySmsCode, sendLoomySmsCode, type 
 import { startLoomyWechatLoginFlow } from '../providers/loomy-wechat-login.js'
 import { startLoomyLoginFlow } from '../providers/loomy-login-page.js'
 import { RACCOON } from '../providers/raccoon-product.js'
-import { loginRaccoonWithSmsCode, sendRaccoonSmsCode } from '../providers/raccoon-oauth.js'
+import { loginRaccoonWithPassword, loginRaccoonWithSmsCode, sendRaccoonSmsCode } from '../providers/raccoon-oauth.js'
 import { startRaccoonLoginFlow } from '../providers/raccoon-login-page.js'
+import { startOfficeAceLoginFlow } from '../providers/officeace-login.js'
+import { startAccioLoginFlow } from '../providers/accio-login.js'
 
 /** 登录会话的存活上限：到点自动清理回调服务器与端口。 */
 export const LOGIN_SESSION_TTL_MS = 10 * 60 * 1000
@@ -192,7 +194,7 @@ async function startUrlFlow(
       }
     }
     case 'raccoon': {
-      // 本地登录页：Tab 内含「微信扫码 / 短信登录」两种方式（含阿里云滑块），
+      // 本地登录页：Tab 内含「微信扫码 / 短信登录 / 密码登录」三种方式（含阿里云滑块），
       // 全部在弹窗页内完成，宿主侧持有敏感状态。
       const flow = await startRaccoonLoginFlow({ fetcher })
       return {
@@ -202,6 +204,26 @@ async function startUrlFlow(
           expires: Number(credential.expires_at ?? 0) || 0,
           refreshable: typeof credential.refresh_token === 'string' && credential.refresh_token.length > 0,
         })),
+        cancel: flow.close,
+      }
+    }
+    case 'officeace': {
+      // 轮询式（无 loopback 端口）：先拿云侧 state 与授权页地址，后台轮询 code。
+      const flow = await startOfficeAceLoginFlow({
+        ...(flowOptions.pollIntervalMs !== undefined ? { pollIntervalMs: flowOptions.pollIntervalMs } : {}),
+      })
+      return {
+        loginUrl: flow.loginUrl,
+        result: flow.result.then(outcomeFromFlowResult),
+        cancel: flow.close,
+      }
+    }
+    case 'accio': {
+      // 标准 PKCE：回调落在本项目自己的 loopback（Accio 对 return_url 无白名单校验）。
+      const flow = await startAccioLoginFlow({ fetcher })
+      return {
+        loginUrl: flow.loginUrl,
+        result: flow.result.then(outcomeFromFlowResult),
         cancel: flow.close,
       }
     }
@@ -440,6 +462,46 @@ export class LoginOrchestrator {
       }
     }
     throw new Error(`provider ${provider} 不支持短信验证码登录`)
+  }
+
+  // ── 密码登录通道（raccoon）──
+
+  /**
+   * 用手机号 + 密码完成登录，并**立即**落账号条目。
+   *
+   * 与 SMS 通道对称：管理端也可以不经本地登录页直连（`/api/login/password/complete`）。
+   * 常规路径是本地登录页的「密码登录」Tab（宿主侧加密）。
+   *
+   * @returns 落盘后的账号条目。
+   */
+  async completePasswordLogin(provider: string, phone: string, password: string): Promise<ProviderAccountEntry> {
+    const fetcher = this.options.fetcher ?? fetch
+    let outcome: ChannelOutcome
+    try {
+      outcome = await this.passwordOutcome(provider, phone, password, fetcher)
+    } catch (error) {
+      throw new Error(classifyLoginError(error))
+    }
+    return this.settle(provider, outcome)
+  }
+
+  /** 各 provider 的密码登录协议调用（结果统一成通道词汇）。 */
+  private async passwordOutcome(
+    provider: string,
+    phone: string,
+    password: string,
+    fetcher: typeof fetch,
+  ): Promise<ChannelOutcome> {
+    if (provider === 'raccoon') {
+      const credential = await loginRaccoonWithPassword(RACCOON, phone, password, fetcher)
+      return {
+        access: JSON.stringify(credential),
+        expires: Number(credential.expires_at ?? 0) || 0,
+        refreshable: typeof credential.refresh_token === 'string' && credential.refresh_token.length > 0,
+        nickname: sanitizeNickname(phone),
+      }
+    }
+    throw new Error(`provider ${provider} 不支持密码登录`)
   }
 
   // ── 落账号条目（tasks 10.14）──

@@ -7,6 +7,7 @@ import {
   checkinProviders,
   supportsCreditBalance,
   supportsDailyCheckin,
+  supportsDailyKeepalive,
   supportsOnboardingTasks,
 } from '../../plugin-src/client/credits-capabilities.js'
 
@@ -140,6 +141,22 @@ describe('积分能力矩阵', () => {
     for (const unknown of ['', 'newprovider', 'CODEARTS', '__proto__']) {
       expect(supportsCreditBalance(unknown), unknown).toBe(false)
       expect(supportsDailyCheckin(unknown), unknown).toBe(false)
+      expect(supportsDailyKeepalive(unknown), unknown).toBe(false)
+    }
+  })
+
+  /**
+   * `dailyKeepalive`（每日积分保活）是与签到、新手任务都不同的第三种能力：
+   * 积分**已自动发放**，本操作只是保住它不过期。
+   *
+   * ⚠️ 目前只有 raccoon 具备 —— 其余渠道要么没有「自动发放 + 当日作废」的
+   * 积分模型，要么已有可调用的签到端点。误登记会让面板渲染一个必然失败的
+   * 按钮（与 CodeArts 早期「无条件发请求」是同一类缺陷）。
+   */
+  it('dailyKeepalive 只对 raccoon 为 true', () => {
+    expect(supportsDailyKeepalive('raccoon')).toBe(true)
+    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy']) {
+      expect(supportsDailyKeepalive(id), `${id} 不应支持每日积分保活`).toBe(false)
     }
   })
 

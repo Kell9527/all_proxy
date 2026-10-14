@@ -14,11 +14,16 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AccountPool } from './pool/account-pool.js'
 import { FileCredentialStore } from './pool/store.js'
+import type { CredentialStore, ProviderAccountEntry } from './pool/types.js'
+import type { Logger } from './pool/store.js'
 import { ProviderRegistry } from './providers/registry.js'
+import { SENSENOVA } from './providers/sensenova-product.js'
+import { sensenovaNicknameFromKey } from './providers/sensenova.js'
 import { currentAccountIdFor, recordCurrentAccount, registerAllProviders } from './providers/wiring.js'
 import { ApiKeyStore } from './auth/api-keys.js'
 import { createApiKeyAuthenticator } from './auth/authenticate.js'
@@ -73,7 +78,7 @@ export function missingAssets(): string[] {
   return missing
 }
 
-const HELP = `all_proxy — 聚合 10 个 AI 平台账号的 OpenAI / Anthropic 兼容网关
+const HELP = `all_proxy — 聚合 13 个 AI 平台账号的 OpenAI / Anthropic 兼容网关
 
 用法:
   all-proxy [命令] [选项]
@@ -91,6 +96,8 @@ const HELP = `all_proxy — 聚合 10 个 AI 平台账号的 OpenAI / Anthropic 
   ALL_PROXY_PORT           监听端口，默认 3877
   ALL_PROXY_HOST           监听地址，默认 127.0.0.1
   ALL_PROXY_ADMIN_SECRET   管理口令（对外监听时**必须**设置，至少 12 字符）
+  SENSENOVA_API_KEYS       SenseNova（商汤）静态 API Key，逗号分隔；
+                           仅在**尚无 sensenova 账号**时用于首次初始化
 `
 
 /** CLI 主函数；返回进程退出码。 */
@@ -140,6 +147,58 @@ function resolveStaticRoot(): string | undefined {
   return undefined
 }
 
+/**
+ * 用 `SENSENOVA_API_KEYS`（逗号分隔）首次引导 SenseNova 账号。
+ *
+ * ## 三条硬约束
+ *
+ * 1. **只在尚无 sensenova 账号时执行**：已有账号说明用户已（通过管理端或
+ *    上次引导）配置过，此时**绝不追加**——否则用户在管理端删掉的 key 会被
+ *    环境变量每次启动塞回来，删除动作形同虚设。
+ * 2. **先写凭据、再写索引**（与登录流程同约定），避免留下无凭据的账号。
+ * 3. 单把 key 失败只跳过该把，不让整个启动失败（引导是便利路径，不是必需）。
+ *
+ * 凭据字段写 `access_token`（值是 key），与 `findAccountIdByCredential` 的既有
+ * 约定一致 —— 改字段名会让账号永远登记不上。
+ */
+async function bootstrapSensenovaKeys(
+  pool: AccountPool,
+  credentials: CredentialStore,
+  logger: Logger,
+): Promise<void> {
+  const raw = process.env[SENSENOVA.envVar]?.trim()
+  if (raw === undefined || raw.length === 0) return
+  // 已有账号 → 不干预（见约束 1）。
+  if (pool.listAccountsByProvider(SENSENOVA.id).length > 0) return
+
+  const keys = raw.split(',').map((key) => key.trim()).filter((key) => key.length > 0)
+  if (keys.length === 0) return
+
+  let created = 0
+  for (const key of keys) {
+    try {
+      const ref = `SENSENOVA_ACCOUNT_${randomBytes(4).toString('hex').toUpperCase()}`
+      await credentials.set(ref, JSON.stringify({ access_token: key }))
+      const entry: ProviderAccountEntry = {
+        id: `${SENSENOVA.id}-${randomBytes(4).toString('hex')}`,
+        provider: SENSENOVA.id,
+        nickname: sensenovaNicknameFromKey(key),
+        enabled: true,
+        credentialRef: ref,
+        createdAt: Date.now(),
+        refreshable: false,
+      }
+      await pool.addAccount(entry)
+      created++
+    } catch (error) {
+      logger.warn(`[sensenova] 引导 ${SENSENOVA.envVar} 中的一把 key 失败，已跳过：${String(error)}`)
+    }
+  }
+  if (created > 0) {
+    logger.info(`[sensenova] 已从 ${SENSENOVA.envVar} 引导 ${created} 个账号（顺序即轮询优先级）`)
+  }
+}
+
 /** serve 命令：组装全部组件并启动；进程被信号终止时优雅退出。 */
 function serveCommand(): number {
   void startServe()
@@ -170,6 +229,12 @@ async function startServe(): Promise<{ port: number; host: string; adminBootstra
 
   const rotating = new RotatingLogger({ path: join(dataDir, 'logs', 'app.log'), mirrorToConsole: true })
   const logger = loggerAdapter(rotating)
+
+  // ── SenseNova 静态 key 的首次引导（可选）──
+  // 只在「该 provider 尚无账号」时用 SENSENOVA_API_KEYS 建号，**绝不覆盖**
+  // 已有账号（否则用户删掉的 key 会被环境变量每次启动塞回来）。
+  // 静态 key 无需登录，故这是一条「零文件启动」路径；也可事后在管理端粘贴。
+  await bootstrapSensenovaKeys(pool, credentials, logger)
 
   // ── 凭据解析与刷新（适配器的两个外部依赖）──
   // ⚠️ 单飞协调器必须是**单例**，且与定时任务（refreshDueAccounts）共用：

@@ -125,7 +125,34 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   语义与 Loomy 的新手任务同构，故登记为 `onboardingTasks` 而**不是**
   //   `dailyCheckin` —— 后者会让用户以为每天都真的加了额度。
   //   ⚠️ 该端点**需要** `X-Client-Platform` 头（值见 RaccoonProduct.clientPlatform）。
-  raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
+  //
+  // dailyKeepalive：**每日积分保活**（本项目新增的第三种能力，语义与上面两者
+  //   都不同）。每日 300 积分服务端自动发放，但**不登录就当天 24:00 清零**；
+  //   官方文案原文：「每日积分每天 00:00 发放，默认当日 24:00 清零，当天登录后
+  //   有效期延长至 7 天」。本能力 = 模拟一次「当日登录」把有效期延长。
+  //   ⚠️ 它既不是 `dailyCheckin`（没有可调用的签到端点，登记了按钮必然失败），
+  //   也不是 `onboardingTasks`（不是一次性，每天都要保活）。
+  raccoon: Object.freeze({ balance: true, onboardingTasks: true, dailyKeepalive: true }),
+  // SenseNova（商汤开放平台）：**无任何积分能力**。
+  //
+  // 它是标准 OpenAI 兼容 API（按 token 计费的 `sk-` key），没有「积分余额」
+  // 或「每日签到」这类渠道概念 —— 上游只有 `GET /v1/models` 与
+  // `POST /v1/chat/completions`，没有 balance / checkin 端点。
+  // 故两项皆 false：面板不得渲染「刷新积分 / 一键领取积分」，也不得对卡片的
+  // 「积分」行发起请求（否则会永远停在「查询失败」，正是 CodeArts 历史缺陷的形态）。
+  //
+  // ⚠️ 限流能力**保持默认 true**（见下方 RATE_LIMIT_CAPABILITIES）：SenseNova
+  // 确实会返回 429（tpm/rpm 限流），「重测 / 重置」按钮对它有效。
+  sensenova: Object.freeze({ balance: false, dailyCheckin: false }),
+  // OfficeAce（华为云 ModelArts MaaS）：本轮**只移植推理**，未移植 V11-HMAC-SHA256
+  // 签名，故 `/v1/subscription` 余额与每日签到（`/v1/subscription/bonus/claim`）
+  // 端点均不可用 —— 两项皆 false，面板不得渲染对应按钮。
+  //
+  // ⚠️ 若日后补上 V11 签名，可在此登记 `balance: true`（并接 `credits.balances`）。
+  officeace: Object.freeze({ balance: false, dailyCheckin: false }),
+  // Accio（阿里 Accio Work）：本轮**只移植推理**，未移植积分（`accio-credits.ts`
+  // 的 `/api/entitlement/*`）—— 两项皆 false，面板不得渲染对应按钮。
+  accio: Object.freeze({ balance: false, dailyCheckin: false }),
 });
 
 /**
@@ -192,6 +219,20 @@ export function supportsDailyCheckin(provider) {
 }
 
 /**
+ * 该 provider 的账号是否靠**粘贴静态 API Key** 添加（而非浏览器登录）。
+ *
+ * 为 true 时面板渲染「+ 新建账号 (粘贴 API Key)」按钮并调用 `account.addKey`；
+ * 为 false（其余 provider）走既有的「弹窗登录 + 轮询」路径。
+ *
+ * ⚠️ 判定必须与后端 `STATIC_KEY_PROVIDERS`（`src/admin/router.ts`）一致 ——
+ * 前端给了粘贴入口、后端却不认这个 provider，会得到一个必然失败的按钮。
+ * 目前只有 SenseNova（商汤开放平台）具备该形态。
+ */
+export function supportsStaticKey(provider) {
+  return provider === 'sensenova';
+}
+
+/**
  * 全部**支持每日签到**的渠道 id 列表，顺序固定（= 本表声明顺序）。
  *
  * 供 Jet Hub 页头的「一键签到」遍历使用。
@@ -221,6 +262,20 @@ export function checkinProviders() {
  */
 export function supportsOnboardingTasks(provider) {
   return CREDITS_CAPABILITIES[provider]?.onboardingTasks === true;
+}
+
+/**
+ * 该 provider 是否支持「每日积分保活」。
+ *
+ * 语义：**每日积分已由服务端自动发放，但不登录就当天作废** —— 本能力
+ * 通过模拟一次「当日登录」把有效期延长（raccoon 是 300 分 / 当天 24:00
+ * → 7 天）。它既不是签到（没有可调用的签到端点），也不是一次性新手任务
+ * （每天都要保活），故单独成一个能力位。
+ *
+ * 为 false 时面板**不得**渲染该按钮，也不得发起 `credits.dailyKeepalive`。
+ */
+export function supportsDailyKeepalive(provider) {
+  return CREDITS_CAPABILITIES[provider]?.dailyKeepalive === true;
 }
 
 /**

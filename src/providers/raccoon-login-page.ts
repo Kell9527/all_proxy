@@ -9,10 +9,11 @@
  *
  * ```
  * 本地服务器（127.0.0.1:随机端口）
- *   GET  /raccoon/login       → 弹窗页：Tab 切换「微信扫码 / 短信登录」
- *   GET  /raccoon/poll        → 前端轮询登录状态（宿主侧持有 qrcode_code）
- *   POST /raccoon/sms/send    → 提交手机号 + 阿里云 captcha_param
- *   POST /raccoon/sms/verify  → 提交验证码完成登录
+ *   GET  /raccoon/login          → 弹窗页：Tab 切换「微信扫码 / 短信登录 / 密码登录」
+ *   GET  /raccoon/poll           → 前端轮询登录状态（宿主侧持有 qrcode_code）
+ *   POST /raccoon/sms/send       → 提交手机号 + 阿里云 captcha_param
+ *   POST /raccoon/sms/verify     → 提交验证码完成登录
+ *   POST /raccoon/password/login → 提交手机号 + 密码一步完成登录
  * ```
  *
  * 微信扫码的 `code` 由**宿主侧本地随机生成**（实测服务端接受任意自造 code
@@ -40,6 +41,7 @@ import {
 import {
   buildQrImageUrl,
   generateQrCode,
+  loginRaccoonWithPassword,
   loginRaccoonWithSmsCode,
   pollRaccoonQrLogin,
   sendRaccoonSmsCode,
@@ -53,6 +55,7 @@ export const RACCOON_LOGIN_PAGE_PATHS = {
   poll: '/raccoon/poll',
   smsSend: '/raccoon/sms/send',
   smsVerify: '/raccoon/sms/verify',
+  passwordLogin: '/raccoon/password/login',
 } as const
 
 /** 一次登录流程的句柄。 */
@@ -273,6 +276,35 @@ async function handleRequest(
     return
   }
 
+  if (url.pathname === RACCOON_LOGIN_PAGE_PATHS.passwordLogin && request.method === 'POST') {
+    // 密码登录一步完成：不需要像 SMS 那样先在 state 里记手机号
+    //（两步共享状态只为「未发过短信」防护，密码登录没有对应的中间步骤）。
+    const body = await readJsonBody(request)
+    const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
+    const password = typeof body.password === 'string' ? body.password : ''
+    if (!/^1[3-9]\d{9}$/.test(phone)) {
+      response.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+      response.end(JSON.stringify({ ok: false, message: '请输入有效的 11 位手机号' }))
+      return
+    }
+    if (password.length === 0) {
+      response.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+      response.end(JSON.stringify({ ok: false, message: '请输入密码' }))
+      return
+    }
+    try {
+      const credential = await loginRaccoonWithPassword(product, phone, password, deps.fetcher)
+      deps.settleOk(credential)
+      writeJson(response, { ok: true })
+    } catch (error) {
+      writeJson(response, {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+    return
+  }
+
   response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('Not found')
 }
 
@@ -331,10 +363,11 @@ function listenOnRandomPort(server: Server): Promise<number> {
  *
  * ## 页面职责
  *
- * - 两个 Tab：微信扫码（默认）与短信登录
+ * - 三个 Tab：微信扫码（默认）、短信登录、密码登录
  * - 二维码由宿主侧生成的 **SVG 内联**进来（页面不需要 QR 逻辑，也不走 CDN）
  * - 每 2 秒轮询 `/raccoon/poll`（与官方客户端一致）
  * - 短信 Tab 加载阿里云滑块脚本，拿到 `captchaParam` 后提交
+ * - 密码 Tab 一步提交手机号 + 密码（宿主侧加密，对齐官网登录页链路）
  *
  * @param qrCode 当前会话的扫码 code（宿主侧生成）。**注意**：本函数只是把它
  *   渲染成二维码 —— 页面拿不到 code 本身（它被编码进二维码图像里）。
@@ -392,6 +425,7 @@ export function renderRaccoonLoginPage(product: RaccoonProduct, qrCode?: string)
     <div class="tabs">
       <button id="tabQr" data-active="1" type="button">微信扫码</button>
       <button id="tabSms" data-active="0" type="button">短信登录</button>
+      <button id="tabPwd" data-active="0" type="button">密码登录</button>
     </div>
 
     <div class="pane" id="paneQr" data-show="1">
@@ -412,6 +446,15 @@ export function renderRaccoonLoginPage(product: RaccoonProduct, qrCode?: string)
       <button class="primary" id="doLogin" type="button">登录</button>
       <div class="status" id="smsStatus"></div>
     </div>
+
+    <div class="pane" id="panePwd" data-show="0">
+      <label for="pwdPhone">手机号</label>
+      <input id="pwdPhone" type="tel" inputmode="numeric" maxlength="11" placeholder="请输入 11 位手机号">
+      <label for="password">密码</label>
+      <input id="password" type="password" placeholder="请输入登录密码">
+      <button class="primary" id="doPwdLogin" type="button">登录</button>
+      <div class="status" id="pwdStatus"></div>
+    </div>
   </div>
 
 <script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
@@ -421,19 +464,24 @@ export function renderRaccoonLoginPage(product: RaccoonProduct, qrCode?: string)
   var POLL_INTERVAL_MS = 2000;
   var paths = ${JSON.stringify(RACCOON_LOGIN_PAGE_PATHS)};
 
-  // ── Tab 切换 ──
+  // ── Tab 切换（三种模式：qr / sms / pwd）──
   var tabQr = document.getElementById('tabQr');
   var tabSms = document.getElementById('tabSms');
+  var tabPwd = document.getElementById('tabPwd');
   var paneQr = document.getElementById('paneQr');
   var paneSms = document.getElementById('paneSms');
-  function selectTab(sms) {
-    tabQr.setAttribute('data-active', sms ? '0' : '1');
-    tabSms.setAttribute('data-active', sms ? '1' : '0');
-    paneQr.setAttribute('data-show', sms ? '0' : '1');
-    paneSms.setAttribute('data-show', sms ? '1' : '0');
+  var panePwd = document.getElementById('panePwd');
+  function selectTab(mode) {
+    tabQr.setAttribute('data-active', mode === 'qr' ? '1' : '0');
+    tabSms.setAttribute('data-active', mode === 'sms' ? '1' : '0');
+    tabPwd.setAttribute('data-active', mode === 'pwd' ? '1' : '0');
+    paneQr.setAttribute('data-show', mode === 'qr' ? '1' : '0');
+    paneSms.setAttribute('data-show', mode === 'sms' ? '1' : '0');
+    panePwd.setAttribute('data-show', mode === 'pwd' ? '1' : '0');
   }
-  tabQr.addEventListener('click', function () { selectTab(false); });
-  tabSms.addEventListener('click', function () { selectTab(true); });
+  tabQr.addEventListener('click', function () { selectTab('qr'); });
+  tabSms.addEventListener('click', function () { selectTab('sms'); });
+  tabPwd.addEventListener('click', function () { selectTab('pwd'); });
 
   // ── 扫码轮询 ──
   var qrStatus = document.getElementById('qrStatus');
@@ -553,6 +601,48 @@ export function renderRaccoonLoginPage(product: RaccoonProduct, qrCode?: string)
       setSmsStatus('登录失败，请检查网络后重试', 'err');
     }).finally(function () {
       loginBtn.disabled = false;
+    });
+  });
+
+  // ── 密码登录（一步提交；宿主侧加密后调用官方 login_with_password）──
+  var pwdStatus = document.getElementById('pwdStatus');
+  var pwdPhoneInput = document.getElementById('pwdPhone');
+  var passwordInput = document.getElementById('password');
+  var pwdLoginBtn = document.getElementById('doPwdLogin');
+
+  function setPwdStatus(text, tone) {
+    pwdStatus.textContent = text || '';
+    if (tone) { pwdStatus.setAttribute('data-tone', tone); } else { pwdStatus.removeAttribute('data-tone'); }
+  }
+
+  pwdLoginBtn.addEventListener('click', function () {
+    var phone = (pwdPhoneInput.value || '').trim();
+    var password = passwordInput.value || '';
+    if (!/^1[3-9]\\d{9}$/.test(phone)) {
+      setPwdStatus('请输入有效的 11 位手机号', 'err');
+      return;
+    }
+    if (!password) {
+      setPwdStatus('请输入密码', 'err');
+      return;
+    }
+    pwdLoginBtn.disabled = true;
+    setPwdStatus('登录中…');
+    fetch(paths.passwordLogin, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: phone, password: password })
+    }).then(function (r) { return r.json(); }).then(function (data) {
+      if (data && data.ok) {
+        setPwdStatus('登录成功，可以关闭此窗口了', 'ok');
+        setTimeout(function () { window.close(); }, 1200);
+      } else {
+        setPwdStatus((data && data.message) || '手机号或密码不正确，请重试', 'err');
+      }
+    }).catch(function () {
+      setPwdStatus('登录失败，请检查网络后重试', 'err');
+    }).finally(function () {
+      pwdLoginBtn.disabled = false;
     });
   });
 })();

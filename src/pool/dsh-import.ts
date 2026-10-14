@@ -51,6 +51,12 @@ const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
   CLINE: 'cline',
   LOOMY: 'loomy',
   RACCOON: 'raccoon',
+  OFFICEACE: 'officeace',
+  ACCIO: 'accio',
+  // SenseNova（商汤开放平台）：静态 API Key，DSH 里本无其登录态，
+  // 但本项目的「粘贴 key 建号」会造出 `SENSENOVA_ACCOUNT_*` ref，
+  // 故登记以保证 ACCOUNT_REF_RE 与本表一致（否则自建 ref 会被判为不可识别）。
+  SENSENOVA: 'sensenova',
 }
 
 /**
@@ -59,16 +65,17 @@ const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
  * ⚠️ 前缀集合必须与 {@link PROVIDER_BY_REF_PREFIX} 一致 —— 少一个就会让那类
  * 账号在导入时被静默丢弃（来源正是如此漏掉了四个）。
  */
-const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|CLINE|LOOMY|RACCOON)_ACCOUNT_([0-9A-Fa-f]{6,})$/
+const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|CLINE|LOOMY|RACCOON|OFFICEACE|ACCIO|SENSENOVA)_ACCOUNT_([0-9A-Fa-f]{6,})$/
 
 /**
  * `refresh_token` 一次性轮换的 provider。
  *
  * ⚠️ 这些 provider 的 refresh token **用一次即作废**（华为实测
  * `STS5.1806 the refresh token has been used`；TRAE 每次 `ExchangeToken` 都轮换）。
- * 导入后若 DSH 与 all_proxy 都去刷新，会互相作废。
+ * OfficeAce（华为 MDS）同样一次性；Accio（阿里）参考实现明确记录「刷新会轮换
+ * refresh_token」。导入后若 DSH 与 all_proxy 都去刷新，会互相作废。
  */
-const ROTATING_REFRESH_PROVIDERS = new Set(['codearts', 'trae'])
+const ROTATING_REFRESH_PROVIDERS = new Set(['codearts', 'trae', 'officeace', 'accio'])
 
 /** 导入来源路径。 */
 export interface DshPaths {
@@ -232,6 +239,7 @@ export async function importFromDsh(options: ImportOptions): Promise<ImportResul
     'CODEARTS_ACCESS_TOKEN', 'BUDDY_ACCESS_TOKEN', 'WORKBUDDY_ACCESS_TOKEN',
     'LOBSTERAI_ACCESS_TOKEN', 'QODER_ACCESS_TOKEN', 'QODERCN_ACCESS_TOKEN',
     'TRAE_ACCESS_TOKEN', 'CLINE_ACCESS_TOKEN', 'LOOMY_ACCESS_TOKEN', 'RACCOON_ACCESS_TOKEN',
+    'OFFICEACE_ACCESS_TOKEN', 'ACCIO_ACCESS_TOKEN', 'SENSENOVA_ACCESS_TOKEN',
   ])
   let credentialCount = 0
   for (const [ref, value] of refs) {

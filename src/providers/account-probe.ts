@@ -35,11 +35,17 @@ import { BuddyAdapter } from './buddy-adapter.js'
 import { LobsteraiAdapter } from './lobsterai-adapter.js'
 import { TraeAdapter } from './trae-adapter.js'
 import { CodeArtsAdapter, isRateLimited, parseRateLimitError } from './llm-adapter.js'
+import { SensenovaAdapter } from './sensenova-adapter.js'
+import { OfficeAceAdapter } from './officeace-adapter.js'
+import { AccioAdapter } from './accio-adapter.js'
 import { productById } from './product.js'
 import { lobsteraiProductById } from './lobsterai-product.js'
 import type { BuddyCredential } from './buddy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCredential } from './trae.js'
+import type { SensenovaCredential } from './sensenova.js'
+import type { OfficeAceCredential } from './officeace-auth.js'
+import type { AccioCredential } from './accio.js'
 import type {
   CodeArtsCredential,
   ProbeAccountResult,
@@ -58,12 +64,24 @@ import type {
 const TRAE_PROVIDER_ID = 'trae'
 
 /**
+ * SenseNova 的 provider id（同 TRAE：具名常量便于检索）。
+ *
+ * ⚠️ **必须在此分派**：否则探测会落到 `else` 分支用 CodeArtsAdapter（华为
+ * HMAC 签名）去发 SenseNova 请求而必然失败 —— 这正是本文件两次踩过的坑。
+ */
+const SENSENOVA_PROVIDER_ID = 'sensenova'
+/** OfficeAce provider id（见 `officeace-product.ts`）。 */
+const OFFICEACE_PROVIDER_ID = 'officeace'
+/** Accio provider id（见 `accio-product.ts`）。 */
+const ACCIO_PROVIDER_ID = 'accio'
+
+/**
  * 探测可能涉及的凭据联合类型。
  *
  * 提为具名别名而非在各处重复四元联合：新增 provider 时只需改这一处，
  * 避免签名与实现漂移（本文件已两次因「分派表没跟上新增 provider」出缺陷）。
  */
-type ProbeCredential = CodeArtsCredential | BuddyCredential | LobsteraiCredential | TraeCredential
+type ProbeCredential = CodeArtsCredential | BuddyCredential | LobsteraiCredential | TraeCredential | SensenovaCredential
 
 /** 探测请求的提示语（与 e2e 探针保持一致，最大化可比性）。 */
 const PROBE_PROMPT = '只回答两个字：收到'
@@ -197,7 +215,7 @@ async function probeWithAdapter(
   // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
   const buddyProduct = productById(entry.provider)
   const lobsteraiProduct = lobsteraiProductById(entry.provider)
-  let adapter: BuddyAdapter | LobsteraiAdapter | TraeAdapter | CodeArtsAdapter
+  let adapter: BuddyAdapter | LobsteraiAdapter | TraeAdapter | CodeArtsAdapter | SensenovaAdapter | OfficeAceAdapter | AccioAdapter
   if (buddyProduct !== undefined) {
     adapter = new BuddyAdapter({
       credentialRef: ref,
@@ -218,6 +236,28 @@ async function probeWithAdapter(
     adapter = new TraeAdapter({
       credentialRef: ref,
       resolveCredential: async () => credential as TraeCredential,
+      refresh: async () => {},
+    })
+  } else if (entry.provider === SENSENOVA_PROVIDER_ID) {
+    // SenseNova（静态 API Key）：OpenAI 兼容 + Bearer。**不传 accountPool** ——
+    // 探测必须只针对指定账号、不产生换号/限流副作用（见文件头「不传 accountPool」）。
+    adapter = new SensenovaAdapter({
+      resolveCredential: async () => credential as SensenovaCredential,
+    })
+  } else if (entry.provider === OFFICEACE_PROVIDER_ID) {
+    // OfficeAce（华为 MaaS）：Basic 鉴权 + 按账号下发 baseUrl。**不传 accountPool**
+    //（同上：探测不产生换号副作用）。OfficeAce 不写 modelRateLimits，正常不会有
+    // 重测按钮；但落到 else 会用 CodeArts 的华为 HMAC 签名去发 Basic 端点而必然
+    // 失败，故仍显式分派（见上方「分派表已两次因漏同步出缺陷」）。
+    adapter = new OfficeAceAdapter({
+      resolveCredential: async () => credential as unknown as OfficeAceCredential,
+    })
+  } else if (entry.provider === ACCIO_PROVIDER_ID) {
+    // Accio（阿里）：标准 OAuth + Gemini 族协议。**不传 accountPool**（同上）。
+    // Accio 不写 modelRateLimits，正常不会有重测按钮；落到 else 会用 CodeArts
+    // 的华为 HMAC 签名发 Accio 端点而必然失败，故仍显式分派。
+    adapter = new AccioAdapter({
+      resolveCredential: async () => credential as unknown as AccioCredential,
       refresh: async () => {},
     })
   } else {

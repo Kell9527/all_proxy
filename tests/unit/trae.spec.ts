@@ -56,6 +56,7 @@ import {
   traeOAuthHeaders,
   traeSOLOHeaders,
   traeUgHeaders,
+  traeUsageFromTokenUsage,
   transformToSOLOBody,
   withTraePhone,
 } from '../../src/providers/trae.js'
@@ -1106,6 +1107,74 @@ describe('SOLO SSE 事件解析', () => {
 
   it('data 为空时只保留事件名', () => {
     expect(parseTraeSSELine('metadata', '')).toEqual({ event: 'metadata' })
+  })
+})
+
+/**
+ * TRAE `token_usage` → 规范 `TokenUsage` 口径（A6）。
+ *
+ * ## 为什么这几条断言重要
+ *
+ * TRAE 的 `prompt_tokens` **含缓存命中**（与 Anthropic 口径相反）。若把
+ * `prompt_tokens` 直接当 `inputTokens`，命中率会被算成 49.8% 而非 99.4%；
+ * 而缓存字段被适配器丢弃时命中率恒为 0（本次修复前的真实症状）。
+ * 报文取**真实实测值**（同前缀两次：冷 `prompt=4894/cacheRead=0`、
+ * 热 `prompt=4894/cacheRead=4864`）。
+ */
+describe('TRAE token_usage → TokenUsage 口径', () => {
+  /** 冷启动（无缓存命中）。 */
+  const COLD = { prompt_tokens: 4894, completion_tokens: 100, reasoning_tokens: 80 }
+  /** 复用前缀（命中 4864）。 */
+  const REUSED = { prompt_tokens: 4894, cache_read_input_tokens: 4864, completion_tokens: 100 }
+
+  it('冷启动：未命中 = prompt，且省略缓存字段（不写 0）', () => {
+    const usage = traeUsageFromTokenUsage(COLD)
+    expect(usage.inputTokens).toBe(4894)
+    expect(usage).not.toHaveProperty('cacheReadTokens')
+    expect(usage).not.toHaveProperty('cacheWriteTokens')
+  })
+
+  it('命中：cacheReadTokens 单列，且未命中做减法', () => {
+    const usage = traeUsageFromTokenUsage(REUSED)
+    expect(usage.cacheReadTokens).toBe(4864)
+    expect(usage.inputTokens).toBe(4894 - 4864)
+  })
+
+  it('不变式：inputTokens + cacheReadTokens 恒等于 prompt_tokens', () => {
+    for (const raw of [COLD, REUSED]) {
+      const usage = traeUsageFromTokenUsage(raw)
+      expect(usage.inputTokens + (usage.cacheReadTokens ?? 0)).toBe(raw.prompt_tokens)
+    }
+  })
+
+  it('cache_creation 也扣除但单列 cacheWriteTokens（不计入命中）', () => {
+    const usage = traeUsageFromTokenUsage({
+      prompt_tokens: 5000, cache_creation_input_tokens: 2000, completion_tokens: 10,
+    })
+    expect(usage.cacheWriteTokens).toBe(2000)
+    expect(usage.cacheReadTokens).toBeUndefined()
+    expect(usage.inputTokens).toBe(3000)
+  })
+
+  it('上游字段矛盾时减法钳到 0（绝不下发负数）', () => {
+    const usage = traeUsageFromTokenUsage({
+      prompt_tokens: 100, cache_read_input_tokens: 9999, completion_tokens: 1,
+    })
+    expect(usage.inputTokens).toBe(0)
+  })
+
+  it('非法值兜底：负数/非数/缺失都按 0 或省略处理', () => {
+    const usage = traeUsageFromTokenUsage({
+      prompt_tokens: -5, completion_tokens: 'x', cache_read_input_tokens: Number.NaN,
+    })
+    expect(usage.inputTokens).toBe(0)
+    expect(usage.outputTokens).toBe(0)
+    expect(usage.cacheReadTokens).toBeUndefined()
+  })
+
+  it('reasoning_tokens 仅在 >0 时写入', () => {
+    expect(traeUsageFromTokenUsage({ prompt_tokens: 1, reasoning_tokens: 135 }).reasoningTokens).toBe(135)
+    expect(traeUsageFromTokenUsage({ prompt_tokens: 1, reasoning_tokens: 0 })).not.toHaveProperty('reasoningTokens')
   })
 })
 

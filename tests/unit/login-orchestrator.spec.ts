@@ -205,6 +205,51 @@ describe('登录编排器', () => {
     })
   })
 
+  describe('Raccoon 密码登录', () => {
+    it('手机号与密码都加密提交；落条目且 refreshable 随凭据', async () => {
+      const seenBodies: Array<Record<string, unknown>> = []
+      const fetcher: typeof fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+        seenBodies.push({ url, ...body })
+        if (url.includes('/login_with_password')) {
+          return new Response(JSON.stringify({
+            code: 0,
+            data: { access_token: 'at-raccoon-pwd', refresh_token: 'rt-raccoon-pwd' },
+          }), { status: 200 })
+        }
+        return new Response('nope', { status: 404 })
+      })
+      const orchestrator = makeOrchestrator(fetcher)
+      const entry = await orchestrator.completePasswordLogin('raccoon', '13812345678', 'Passw0rd!')
+      const call = seenBodies.find(b => String(b['url']).includes('/login_with_password'))!
+      expect(call['nation_code']).toBe('86')
+      // 手机号与密码都必须是密文（服务端逐字段解密）
+      expect(call['phone']).not.toBe('13812345678')
+      expect(call['password']).not.toBe('Passw0rd!')
+      expect(entry.provider).toBe('raccoon')
+      expect(entry.refreshable).toBe(true)
+      const credential = JSON.parse((await credentials.resolve(entry.credentialRef))!.value) as Record<string, unknown>
+      expect(credential['access_token']).toBe('at-raccoon-pwd')
+      expect(credential['refresh_token']).toBe('rt-raccoon-pwd')
+    })
+
+    it('账密错误（200004）→ 可读归因', async () => {
+      const fetcher: typeof fetch = vi.fn(async () => new Response(JSON.stringify({
+        code: 200004, message: 'phone_or_password_verify_error', details: 'phone or password is wrong',
+      }), { status: 400 }))
+      const orchestrator = makeOrchestrator(fetcher)
+      await expect(orchestrator.completePasswordLogin('raccoon', '13812345678', 'WrongPass1'))
+        .rejects.toThrow(/phone or password is wrong/)
+    })
+
+    it('不支持的 provider 给出明确错误', async () => {
+      const orchestrator = makeOrchestrator(fetch)
+      await expect(orchestrator.completePasswordLogin('qoder', '13812345678', 'Passw0rd!'))
+        .rejects.toThrow(/不支持密码登录/)
+    })
+  })
+
   describe('两步式 URL 会话（10.1）', () => {
     it('qoder：start 立即返回 loginUrl；「未授权」404 期间 poll 保持 pending', async () => {
       let polls = 0

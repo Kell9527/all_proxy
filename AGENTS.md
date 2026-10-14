@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-`all_proxy` 把 **10 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API**，
+`all_proxy` 把 **13 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API**，
 并自带一个网页管理端。目标形态是**独立 HTTP 服务**，不依赖 DeepSeek Harness 运行时。
 
 单进程同时提供：对外 API（`/v1/*`）、管理 API（`/api/*`）、管理端页面。
@@ -34,7 +34,7 @@
 | 项 | 来源（DSH 插件） | 本项目 | 原因 |
 |---|---|---|---|
 | 模型开关语义 | **仅目录过滤**：关闭的模型仍可被解析、仍能收发请求 | **硬拦截**：调用被关闭的模型返回 `404 model_not_found` 且不发上游请求 | 对外提供 API 时，调用方知道模型名就能绕过开关，开关将形同虚设 |
-| 模型寻址 | 裸模型 id（provider 由适配器路由隐含） | **强制 provider 前缀** `<provider>/<model>` | 10 个 provider 之间重名严重（`deepseek-v4-flash`、`glm-5.2` 等多处重复） |
+| 模型寻址 | 裸模型 id（provider 由适配器路由隐含） | **强制 provider 前缀** `<provider>/<model>` | 13 个 provider 之间重名严重（`deepseek-v4-flash`、`glm-5.2` 等多处重复） |
 | 凭据存储 | `ctx.credentials`（`$DSH_HOME/.credentials.yaml`） | 自持 JSON 凭据文件（可读写、可自由刷新回写） | 规避与 DSH 两边同时刷新导致一次性 `refresh_token` 互相作废 |
 | 目录门控 `providerCatalogVisible` | 用于隐藏无账号的 provider 分组 | **整体删除** | 它只影响 DSH 模型选择器的分组显示，不改路由；对外 API 无此概念 |
 | 续期调度 | 由 DSH 插件生命周期驱动 | 由本服务自己的定时器驱动 | 无 DSH 运行时 |
@@ -104,9 +104,46 @@
 `llm-adapter` / `models` / `service` / `oauth` / `login` / `credits` /
 `*credits` / `account-probe` / `backup` / `types`）。
 
+**本项目自写的第 11 个 provider —— SenseNova（商汤开放平台，`token.sensenova.cn`）**：
+与既有 10 个**不同类**，凭据是**静态 API Key**（一把 `sk-...`，无登录、无 refresh）。
+文件：`sensenova-product.ts`（配置）/ `sensenova.ts`（凭据与纯函数）/
+`sensenova-adapter.ts`（OpenAI 兼容 + **请求级换号**：正常钉住手动顺序的第一个账号，
+命中 429（tpm/rpm 限流）写 **5 秒**冷却并换下一把；全部账号都在冷却时**不报错** ——
+等到最早一把解禁继续轮询，直到成功或超出预算（默认 5 分钟）；配额类错误换号并锁到
+UTC+8 当日 24:00）。
+账号来源是**管理端粘贴 key**（`POST /api/accounts`，见 `src/admin/router.ts` 的
+`STATIC_KEY_PROVIDERS`）或环境变量 `SENSENOVA_API_KEYS` 首次引导，故它**没有**
+`*-oauth.ts` / `*-auth.ts`，也不在 `REFRESH_SUPPORTED_PROVIDERS` 里。
+
+**第 12、13 个 provider —— OfficeAce（华为云 ModelArts MaaS）与 Accio（阿里 Accio Work）**
+（2026-10-14 从来源 HEAD 移植，均超出移植基线 `3611a62`，故不走 `port-providers.mjs`）：
+
+- **OfficeAce**（`officeace-product.ts` / `officeace-adapter.ts` / `officeace-auth.ts` /
+  `officeace-login.ts`）：华为云 OAuth + PKCE + **DPoP** 登录，推理走
+  `Authorization: Basic base64(app_key:app_secret)`；**OpenAI 兼容**（复用
+  `shared/openai-compat.ts`）。两个必须记住的点：① **`maasBaseUrl` 必须优先用凭据里
+  按账号下发的 host**（硬编码默认域会 401 `APIG.1009`）；② `max_tokens < 4096` 直接
+  丢弃（否则思考链烧光预算、正文零产出）。**DPoP 私钥随凭据 JSON 落盘**（刷新必须
+  同一把），refresh_token **一次性**（进 `ROTATING_REFRESH_PROVIDERS` + `RefreshCoordinator`）。
+  裁掉了来源的 Windows 迁移桥（Redis 6399 / DPAPI / PowerShell）与 V11 签名
+  （余额/倍率，故 `credits-capabilities.js` 登记为无积分能力）。
+- **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
+  `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts`）：标准 OAuth 2.0 + **PKCE**
+  （回调落本项目自己的 loopback），推理是 **Gemini 族协议**（复用 `gemini-messages.ts`
+  的 `consumeGeminiSse` + 一层薄归一化）。四个必须记住的点：① **`token` 必须在请求
+  body**（放 Authorization 头恒流内 402）；② **`system_instruction` 必须是字符串**
+  （对象形态恒 HTTP 200 + 流内 400）；③ **对外 id 是「人话」slug、上行须反查上游
+  `modelCode`**（漏映射症状是「模型不回复」这种误导性形态）；④ **HTTP 200 也可能是
+  风控拦截页**（必须校验 `content-type: text/event-stream`）。refresh_token **轮换**
+  （同样进 `ROTATING_REFRESH_PROVIDERS`）。图片通路未实测 ⇒ `inputModalities` 恒省略、
+  收到图片显式 `UNSUPPORTED_CONTENT`。
+
 **测试**：来源 `tests/unit/` 的 84 个文件经 `scripts/port-tests.mjs` 移植，
-加上本项目自写的（`llm` / `account-pool` / `gateway` / `divergence-gating`）。
-当前 **100 个文件 2536 条用例全部通过**。
+加上本项目自写的（`llm` / `account-pool` / `gateway` / `divergence-gating` /
+`sensenova*` / `officeace*` / `accio*` / `trae-cooldown-table` / `serial-queue` /
+`expiry-sync`）。当前 **128 个文件 3139 条用例**（2026-10-14 实测；其中
+`buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
+`validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 
 **未移植的测试**（来源里依赖 DSH 服务容器或断言 DSH 源码结构，本项目无对应物）：
 `plugin.spec` / `jet-hub-rpc.spec` / `jet-hub-store.spec` / `backup.spec` /
@@ -121,7 +158,7 @@ all_proxy/
 ├── src/                    后端 TypeScript 源码
 │   ├── index.ts            入口（CLI 与 serve 组装）
 │   ├── gateway/            对外 HTTP 端点（OpenAI / Anthropic 协议、静态托管）
-│   ├── providers/          10 个 provider 的适配层
+│   ├── providers/          13 个 provider 的适配层
 │   ├── pool/               账号池与凭据存储
 │   ├── auth/               API Key 存储与入站鉴权
 │   ├── admin/              管理 API 与管理端鉴权
@@ -156,6 +193,23 @@ all_proxy/
 3. 管理端：`plugin-src/client/jet-hub.js` 的 `PROVIDERS` 加图标与条目；
 4. 登录编排：在 `src/login/orchestrator.ts` 的 `startUrlFlow` 或 SMS 通道加分支；
 5. 如有静默续期，在 `src/refresh/provider-refresher.ts` 接线刷新函数。
+
+**静态 API Key provider**（如 `sensenova`；上游直接给一把 `sk-...`，无登录）：
+
+1. 新建 `*-product.ts`（基地址、chat 路径、兜底模型表、引导环境变量名）与
+   `*.ts`（凭据类型 + 解析/脱敏纯函数）；
+2. 新建 `*-adapter.ts`：OpenAI 兼容时复用 `shared/openai-compat.ts`；换号走
+   `AccountPool.getAvailableAccount(exclude)`（429 → 短冷却标记 + 换号；全部冷却
+   时可等到最早解禁继续轮询，见 `sensenova-adapter.ts`）；
+3. `wiring.ts` 注册（`refresh: async () => {}`，静态 key 无续期）；
+   **不要**登记 `REFRESH_SUPPORTED_PROVIDERS`（那会让定时任务对一个不存在的
+   端点发请求），账号一律 `refreshable: false`；
+4. 管理端新增账号：把 provider 加进 `src/admin/router.ts` 的
+   `STATIC_KEY_PROVIDERS`，前端 `supportsStaticKey()` 才会渲染「粘贴 API Key」按钮；
+5. **凭据字段必须写 `access_token`**（值是 key）——`findAccountIdByCredential`
+   对非 codearts 一律取该字段，改字段名会让账号永远登记不上（换号/限流/用量全失效）；
+6. `account-probe.ts` 的探测分派表补该 provider（否则「重测」会落到 CodeArts 签名分支）；
+7. `dsh-import.ts` 的 `ACCOUNT_REF_RE` / `PROVIDER_BY_REF_PREFIX` 补前缀（自建 ref 才可识别）。
 
 ## 开发命令
 
@@ -207,6 +261,20 @@ npm run dev          # 开发态（tsx watch）
 - **Loomy 没有 refresh 端点**：token 过期只能重新登录（故主路径用手机号验证码，成本低）。
 - **`codearts` / `trae` 的 refresh token 一次性轮换**：从 DSH 导入后，建议只让一边刷新，
   否则两边会互相作废。
+- **Raccoon 每日 300 积分的「当日登录」触发端点已确证为 `GET /api/web/office/v3/setting_info`**
+  （2026-10-11 跨日对照实验）：每日积分由服务端自动发放（账单 `biz_type: 'daily_grant'`，
+  **没有签到端点**），但不登录就**当天 24:00 清零**，只有「当日登录」才延长到 7 天
+  （官方文案 `dailyGrantRule` 原文如此）。判定依据是账单里 `daily_grant.created_at`：
+  整点 `00:00:00` = 未延长，真实时刻 = 已延长。三条实测结论：
+  - ✅ **`setting_info` 触发延长**（实验组只调它 → 记录从无到有、`created_at` 为真实时刻）；
+  - ❌ **读 `/bills` 不触发**（对照组只读账单状态始终不变；另有一轮带鉴权反复读 14 分钟的反证）；
+  - ❌ **续期不算登录**（`/auth/v1/refresh` 不带 `Authorization` 头；实证 10-05~07 三天每小时都在续期，积分照样当天清零）。
+  ⚠️ 当天的 `daily_grant` 记录**并非 00:00 就存在**，而是「当天首次登录态动作」时才由服务端创建
+  —— 故「今天尚无记录」是干净初始态，不是「服务端还没发放」。
+  实现见 `keepAliveRaccoonDailyPoints`（候选链 `setting_info` → `balance`，按账单前后对比自验证）；
+  实验脚本 `scripts/probe-raccoon-daily-extension.mjs`，结果存档
+  `data/logs/raccoon-daily-extension-probe.json`。面板按钮「保活今日积分」供
+  「半夜电脑没开机」的用户次日手动补一次。
 - **`node:sqlite` 是 experimental**：启动时会打印警告，属预期。
 - **来源与本项目会逐渐分叉**：来源的缺陷修复不会自动同步；需要时按上表基线 commit
   对照 cherry-pick。

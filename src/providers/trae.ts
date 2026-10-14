@@ -36,6 +36,7 @@
 
 import { createHash } from 'node:crypto'
 import { jwtExpiresAtMs } from './buddy.js'
+import type { TokenUsage } from './llm.js'
 import { TRAE_CHANNELS, type TraeProduct } from './trae-product.js'
 
 // ── 端点路径 ──
@@ -1782,6 +1783,51 @@ function normalizeTraeToolCalls(calls: unknown[]): unknown[] {
     }
     return c
   })
+}
+
+/**
+ * SOLO `token_usage` 事件 → 规范 `TokenUsage`（**含缓存字段**）。
+ *
+ * ## 为什么必须做减法（2026-10-12 修，来源提交 c656537）
+ *
+ * TRAE 的 `prompt_tokens` 是**含缓存命中**的总输入量（与 Anthropic 口径相反）。
+ * 实测同前缀两次：`prompt_tokens` 恒为 4894，而 `cache_read_input_tokens`
+ * 从 0 变成 4864 —— 若把 `prompt_tokens` 直接当 `inputTokens` 下发，
+ * 命中率会被算成 49.8% 而非真实的 99.4%（缓存字段被适配器**整个丢弃**时
+ * 命中率恒为 0，是本次修复前的真实症状）。
+ *
+ * 三条判据：
+ * 1. 未命中输入 = `prompt_tokens - cache_read - cache_creation`；
+ * 2. `cache_creation_input_tokens` **也要从总输入减掉，但不计入命中** ——
+ *    它是「写入缓存」的 token，单列 `cacheWriteTokens`；
+ * 3. 减法要**钳到 0**：上游字段彼此矛盾时宁可少算未命中，也不能下发负数
+ *    （`TokenUsage` 的计数字段是 `nonnegative`）。
+ *
+ * 值为 0 时**省略字段**（契约上「无命中」是省略，不是写 0）。
+ *
+ * @param raw `token_usage` 事件的 data 对象（`parseTraeSSELine` 原样存入的 `ev.usage`）。
+ */
+export function traeUsageFromTokenUsage(raw: Record<string, unknown>): TokenUsage {
+  const num = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined
+
+  const promptTokens = num(raw.prompt_tokens)
+  const cacheRead = num(raw.cache_read_input_tokens)
+  const cacheWrite = num(raw.cache_creation_input_tokens)
+  const completionTokens = num(raw.completion_tokens)
+  const reasoningTokens = num(raw.reasoning_tokens)
+
+  // 未命中 = 总输入 - 命中 - 写入；钳到 0（见上方「宁可少算」）。
+  const billed = (promptTokens ?? 0) - (cacheRead ?? 0) - (cacheWrite ?? 0)
+  const inputTokens = Math.max(0, billed)
+
+  return {
+    inputTokens,
+    outputTokens: completionTokens ?? 0,
+    ...cacheRead !== undefined && cacheRead > 0 ? { cacheReadTokens: cacheRead } : {},
+    ...cacheWrite !== undefined && cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {},
+    ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
+  }
 }
 
 /**

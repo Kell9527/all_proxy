@@ -1,7 +1,7 @@
 /**
  * Raccoon Work 登录与续期的纯 API 层。
  *
- * ## 两条登录路径
+ * ## 三条登录路径
  *
  * 1. **微信扫码**（首选）：`code` 由**客户端本地随机生成**，服务端只做轮询查询。
  *    实测任意自造 code 都被接受并进入 `pending`，故完全绕开官方那条
@@ -9,6 +9,9 @@
  *    Node 进程）无法接收的。
  * 2. **短信验证码**（次选）：手机号需 AES-128-CFB 加密，且 `send_sms` 要求
  *    先过阿里云滑块拿到 `captcha_param`。
+ * 3. **密码登录**（官网入口）：手机号与密码都需 AES-128-CFB 加密
+ *    （同一函数，服务端逐字段解密）。官方登录页
+ *    （`https://xiaohuanxiong.com/login` 的「密码登录」Tab）即此链路。
  *
  * ## 为什么不用官方桌面端的授权码链路
  *
@@ -231,6 +234,53 @@ export async function loginRaccoonWithSmsCode(
     fetcher,
   )
   if (envelope.code !== 0) throw envelopeError(envelope, '短信登录失败')
+  return credentialFromEnvelope(envelope)
+}
+
+/**
+ * 用手机号 + 密码登录（官网登录页的「密码登录」链路）。
+ *
+ * 请求体形状与 `login_with_sms` 同构，但**密码同样要 AES-128-CFB 加密**
+ * （与手机号同一函数 `encryptRaccoonPhone`，服务端逐字段解密）。
+ * 依据官网前端：`` `{ nation_code, phone: J(h), password: J(u) }` ``，
+ * 其中 `J` 即加密函数（key `senseraccoon2023`，CFB，base64(iv‖密文)）。
+ *
+ * 实测错误码（未注册测试号，2026-10-08）：
+ * - `200004 phone_or_password_verify_error`：手机号未注册或密码错误；
+ * - `100002 param password invalid`：密码复杂度不足（服务端要求大小写混合，
+ *   纯小写/纯数字会被拒）—— 文案原样透传给页面即可，本地不复刻该规则；
+ * - `200101 limiter_phone_verify_error`：按手机号限流，兜底文案带冷却提示。
+ *
+ * ⚠️ 实测该端点**不校验** `Referer` / `Origin` / `User-Agent`（裸 curl 直连
+ * 与浏览器同款响应；曾误判为来源校验，实为测试号段/密码复杂度触发的
+ * `params_invalid_error`）。故 `postJson` 保持只发 `Content-Type`。
+ *
+ * @returns 完整凭据（`expires_at` 由 JWT 的 exp 推算）。
+ * @throws 账密错误、密码非法、网络失败。
+ */
+export async function loginRaccoonWithPassword(
+  product: RaccoonProduct,
+  phone: string,
+  password: string,
+  fetcher: typeof fetch = fetch,
+): Promise<RaccoonCredential> {
+  const { envelope } = await postJson(
+    `${product.apiBase}${product.authApiPrefix}/login_with_password`,
+    {
+      nation_code: '86',
+      phone: encryptRaccoonPhone(phone),
+      password: encryptRaccoonPhone(password),
+    },
+    fetcher,
+  )
+  if (envelope.code !== 0) {
+    // 限流文案带服务器给的冷却时间，对用户是可操作的（「稍后再试」）。
+    if (/\bretry after:(\d+)s/.test(envelope.details)) {
+      const seconds = /\bretry after:(\d+)s/.exec(envelope.details)?.[1] ?? ''
+      throw new Error(`raccoon: 登录尝试过于频繁，请 ${seconds} 秒后再试`)
+    }
+    throw envelopeError(envelope, '密码登录失败')
+  }
   return credentialFromEnvelope(envelope)
 }
 

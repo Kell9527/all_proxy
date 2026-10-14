@@ -29,9 +29,10 @@ import { join } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AccountPool } from '../pool/account-pool.js'
-import type { CredentialStore } from '../pool/types.js'
+import type { CredentialStore, ProviderAccountEntry } from '../pool/types.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import type { Logger } from '../pool/store.js'
+import { sensenovaNicknameFromKey } from '../providers/sensenova.js'
 import { AdminAuth, extractAdminSecret } from './auth.js'
 import { ApiKeyStore } from '../auth/api-keys.js'
 import type { UsageStore } from '../usage/store.js'
@@ -40,7 +41,7 @@ import type { LoginOrchestrator } from '../login/orchestrator.js'
 import { listAllModelsForAdmin } from '../gateway/model-resolver.js'
 import { retestAccount, retestAllAccounts, type ProbePool } from '../providers/account-probe.js'
 import { exportBackup, importBackup, type BackupPool as BackupPoolLike, type BackupCredentials as BackupCredentialsLike } from '../providers/backup.js'
-import { claimAll as claimAllCredits, claimOnboarding, fetchBalances } from './credits-endpoint.js'
+import { claimAll as claimAllCredits, claimOnboarding, fetchBalances, keepAliveDailyPoints } from './credits-endpoint.js'
 import { maskCredentialPath, parseCredentialRef, validateFileRefInput } from '../pool/credential-ref-kind.js'
 
 /** 管理 API 的依赖。 */
@@ -105,6 +106,85 @@ function asBackupPool(p: AccountPool): BackupPoolLike & { getStateSnapshot(): Re
     replaceAll: (accounts, disabledModels, loomyPermanentLocked) =>
       p.replaceAll({ accounts: [...accounts], disabledModels: { ...disabledModels }, loomyPermanentLocked: loomyPermanentLocked === true } as Parameters<AccountPool['replaceAll']>[0]),
   }
+}
+
+/**
+ * 读取凭据里的手机号，用作账号卡片的展示名。
+ *
+ * ## 为什么要这个
+ *
+ * 内置凭据的 ref 名是 `LOOMY_ACCOUNT_A1BAA706` 这类**机器生成**的标识，用户
+ * 看不出「这条凭据是哪部手机的」。而 Loomy 只能靠手机号验证码重新登录，过期
+ * 时用户必须对照手机号才知道该登哪个号 —— 故在卡片「凭据」一栏直接展示手机号。
+ *
+ * ## 为什么不做掩码
+ *
+ * 用户的用途是**照着重新登录**，掩码号（`138****8000`）没法直接输入，等于没
+ * 显示。这里是本地管理端（默认仅监听 127.0.0.1），且凭据文件里本来就明文存着
+ * 同一个手机号，展示明文**不新增任何泄露面**。
+ *
+ * ## 读不到就回退
+ *
+ * 无 `phone` 字段 / JSON 损坏 / 凭据缺失 / provider 不用手机号登录 —— 一律返回
+ * `undefined`，调用方回退到 ref 名，行为与改动前完全一致。
+ */
+async function displayPhoneOf(credentials: CredentialStore, ref: string): Promise<string | undefined> {
+  // 凭据读取失败不是错误：账号可能刚被删、或共享文件还没被官方客户端写出来。
+  const resolved = await credentials.resolve(ref).catch(() => undefined)
+  if (resolved === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(resolved.value)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const phone = (parsed as Record<string, unknown>)['phone']
+    return typeof phone === 'string' && phone.trim().length > 0 ? phone.trim() : undefined
+  } catch {
+    // 凭据值不保证是 JSON（各 provider 形态不一），解析失败即视为「无手机号」。
+    return undefined
+  }
+}
+
+/**
+ * 支持「粘贴静态 API Key 建号」的 provider 集合。
+ *
+ * ⚠️ **刻意是白名单而非「所有 provider」**：其余 10 个 provider 的凭据是
+ * 登录态 token（形如 `{access_token, refresh_token, expires_at}`），手填一把
+ * key 会造出无法续期、字段缺失的坏账号。只有 SenseNova 的凭据本身就是
+ * 一把静态 key。
+ *
+ * 新增静态 key provider 时在此登记（并在前端 PROVIDERS 里加对应按钮）。
+ */
+const STATIC_KEY_PROVIDERS: ReadonlySet<string> = new Set(['sensenova'])
+
+/**
+ * 用一把静态 API Key 建号：写凭据 → 落账号索引。
+ *
+ * ⚠️ **先写凭据、再写索引**（与 `LoginOrchestrator.settle` 同约定）：索引里
+ * 出现账号的前提是凭据已经落盘，否则会留下「选号器看得见却用不了」的账号。
+ *
+ * 凭据字段为 `access_token`（见 `/api/accounts` 端点注释）。
+ * `refreshable: false` —— 静态 key 无续期端点。
+ */
+async function createStaticKeyAccount(
+  pool: AccountPool,
+  credentials: CredentialStore,
+  provider: string,
+  apiKey: string,
+  nickname: string,
+): Promise<{ id: string; provider: string; nickname: string }> {
+  const ref = `${provider.toUpperCase()}_ACCOUNT_${randomBytes(4).toString('hex').toUpperCase()}`
+  await credentials.set(ref, JSON.stringify({ access_token: apiKey }))
+  const entry: ProviderAccountEntry = {
+    id: `${provider}-${randomBytes(4).toString('hex')}`,
+    provider,
+    // 昵称：用户显式指定优先，否则用脱敏后的 key（便于多把 key 的区分）。
+    nickname: nickname.length > 0 ? nickname : sensenovaNicknameFromKey(apiKey),
+    enabled: true,
+    credentialRef: ref,
+    createdAt: Date.now(),
+    refreshable: false,
+  }
+  await pool.addAccount(entry)
+  return { id: entry.id, provider: entry.provider, nickname: entry.nickname }
 }
 
 /** 创建管理 API 处理器。 */
@@ -291,6 +371,24 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       return true
     }
 
+    if (path === '/api/login/password/complete' && method === 'POST') {
+      if (options.login === undefined) {
+        sendJson(res, 503, { error: { code: 'login_unavailable', message: '登录编排未启用' } })
+        return true
+      }
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const provider = typeof body.value['provider'] === 'string' ? body.value['provider'].trim() : ''
+      const phone = typeof body.value['phone'] === 'string' ? body.value['phone'].trim() : ''
+      const password = typeof body.value['password'] === 'string' ? body.value['password'] : ''
+      if (provider.length === 0 || phone.length === 0 || password.length === 0) {
+        sendJson(res, 400, { error: { code: 'invalid_request_error', message: '缺少 provider、phone 或 password' } })
+        return true
+      }
+      await runWrite('login-password-complete', provider, () => options.login!.completePasswordLogin(provider, phone, password))
+      return true
+    }
+
     // ═══════════════ 只读诊断 ═══════════════
 
     if (path === '/api/admin/audit' && method === 'GET') {
@@ -349,13 +447,62 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       // 凭据引用的**展示形态**：文件引用给出脱敏路径（绝对路径会泄露本机
       // 用户名等，管理端可能被截图或投屏）。原始 ref 仍照常返回，供绑定界面
       // 回填与备份对账。
-      const data = listed.map((status) => {
+      //
+      // 内置凭据额外读一次凭据：能取到手机号就显示手机号（见 `displayPhoneOf`），
+      // 取不到仍显示 ref 名。逐条 `catch` 保证单个凭据读失败（共享文件尚未被
+      // 官方客户端写出等）不会让整个列表 500。
+      const data = await Promise.all(listed.map(async (status) => {
         const parsed = parseCredentialRef(status.credentialRef)
-        return parsed.kind === 'file'
-          ? { ...status, credentialKind: 'file', credentialDisplay: maskCredentialPath(parsed.path) }
-          : { ...status, credentialKind: 'inline', credentialDisplay: status.credentialRef }
-      })
+        if (parsed.kind === 'file') {
+          return { ...status, credentialKind: 'file', credentialDisplay: maskCredentialPath(parsed.path) }
+        }
+        const phone = await displayPhoneOf(credentials, status.credentialRef)
+        return {
+          ...status,
+          credentialKind: 'inline',
+          credentialDisplay: phone ?? status.credentialRef,
+        }
+      }))
       sendJson(res, 200, { data })
+      return true
+    }
+
+    /**
+     * 手动新增账号（粘贴静态 API Key）—— 目前仅 SenseNova 适用。
+     *
+     * ## 为什么需要它
+     *
+     * 其余 10 个 provider 的账号都来自**登录流程**（扫码 / OAuth / 短信 /
+     * 密码），凭据是登录态 token。SenseNova 是第一个**静态 API Key**
+     * provider：用户手里就是一把 `sk-...`，没有任何登录可走。此前不存在
+     * 「不经过登录就能建号」的路径，故补此端点。
+     *
+     * ## 约定
+     *
+     * - `provider` 必须是**已注册且支持静态 key** 的 provider（当前只有
+     *   `sensenova`）；其余一律拒绝，避免把登录态 provider 变成「凭据可手填」
+     *   而破坏其凭据形状。
+     * - `apiKey` 明文只在**本次请求**里出现，落盘进凭据存储（与登录流程同处），
+     *   **不回显、不写日志**（留痕只记 provider）。
+     * - 凭据字段写成 `access_token`（值是 key）—— 这是 `findAccountIdByCredential`
+     *   的既有约定，改字段名会让该账号永远登记不上。
+     */
+    if (path === '/api/accounts' && method === 'POST') {
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const provider = typeof body.value['provider'] === 'string' ? body.value['provider'].trim() : ''
+      const apiKey = typeof body.value['apiKey'] === 'string' ? body.value['apiKey'].trim() : ''
+      const rawNickname = typeof body.value['nickname'] === 'string' ? body.value['nickname'].trim() : ''
+      await runWrite('account-create', provider, async () => {
+        if (!STATIC_KEY_PROVIDERS.has(provider)) {
+          throw new Error(`provider "${provider}" 不支持粘贴 API Key 建号（当前仅支持: ${[...STATIC_KEY_PROVIDERS].join(', ')}）`)
+        }
+        if (registry.get(provider) === undefined) throw new Error(`未知 provider "${provider}"`)
+        if (apiKey.length === 0) throw new Error('缺少 apiKey')
+        const entry = await createStaticKeyAccount(pool, credentials, provider, apiKey, rawNickname)
+        // ⚠️ 只回昵称与 id，**绝不回显 key**（明文 key 只在请求体里出现过）。
+        return { ok: true, account: { id: entry.id, provider: entry.provider, nickname: entry.nickname } }
+      })
       return true
     }
 
@@ -565,6 +712,20 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       const accountId = typeof body.value['accountId'] === 'string' ? body.value['accountId'] : ''
       await runWrite('credits-onboarding', `${provider}/${accountId}`, () =>
         claimOnboarding(provider, accountId, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m) }))
+      return true
+    }
+
+    // 每日积分保活（仅 raccoon）：模拟「当日登录」，把当天到账的每日积分
+    // 有效期从「当天 24:00」延长到 7 天。
+    //
+    // ⚠️ 这是**写操作**（会改变服务端账期状态），故走 runWrite 留痕；
+    // 但它幂等 —— 当天已延长时直接返回 `already-extended`，不发触发请求。
+    if (path === '/api/credits/daily-keepalive' && method === 'POST') {
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
+      await runWrite('credits-daily-keepalive', provider, () =>
+        keepAliveDailyPoints(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m) }))
       return true
     }
 

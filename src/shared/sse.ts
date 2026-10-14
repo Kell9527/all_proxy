@@ -1033,3 +1033,68 @@ export function isProseTruncatedByStopString(text: string): boolean {
   // ② 必须以未闭合的开引号收尾（或半个标签，服务端可能已吐出一部分）
   return /`$/.test(tail) || /<$/.test(tail) || /<\/think$/.test(tail)
 }
+
+/**
+ * 对**完整字符串**做 DSML 工具调用标记归一化（幂等）。
+ *
+ * ## 为什么需要（2026-10-13 实测）
+ *
+ * 工具调用协议是模型写在正文里的文本标记（`<｜DSML｜invoke …>`，竖线是
+ * U+FF5C 全角竖线）。部分模型（实测 deepseek-v4.1-flash 经 OfficeAce MaaS、
+ * step-5-preview 经 CodeBuddy）会把它**写坏成双竖线** `<｜｜DSML｜｜` ——
+ * 宿主解析器不认，工具调用整段当正文显示，模型「停住不动」。
+ *
+ * 规则（幂等）：`<｜{2,}DSML` → `<｜DSML`；`DSML｜{2,}` → `DSML｜`。
+ *
+ * ⚠️ `DSML` 后必须有**分隔边界**（竖线/空白/`>`/`/`/结尾/**协议标签名首字母**），
+ * 否则正文里 `<｜｜DSMLX …` 这种以 DSML 开头的普通词会被误改（方向：宁可漏判
+ * 不可误伤）。首字母集合 `[tcip]` 覆盖 tool_calls/calls/invoke/parameter/thought。
+ */
+export function fixDsmlMarkers(text: string): string {
+  const AFTER = '(?=｜|\s|>|\/|$|[tcip])'
+  return text
+    .replace(new RegExp(`(<\/?)｜{2,}DSML${AFTER}`, 'g'), '$1｜DSML')
+    .replace(new RegExp(`DSML｜{2,}${AFTER}`, 'g'), 'DSML｜')
+}
+
+/**
+ * {@link fixDsmlMarkers} 的**流式安全**版本。
+ *
+ * ## 为什么不能逐帧直接 `replace`
+ *
+ * 标记会被上游切成任意片段（`<｜` + `｜DSML｜` + `｜invoke…`），逐帧 replace
+ * 每帧都只见半截模式。故这里持有**待定缓冲**：凡是可能构成模式前缀的尾部都
+ * 扣住不发，等下一帧拼齐再判。代价是文本恰好以 `<`、`<｜`、`DSML｜` 结尾时
+ * 最后几个字符会延迟到下一帧（或 `flush()`）。
+ */
+export function createDsmlMarkerNormalizer(): {
+  push: (text: string) => string
+  flush: () => string
+} {
+  let pending = ''
+  const PREFIX_PATTERNS = ['<｜｜DSML', '</｜｜DSML', 'DSML｜｜']
+  const MAX_PENDING = 9
+  function holdBackLen(s: string): number {
+    const max = Math.min(s.length, MAX_PENDING)
+    for (let len = max; len >= 1; len--) {
+      const tail = s.slice(-len)
+      if (PREFIX_PATTERNS.some((p) => p.startsWith(tail))) return len
+    }
+    return 0
+  }
+  return {
+    push(text: string): string {
+      pending += text
+      const fixed = fixDsmlMarkers(pending)
+      const hold = holdBackLen(fixed)
+      const out = hold > 0 ? fixed.slice(0, fixed.length - hold) : fixed
+      pending = hold > 0 ? fixed.slice(fixed.length - hold) : ''
+      return out
+    },
+    flush(): string {
+      const out = fixDsmlMarkers(pending)
+      pending = ''
+      return out
+    },
+  }
+}

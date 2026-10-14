@@ -19,7 +19,7 @@
  *   `GET /api/web/llm/v2/model_catalog` 取 `visible:true` 的 6 条
  */
 
-import { RACCOON_API_BASE, RACCOON_PHONE_CIPHER_SECRET } from './raccoon.js'
+import { RACCOON_API_BASE, RACCOON_OFFICE_PREFIX, RACCOON_PHONE_CIPHER_SECRET } from './raccoon.js'
 
 /** 兜底模型目录中的一个条目。 */
 export interface RaccoonFallbackModel {
@@ -49,6 +49,8 @@ export interface RaccoonProduct {
   llmApiPrefix: string
   /** 积分端点前缀。 */
   pointsApiPrefix: string
+  /** 个人版「办公」端点前缀（`setting_info` 等，每日积分保活用）。 */
+  officeApiPrefix: string
   /** 桌面端端点前缀。 */
   desktopApiPrefix: string
   /** User-Agent（仅记录用；实测该端点不校验 UA）。 */
@@ -155,6 +157,7 @@ export const RACCOON: RaccoonProduct = {
   authApiPrefix: '/api/web/auth/v1',
   llmApiPrefix: '/api/web/llm/v2',
   pointsApiPrefix: '/api/web/points/v1',
+  officeApiPrefix: RACCOON_OFFICE_PREFIX,
   desktopApiPrefix: '/api/web/desktop/v1',
   userAgent: 'Raccoon Work/1.0.35 (Windows)',
   clientPlatform: 'desktop-windows',

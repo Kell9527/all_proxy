@@ -5,6 +5,7 @@ import {
   exchangeRaccoonAuthorizationCode,
   fetchRaccoonUserInfo,
   generateQrCode,
+  loginRaccoonWithPassword,
   loginRaccoonWithSmsCode,
   pollRaccoonQrLogin,
   refreshRaccoonCredential,
@@ -153,6 +154,68 @@ describe('loginRaccoonWithSmsCode', () => {
     ))
     await expect(loginRaccoonWithSmsCode(RACCOON, '13800000000', 'bad', fetcher as unknown as typeof fetch))
       .rejects.toThrow(/sms code invalid/)
+  })
+})
+
+describe('loginRaccoonWithPassword', () => {
+  it('手机号与密码都加密后提交（密文不等于明文）', async () => {
+    const fetcher = vi.fn(async () => jsonResponse({
+      code: 0,
+      data: { access_token: 'at', refresh_token: 'rt', office_identity: 'personal' },
+    }))
+    await loginRaccoonWithPassword(
+      RACCOON, '13800000000', 'Passw0rd!', fetcher as unknown as typeof fetch,
+    )
+    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe(`${RACCOON.apiBase}${RACCOON.authApiPrefix}/login_with_password`)
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>
+    expect(body.nation_code).toBe('86')
+    // 手机号与密码都必须是密文（明文直传会被服务端拒）
+    expect(body.phone).not.toBe('13800000000')
+    expect(body.password).not.toBe('Passw0rd!')
+    expect(typeof body.phone).toBe('string')
+    expect(typeof body.password).toBe('string')
+  })
+
+  it('成功后返回完整凭据（含 expires_at 与 office_identity）', async () => {
+    const exp = Math.floor(Date.now() / 1000) + 3600
+    const fetcher = vi.fn(async () => jsonResponse({
+      code: 0,
+      data: { access_token: jwtWithExp(exp), refresh_token: 'r', office_identity: 'personal' },
+    }))
+    const credential = await loginRaccoonWithPassword(
+      RACCOON, '13800000000', 'Passw0rd!', fetcher as unknown as typeof fetch,
+    )
+    expect(credential.access_token).toBe(jwtWithExp(exp))
+    expect(credential.refresh_token).toBe('r')
+    expect(credential.expires_at).toBe(String(exp * 1000))
+    expect(credential.office_identity).toBe('personal')
+  })
+
+  it('缺少 access_token 时抛错（不产出半截凭据）', async () => {
+    const fetcher = vi.fn(async () => jsonResponse({ code: 0, data: { refresh_token: 'r' } }))
+    await expect(loginRaccoonWithPassword(RACCOON, '13800000000', 'Passw0rd!', fetcher as unknown as typeof fetch))
+      .rejects.toThrow(/access_token/)
+  })
+
+  it('账密错误（200004）时透传服务端文案', async () => {
+    const fetcher = vi.fn(async () => jsonResponse(
+      { code: 200004, message: 'phone_or_password_verify_error', details: 'phone or password is wrong' }, 400,
+    ))
+    await expect(loginRaccoonWithPassword(RACCOON, '13800000000', 'wrong', fetcher as unknown as typeof fetch))
+      .rejects.toThrow(/phone or password is wrong/)
+  })
+
+  it('限流（200101 retry after:N）时给出带冷却秒数的可操作提示', async () => {
+    const fetcher = vi.fn(async () => jsonResponse(
+      {
+        code: 200101,
+        message: 'limiter_phone_verify_error',
+        details: 'phone verify exceed max time, retry after:21s',
+      }, 429,
+    ))
+    await expect(loginRaccoonWithPassword(RACCOON, '13800000000', 'Passw0rd!', fetcher as unknown as typeof fetch))
+      .rejects.toThrow(/请 21 秒后再试/)
   })
 })
 

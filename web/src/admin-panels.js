@@ -27,6 +27,7 @@ const TABS = [
   { id: 'keys', label: 'API Keys' },
   { id: 'usage', label: '用量与状态' },
   { id: 'sms', label: '短信登录' },
+  { id: 'password', label: '密码登录' },
 ]
 
 /** 页面外壳：口令门 + 顶部标签页 + 内容区。 */
@@ -123,6 +124,7 @@ export function AdminShell() {
       tab === 'keys' ? React.createElement(KeysPanel)
         : tab === 'usage' ? React.createElement(UsagePanel)
           : tab === 'sms' ? React.createElement(SmsPanel)
+            : tab === 'password' ? React.createElement(PasswordPanel)
             : React.createElement(ProvidersSlot),
     ),
   )
@@ -182,7 +184,7 @@ function SmsPanel() {
     React.createElement('section', { style: sectionStyle },
       React.createElement('h3', { style: headingStyle }, '短信验证码登录'),
       React.createElement('p', { style: { color: 'var(--dsw-alias-label-secondary, #646a73)', fontSize: 13, margin: '0 0 12px' } },
-        '适用于 Loomy（主路径，可登录多个账号）与 Raccoon。Raccoon 也可用「Provider 管理 → 新建账号」的弹窗页（内含扫码与短信）。'),
+        '适用于 Loomy（主路径，可登录多个账号）与 Raccoon。Raccoon 也可用「Provider 管理 → 新建账号」的弹窗页（内含扫码 / 短信 / 密码三种方式），或用「密码登录」标签页走官网账密链路。'),
       React.createElement('div', { style: rowStyle },
         React.createElement('select', { style: inputStyle, value: provider, onChange: e => setProvider(e.target.value) },
           React.createElement('option', { value: 'loomy' }, 'Loomy'),
@@ -193,6 +195,58 @@ function SmsPanel() {
       sent && React.createElement('div', { style: rowStyle },
         React.createElement('input', { style: inputStyle, placeholder: '短信验证码', value: code, onChange: e => setCode(e.target.value) }),
         React.createElement('button', { style: primaryBtnStyle, disabled: busy || code.length === 0, onClick: complete }, '完成登录'),
+      ),
+      message !== null && React.createElement('p', { style: { fontSize: 13, color: message.tone === 'ok' ? '#9fdca4' : '#ff8f8f' } }, message.text),
+    ),
+  )
+}
+
+// ───────────────────────── 密码登录（Raccoon） ─────────────────────────
+
+/**
+ * 手机号 + 密码登录面板（Raccoon 官网的「密码登录」链路）。
+ *
+ * 与 SmsPanel 对称但走独立通道 `POST /api/login/password/complete`
+ * （协议层 `login_with_password`）。目前只有 Raccoon 支持密码登录
+ * （其余 provider 无该链路），故不做 provider 下拉。
+ *
+ * 密码复杂度由官网服务端判定（实测纯小写/纯数字会被拒），失败文案由
+ * 服务端透传，本地不复刻规则。
+ */
+function PasswordPanel() {
+  const [phone, setPhone] = React.useState('')
+  const [password, setPassword] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [message, setMessage] = React.useState(null)
+
+  const complete = async () => {
+    setBusy(true)
+    setMessage(null)
+    try {
+      const entry = await api('POST', '/api/login/password/complete', { provider: 'raccoon', phone, password })
+      setMessage({ tone: 'ok', text: `登录成功：${entry.nickname}（${entry.id}）已加入账号池` })
+      setPhone('')
+      setPassword('')
+    } catch (e) {
+      setMessage({ tone: 'error', text: e.message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const ready = phone.length > 0 && password.length > 0 && !busy
+
+  return React.createElement('div', { style: { padding: 16, maxWidth: 620, margin: '0 auto' } },
+    React.createElement('section', { style: sectionStyle },
+      React.createElement('h3', { style: headingStyle }, 'Raccoon 密码登录'),
+      React.createElement('p', { style: { color: 'var(--dsw-alias-label-secondary, #646a73)', fontSize: 13, margin: '0 0 12px' } },
+        '用商汤小浣熊官网（xiaohuanxiong.com）的账号密码直接登录 Raccoon，无需短信验证码。未注册手机号将按官网规则自动注册。'),
+      React.createElement('div', { style: rowStyle },
+        React.createElement('input', { style: inputStyle, placeholder: '手机号', value: phone, onChange: e => setPhone(e.target.value) }),
+      ),
+      React.createElement('div', { style: rowStyle },
+        React.createElement('input', { style: inputStyle, type: 'password', placeholder: '密码', value: password, onChange: e => setPassword(e.target.value) }),
+        React.createElement('button', { style: primaryBtnStyle, disabled: !ready, onClick: complete }, busy ? '登录中…' : '登录'),
       ),
       message !== null && React.createElement('p', { style: { fontSize: 13, color: message.tone === 'ok' ? '#9fdca4' : '#ff8f8f' } }, message.text),
     ),

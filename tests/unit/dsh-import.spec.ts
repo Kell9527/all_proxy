@@ -74,9 +74,10 @@ describe('parseCredentialRefs', () => {
 })
 
 describe('accountFromCredentialRef', () => {
-  it('**覆盖全部 10 个 provider 的前缀**（来源漏了四个）', () => {
+  it('**覆盖全部 11 个 provider 的前缀**（来源漏了四个）', () => {
     // ⚠️ 来源的 PROVIDER_BY_REF_PREFIX 只列了 6 个，遗漏 QODERCN / CLINE /
     // LOOMY / RACCOON —— 用户的凭据里确实有后三类，故必须补全。
+    // SENSENOVA 虽在 DSH 里没有登录态，但本项目「粘贴 key 建号」会造出该前缀。
     const cases: Array<[string, string]> = [
       ['CODEARTS_ACCOUNT_AABBCC', 'codearts'],
       ['BUDDY_ACCOUNT_AABBCC', 'buddy'],
@@ -88,6 +89,9 @@ describe('accountFromCredentialRef', () => {
       ['CLINE_ACCOUNT_AABBCC', 'cline'],
       ['LOOMY_ACCOUNT_AABBCC', 'loomy'],
       ['RACCOON_ACCOUNT_AABBCC', 'raccoon'],
+      ['OFFICEACE_ACCOUNT_AABBCC', 'officeace'],
+      ['ACCIO_ACCOUNT_AABBCC', 'accio'],
+      ['SENSENOVA_ACCOUNT_AABBCC', 'sensenova'],
     ]
     for (const [ref, provider] of cases) {
       const entry = accountFromCredentialRef(ref)

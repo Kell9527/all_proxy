@@ -1,15 +1,15 @@
 # all_proxy
 
-把 **10 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API** 的本地网关，自带网页管理端。
+把 **13 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API** 的本地网关，自带网页管理端。
 
 ```
-10 个 provider 账号池 ──┐
+13 个 provider 账号池 ──┐
                         ├──> all_proxy（单进程）──> OpenAI 兼容  /v1/chat/completions  /v1/models
 凭据自持、自动续期 ────┘            │                Anthropic 兼容 /v1/messages
                                     └──> 网页管理端（同源，账号 / 模型开关 / API Key / 用量 / 备份）
 ```
 
-支持的 provider：`codearts`（华为云）、`buddy`（腾讯 CodeBuddy）、`workbuddy`、`lobsterai`、`qoder`、`qodercn`、`trae`、`cline`、`loomy`、`raccoon`。
+支持的 provider：`codearts`（华为云）、`buddy`（腾讯 CodeBuddy）、`workbuddy`、`lobsterai`、`qoder`、`qodercn`、`trae`、`cline`、`loomy`、`raccoon`、`sensenova`（商汤开放平台，静态 API Key）。
 
 ## 环境要求
 
@@ -51,6 +51,7 @@ all_proxy: 已监听 http://127.0.0.1:3877 ...
 | `ALL_PROXY_PORT` | 监听端口 | `3877` |
 | `ALL_PROXY_HOST` | 监听地址 | `127.0.0.1` |
 | `ALL_PROXY_ADMIN_SECRET` | 管理口令（自设；本机监听至少 4 字符，对外监听至少 12 字符） | 自动生成 |
+| `SENSENOVA_API_KEYS` | SenseNova（商汤）静态 API Key，逗号分隔；仅在**尚无 sensenova 账号**时首次初始化 | 无 |
 
 ⚠️ **口令长度分级**：仅本机监听(默认 `127.0.0.1`)时口令至少 **4** 位(本机场景够用，少点记不住)；一旦对外监听(`0.0.0.0` / 局域网 IP)，**必须至少 12 位**且服务未设口令时拒绝启动——管理端能导出全部账号凭据，暴露到网络时短口令等于没有保护。
 
@@ -149,9 +150,15 @@ export ANTHROPIC_MODEL=buddy/glm-5.3   # <provider>/<model> 形式
 
 - 账号按 provider 分组管理，**数组顺序即选号优先级**（拖拽排序直接决定先用哪个账号）。
 - 同一 provider 内自动轮换：限流的账号按模型维度跳过并冷却；全部账号耗尽时如实报 `503`。
-- `loomy` / `raccoon` 没有轮换逻辑（与来源插件一致）。
 - 续期调度**只看账号是否可续期，不看启用状态**：停用的账号凭据照常保持新鲜。
 - 新增账号走管理端「新建账号」：codearts / lobsterai / qoder / qodercn / trae / cline / raccoon 是链接式登录（先弹窗后轮询；raccoon 弹窗内含扫码与短信）；**loomy 主路径是手机号验证码**（本地弹窗页输入手机号与验证码，可登录多个账号，与 design D12 一致），微信扫码保留为可选路径。
+- **`sensenova`（商汤开放平台）是静态 API Key provider**：它的「新建账号」按钮改为**粘贴 `sk-...`**（不需要登录）。可添加多把 key，顺序即轮询优先级 —— 正常情况钉住第一把；命中 `429`（tpm/rpm 限流）就写 **5 秒**冷却并换下一把；**若所有 key 都在冷却，不会直接报错，而是等到最早一把解禁继续轮询**（默认最多轮询 5 分钟），真正做到「不通就一直试」。配额类错误（额度耗尽）换号并锁到 UTC+8 当日 24:00。也可用环境变量 `SENSENOVA_API_KEYS`（逗号分隔）在**首次启动且尚无该 provider 账号**时批量初始化。
+
+## SenseNova（商汤开放平台）接入
+
+- 上游：`https://token.sensenova.cn/v1`，标准 OpenAI 兼容（`/v1/chat/completions`、`/v1/models`，标准 SSE）。
+- 模型按 `<provider>/<model>` 寻址，例如 **`sensenova/kimi-k3`**（即用户口语里的「K3」，最容易 429 的那个）、`sensenova/glm-5.2`、`sensenova/deepseek-v4-flash`、`sensenova/sensenova-6.8-flash-lite`（支持图片）等。模型目录**远端优先**（`/v1/models`），失败回退内置兜底表；出图模型（`sensenova-u1.5-lite`）不作为对话模型列出。
+- 一把 key 一个账号，key 明文只存在本地 `data/credentials.json`（已在 `.gitignore` 内），**绝不出现在日志、错误响应、备份之外的任何地方**；管理端卡片只显示脱敏昵称（前 6 后 4）。
 
 ## 一次性 refresh token 注意事项（重要）
 
@@ -196,6 +203,7 @@ export ANTHROPIC_MODEL=buddy/glm-5.3   # <provider>/<model> 形式
 |---|---|
 | `GET /api/providers` | provider 清单与账号计数 |
 | `GET /api/accounts?provider=` | 账号列表（含状态、凭据来源与脱敏路径） |
+| `POST /api/accounts` | 用静态 API Key 新增账号（`provider` + `apiKey` [+ `nickname`]；仅 `sensenova`） |
 | `PATCH/DELETE /api/accounts/:id` | 停用/启用、删除账号 |
 | `POST /api/accounts/credential-file` | 绑定/解绑共享凭据文件（`accountId` + `filePath`，空 `filePath` = 解绑） |
 | `POST /api/accounts/reorder` | 调整选号优先级 |
@@ -223,7 +231,7 @@ export ANTHROPIC_MODEL=buddy/glm-5.3   # <provider>/<model> 形式
 - **Loomy 没有 refresh 端点**：token 过期只能重新登录（手机号验证码路径成本低）。
 - **`codearts` / `trae` 一次性 refresh token**：见上文注意事项。
 - **`node:sqlite` 是 experimental**：启动时打印警告，属预期。
-- 账号、模型开关、API Key、用量、备份、**积分（余额查询 / 每日签到 / 新手任务，十个 provider 按能力矩阵分派）**均可用；不支持签到或余额的 provider（workbuddy / cline / raccoon 的部分能力）会返回明确提示而不假装成功。
+- 账号、模型开关、API Key、用量、备份、**积分（余额查询 / 每日签到 / 新手任务，各 provider 按能力矩阵分派）**均可用；不支持签到或余额的 provider（workbuddy / cline / raccoon 的部分能力、sensenova 的全部积分能力）会返回明确提示而不假装成功。
 
 ### 模型目录快照（`data/catalogs/`）
 

@@ -13,12 +13,12 @@ import { parseModelRef } from '../../src/providers/registry.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
-/** 全部 10 个 provider 的期望清单（与规格一致）。 */
+/** 全部 13 个 provider 的期望清单（与规格一致）。 */
 const EXPECTED = [
-  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon',
+  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'officeace', 'accio', 'sensenova',
 ]
 
-describe('10 个 provider 的装配', () => {
+describe('13 个 provider 的装配', () => {
   let dir: string
   let pool: AccountPool
   let registry: ProviderRegistry
@@ -42,9 +42,9 @@ describe('10 个 provider 的装配', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('注册了全部 10 个 provider（一个不少、一个不多）', () => {
+  it('注册了全部 13 个 provider（一个不少、一个不多）', () => {
     expect(registry.ids().sort()).toEqual([...EXPECTED].sort())
-    expect(registry.ids()).toHaveLength(10)
+    expect(registry.ids()).toHaveLength(13)
   })
 
   it('ALL_PROVIDER_IDS 与注册结果一致（防止清单漂移）', () => {
@@ -79,18 +79,27 @@ describe('10 个 provider 的装配', () => {
     expect(registry.get('codearts')?.descriptor.supportsImages).toBe(false)
   })
 
-  it('**loomy 与 raccoon 登记为会轮换账号**（2026-09-29 起补上了请求级换号）', () => {
-    // 早期如实登记为 false（来源没有轮换逻辑）；后应用户要求为两者补上
-    // 「额度耗尽 / 限流 / 认证失败 → 换下一个账号」的故障转移，
+  it('**loomy / raccoon / sensenova 登记为会轮换账号**', () => {
+    // loomy 与 raccoon 早期如实登记为 false（来源没有轮换逻辑）；后应用户要求
+    // 为两者补上「额度耗尽 / 限流 / 认证失败 → 换下一个账号」的故障转移，
     // 换号带 tried 排除集不会反复重试同一个账号，故如实改登记为 true。
+    // sensenova（静态 API Key）同样有请求级换号：429 换下一把 key（用户要求）。
     expect(registry.get('loomy')?.descriptor.rotatesAccounts).toBe(true)
     expect(registry.get('raccoon')?.descriptor.rotatesAccounts).toBe(true)
+    expect(registry.get('sensenova')?.descriptor.rotatesAccounts).toBe(true)
   })
 
   it('其余 provider 登记为会轮换账号', () => {
     for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline']) {
       expect(registry.get(id)?.descriptor.rotatesAccounts, `${id} 应会轮换`).toBe(true)
     }
+  })
+
+  it('sensenova 用 Bearer 鉴权、支持图片、远端目录', () => {
+    const descriptor = registry.get('sensenova')!.descriptor
+    expect(descriptor.authKind).toBe('bearer')
+    expect(descriptor.catalogSource).toBe('remote-first')
+    expect(descriptor.apiBase).toBe('https://token.sensenova.cn/v1')
   })
 
   it('重复注册同一个 id 会抛错（而不是静默覆盖）', () => {
@@ -100,7 +109,7 @@ describe('10 个 provider 的装配', () => {
   })
 })
 
-describe('10 个 provider 的模型目录', () => {
+describe('11 个 provider 的模型目录', () => {
   let dir: string
   let pool: AccountPool
   let registry: ProviderRegistry
@@ -211,7 +220,7 @@ describe('Qoder WASM 资产', () => {
   })
 })
 
-describe('模型寻址在 10 个 provider 上的表现', () => {
+describe('模型寻址在 11 个 provider 上的表现', () => {
   it('每个 provider 的 id 都能作为前缀解析', () => {
     for (const id of EXPECTED) {
       const parsed = parseModelRef(`${id}/some-model`)

@@ -1,5 +1,5 @@
 /**
- * 装配层：把 10 个 provider 的适配器接进注册表。
+ * 装配层：把 11 个 provider 的适配器接进注册表。
  *
  * ## 为什么单独一层
  *
@@ -171,6 +171,9 @@ import { TraeAdapter } from './trae-adapter.js'
 import { ClineAdapter } from './cline-adapter.js'
 import { LoomyAdapter } from './loomy-adapter.js'
 import { RaccoonAdapter } from './raccoon-adapter.js'
+import { OfficeAceAdapter } from './officeace-adapter.js'
+import { AccioAdapter } from './accio-adapter.js'
+import { SensenovaAdapter, fetchSensenovaRemoteModels } from './sensenova-adapter.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
@@ -178,6 +181,11 @@ import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import { LOOMY } from './loomy-product.js'
 import { RACCOON } from './raccoon-product.js'
+import { OFFICEACE } from './officeace-product.js'
+import { ACCIO } from './accio-product.js'
+import { fetchAccioRemoteModels, parseAccioCredential } from './accio-auth.js'
+import type { AccioCredential } from './accio.js'
+import { SENSENOVA } from './sensenova-product.js'
 
 /** 装配上下文：适配器需要的全部外部依赖。 */
 export interface WiringContext {
@@ -238,12 +246,15 @@ function descriptorFor(
 }
 
 /**
- * 构造全部 10 个 provider 的适配器并注册。
+ * 构造全部 11 个 provider 的适配器并注册。
  *
  * ⚠️ `loomy` 与 `raccoon` 的 `rotatesAccounts` 起初为 false：来源里它们
  * **没有**轮换逻辑。2026-09-29 应用户要求为两者补上了**请求级换号**
  * （额度耗尽 / 限流 / 认证失败时换下一个账号，见各自适配器的 stream 注释）
  * —— 换号带 `tried` 排除集，不会反复重试同一个账号，故如实改登记为 true。
+ *
+ * ⚠️ `sensenova` 是本项目第 11 个 provider，也是**第一个用静态 API Key**
+ * 的（其余 10 个都是登录态凭据）。它同样有请求级换号（429 换下一把 key）。
  */
 export function registerAllProviders(registry: ProviderRegistry, ctx: WiringContext): void {
   currentPool = ctx.pool
@@ -346,7 +357,9 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
     descriptorFor('trae', TRAE.displayName, TRAE.agentHost),
     new TraeAdapter({
       credentialRef: 'TRAE_ACCESS_TOKEN' as never,
-      resolveCredential: () => ctx.resolveCredential('trae') as never,
+      // ⚠️ 必须透传 modelId：空串会让模型级限流过滤整体短路，换号形同虚设
+      //（见 TraeAdapterOptions.resolveCredential 的说明）。
+      resolveCredential: (modelId?: string) => ctx.resolveCredential('trae', modelId) as never,
       refresh: () => ctx.refresh('trae'),
       accountPool: ctx.pool,
       product: TRAE,
@@ -475,12 +488,83 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       readImage: ctx.readImage,
     }),
   )
+
+  // ── OfficeAce（华为 ModelArts MaaS）：Basic 鉴权 + 按账号下发 baseUrl ──
+  //
+  // ⚠️ 与其余 provider 的差异：**推理 baseUrl 由凭据按账号下发**（`maasBaseUrl`），
+  // 硬编码默认域会对同账号回 401 `APIG.1009`（见 officeace-adapter 的
+  // `maasBaseUrlOf`）。目录是**静态表 + 探测门控**（`/v2/models` 只返回 id、
+  // 不返回能力元数据，故 `catalogSource: 'static-only'`）。
+  //
+  // 不写 `modelRateLimits`（无请求级换号），故 `rotatesAccounts: false`。
+  registry.register(
+    descriptorFor('officeace', OFFICEACE.displayName, OFFICEACE.defaultBaseUrl, {
+      authKind: 'custom',
+      catalogSource: 'static-only',
+      supportsImages: true,
+      rotatesAccounts: false,
+    }),
+    new OfficeAceAdapter({
+      resolveCredential: () => ctx.resolveCredential('officeace') as never,
+      refresh: () => ctx.refresh('officeace'),
+      readImage: ctx.readImage,
+    }),
+  )
+
+  // ── Accio（阿里 Accio Work）：标准 OAuth + PKCE，Gemini 族协议 ──
+  //
+  // ⚠️ 与其余 provider 的差异：**token 必须在请求 body**（放 Authorization 头恒
+  // 流内 402），且**对外 id 是「人话」slug、上行须反查上游 `modelCode`**（见
+  // accio-adapter）。目录**动态拉取**（`POST /api/llm/config/v2`，token 在 body），
+  // 失败回退兜底表 ⇒ `catalogSource: 'remote-first'`。
+  //
+  // 不写 `modelRateLimits`（无请求级换号），故 `rotatesAccounts: false`。
+  registry.register(
+    descriptorFor('accio', ACCIO.displayName, ACCIO.gatewayBaseUrl, {
+      authKind: 'custom',
+      catalogSource: 'remote-first',
+      supportsImages: false,
+      rotatesAccounts: false,
+    }),
+    new AccioAdapter({
+      // ⚠️ 透传 modelId：选号器按它过滤限流账号（空串会让过滤整体短路）。
+      resolveCredential: (modelId?: string) => ctx.resolveCredential('accio', modelId) as never,
+      refresh: () => ctx.refresh('accio'),
+      accountPool: ctx.pool,
+      fetchRemoteModels: () => fetchRemoteCatalog('accio', async () => {
+        const account = await ctx.pool.getAvailableAccount('accio', '')
+        const credential = parseAccioCredential(JSON.stringify(account?.credential ?? {}))
+        if (credential === undefined) return []
+        return fetchAccioRemoteModels(credential as AccioCredential, fetcher)
+      }),
+    }),
+  )
+
+  // ── SenseNova（商汤开放平台）：**静态 API Key**，请求级换号 ── ⚠️ 本 provider 与其余 10 个不同类：凭据就是一把静态 `sk-...`（无登录、
+  // 无 refresh）。账号来源是「管理端粘贴 key」（见 admin 的 POST /api/accounts），
+  // 故这里注入 `resolveCredential`（取号）与 no-op 的 refresh（静态 key 无
+  // 续期端点，适配器也不会调用它）。
+  //
+  // 换号语义：正常情况钉住手动顺序的第一个 key；命中 429（tpm/rpm 限流）
+  // 就换下一把重试 —— 用户明确要求（K3 模型容易 429）。
+  registry.register(
+    descriptorFor('sensenova', SENSENOVA.displayName, SENSENOVA.apiBase, { rotatesAccounts: true }),
+    new SensenovaAdapter({
+      resolveCredential: () => ctx.resolveCredential('sensenova') as never,
+      refresh: async () => {},
+      accountPool: ctx.pool,
+      product: SENSENOVA,
+      readImage: ctx.readImage,
+      fetchRemoteModels: () => fetchRemoteCatalog('sensenova', async () =>
+        fetchSensenovaRemoteModels(ctx.pool, SENSENOVA, fetcher)),
+    }),
+  )
 }
 
 /**
  * 全部 provider 的 id（顺序与 `registerAllProviders` 的注册顺序一致）。
  *
- * ⚠️ 与注册顺序**必须保持同步**：测试用它断言「10 个都在」，
+ * ⚠️ 与注册顺序**必须保持同步**：测试用它断言「11 个都在」，
  * 漏一个就说明装配有缺口。
  */
 export const ALL_PROVIDER_IDS = [
@@ -494,4 +578,7 @@ export const ALL_PROVIDER_IDS = [
   'cline',
   'loomy',
   'raccoon',
+  'officeace',
+  'accio',
+  'sensenova',
 ] as const

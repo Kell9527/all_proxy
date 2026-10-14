@@ -92,7 +92,7 @@ describe('Raccoon 面板图标', () => {
 describe('Raccoon 的能力登记', () => {
   it('**登记了 onboardingTasks（登录奖励）**，故面板会渲染领取按钮', () => {
     expect(capabilitiesSource).toMatch(
-      /raccoon: Object\.freeze\(\{ balance: true, onboardingTasks: true \}\)/,
+      /raccoon: Object\.freeze\(\{ balance: true, onboardingTasks: true, dailyKeepalive: true \}\)/,
     )
   })
 
@@ -101,5 +101,25 @@ describe('Raccoon 的能力登记', () => {
     const line = capabilitiesSource.split('\n').find((l) => l.includes('raccoon: Object.freeze'))
     expect(line).toBeDefined()
     expect(line).not.toContain('dailyCheckin')
+  })
+
+  /**
+   * ⚠️ `dailyKeepalive` 与 `dailyCheckin` **语义不同，不能互相推断**：
+   * - `dailyCheckin` = 有一个可调用的端点，调用后**新增**积分（raccoon 没有）
+   * - `dailyKeepalive` = 积分已自动发放，调用后只是**保住不过期**
+   *   （当天 24:00 → 7 天）
+   * 用户报障：「半夜电脑没开机」时每日积分白白清零 —— 保活按钮正是为此。
+   */
+  it('登记了 dailyKeepalive（每日积分保活，与签到是不同能力）', () => {
+    const line = capabilitiesSource.split('\n').find((l) => l.includes('raccoon: Object.freeze'))
+    expect(line).toContain('dailyKeepalive: true')
+  })
+
+  it('除 raccoon 外没有其他 provider 登记 dailyKeepalive（避免对不支持的渠道发请求）', () => {
+    const lines = capabilitiesSource.split('\n').filter((l) => l.includes('Object.freeze({') && l.includes('balance:'))
+    for (const line of lines) {
+      if (line.includes('raccoon')) continue
+      expect(line, `意外的 dailyKeepalive 登记：${line.trim()}`).not.toContain('dailyKeepalive')
+    }
   })
 })

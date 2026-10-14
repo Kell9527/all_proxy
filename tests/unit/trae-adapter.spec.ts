@@ -1190,6 +1190,177 @@ describe('TRAE 适配器 · 限流换号', () => {
     const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
     expect((error as { code?: string }).code).toBe('AUTH')
   })
+
+  it('4008 冷却时长按类别取 24 小时（不是 1 小时兜底）', async () => {
+    // 原实现一律 1 小时兜底 ⇒ 日配额耗尽的账号 1 小时后被选回、又 4008。
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => null),
+    }
+    const { adapter } = makeAdapter({
+      accountPool: pool,
+      responses: [new Response('{"code":4008,"msg":"quota exceeded"}', { status: 400 })],
+    })
+    await collect(adapter, BASIC_OPTIONS).catch(() => {})
+    expect(pool.updateModelRateLimit).toHaveBeenCalled()
+    const resetAt = pool.updateModelRateLimit.mock.calls[0]![2] as number
+    const delta = resetAt - Date.now()
+    // 落在 (23h, 24h] 区间。
+    expect(delta).toBeGreaterThan(23 * 3_600_000)
+    expect(delta).toBeLessThanOrEqual(24 * 3_600_000)
+  })
+})
+
+/**
+ * 流内错误换号（A7）。
+ *
+ * ## 修的是什么
+ *
+ * 换号逻辑原**整体写在 `if (!response.ok)` 里**，而上游用
+ * `HTTP 200 + SSE event:error` 下发额度错误时它**一行都不执行** ⇒ 用户报障
+ * 「不会切换账号」。修法：未产出内容时抛哨兵码，外层换号重发（已产出内容则
+ * 如实抛错，绝不重放防重复计费）。
+ *
+ * ⚠️ 换号必须传**真实 modelId** 与 `tried`：空 modelId 会让限流过滤整体短路，
+ * 刚标记的账号立刻又被选中 —— 换号形同虚设。
+ */
+describe('TRAE 适配器 · 流内错误换号', () => {
+  /** 造一个能观察 modelId / tried 的账号池。 */
+  function makePool(nextCredential: TraeCredential | null) {
+    return {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async (_provider: string, _model: string, _tried: ReadonlySet<string>) =>
+        nextCredential === null
+          ? null
+          : { entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' }, credential: nextCredential }),
+    }
+  }
+
+  it('流内 4008 且未产出内容 → 换号重发（HTTP 200 也换号）', async () => {
+    const pool = makePool(makeCredential({ access_token: 'AT2' }))
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 4008, message: '配额超限' }])),
+        sseResponse(soloSse(['output', { response: '第二个账号的回答' }], ['done', { finish_reason: 'stop' }])),
+      ],
+    })
+    const chunks = await collect(adapter, BASIC_OPTIONS)
+
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    // 当前账号被标记（按类别 24h）。
+    expect(pool.updateModelRateLimit).toHaveBeenCalled()
+    const delta = (pool.updateModelRateLimit.mock.calls[0]![2] as number) - Date.now()
+    expect(delta).toBeGreaterThan(23 * 3_600_000)
+    // ⚠️ 换号时 modelId 必须非空且 tried 已含首个账号。
+    const args = pool.getAvailableAccount.mock.calls[0]!
+    expect(args[1], 'modelId 必须透传（空串会让限流过滤短路）').toBe(BASIC_OPTIONS.model)
+    expect([...(args[2] as ReadonlySet<string>)]).toContain('trae-1')
+  })
+
+  it('流内 1005 同样触发换号', async () => {
+    const pool = makePool(makeCredential({ access_token: 'AT2' }))
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 1005, message: 'plan 权益不足' }])),
+        sseResponse(soloSse(['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }])),
+      ],
+    })
+    await collect(adapter, BASIC_OPTIONS)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('**已产出正文后**的流内错误不换号、不重发（防重复计费）', async () => {
+    const pool = makePool(makeCredential({ access_token: 'AT2' }))
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(
+          ['output', { response: '已经说了一半' }],
+          ['error', { code: 4008, message: '配额超限' }],
+        )),
+      ],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+    // 只发过一次：绝不在已产出内容后重放。
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(pool.getAvailableAccount).not.toHaveBeenCalled()
+  })
+
+  it('无账号池时流内 4008 如实抛 QUOTA_EXCEEDED（不带哨兵码）', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(['error', { code: 4008, message: '配额超限' }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+  })
+
+  it('全部账号流内失败 → 如实抛错，不无限循环', async () => {
+    const pool = makePool(null)
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [sseResponse(soloSse(['error', { code: 4008, message: '配额超限' }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * 流内错误码归类（A8）。
+ *
+ * `4006`（请求体过大）**不能**落 `SERVER`（在可重试集合里 ⇒ 巨型请求体被原样
+ * 重发 N 次必然再失败），改归 `CONTEXT_WINDOW_EXCEEDED`；`4001`（模型不可调用）
+ * 与 `4006` **不可合并**（一个是模型维度、一个是载荷维度）。
+ */
+describe('TRAE 适配器 · 流内错误码归类', () => {
+  it('4006（请求体过大）归 CONTEXT_WINDOW_EXCEEDED，且文案点明图片过多', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(['error', { code: 4006, message: 'content is too large' }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect(String((error as Error).message)).toContain('内容过大')
+  })
+
+  it('4006 不换号（载荷问题换账号也解决不了）', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => null),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [sseResponse(soloSse(['error', { code: 4006, message: 'too large' }]))],
+    })
+    await collect(adapter, BASIC_OPTIONS).catch(() => {})
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(pool.getAvailableAccount).not.toHaveBeenCalled()
+  })
+
+  it('4001（模型不可调用）仍归 SERVER 且文案点明模型不被接受（与 4006 不可合并）', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(['error', { code: 4001, message: 'param is invalid' }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('SERVER')
+    expect(String((error as Error).message)).toContain('不被上游接受')
+    expect(String((error as Error).message)).not.toContain('内容过大')
+  })
+
+  it('未知码仍归 SERVER', async () => {
+    const { adapter } = makeAdapter({
+      responses: [sseResponse(soloSse(['error', { code: 5000, message: 'boom' }]))],
+    })
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('SERVER')
+  })
 })
 
 describe('TRAE 适配器 · prepareCall', () => {

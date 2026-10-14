@@ -59,10 +59,14 @@ import { RefreshTokenExpiredError as ClineRefreshExpired } from '../providers/cl
 import { RACCOON } from '../providers/raccoon-product.js'
 import { refreshRaccoonCredential } from '../providers/raccoon-oauth.js'
 import type { RaccoonCredential } from '../providers/raccoon.js'
+import { refreshOfficeAceCredential, type OfficeAceCredential } from '../providers/officeace-auth.js'
+import { refreshAccioCredential } from '../providers/accio-oauth.js'
+import { accioExpiresAtMs, type AccioCredential } from '../providers/accio.js'
+import { isAccioTerminalRefreshError } from '../providers/accio-auth.js'
 
 /** 已接线的 provider。loomy 没有 refresh 端点，属已知限制（AGENTS.md）。 */
 export const REFRESH_SUPPORTED_PROVIDERS = new Set([
-  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon',
+  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon', 'officeace', 'accio',
 ])
 
 /** 刷新结果：新凭据（整体替换写回凭据存储）。 */
@@ -295,6 +299,66 @@ async function refreshRaccoon(credential: Record<string, unknown>, fetcher: type
 }
 
 /**
+ * OfficeAce：华为云 STS `refresh_token` 交换（**一次性**，返回后必须立即回写）。
+ *
+ * ⚠️ DPoP 私钥从凭据里的 `dpopPrivateJwk` 读（跟着凭据 JSON 落盘，天然持久化）
+ * —— 刷新必须用**同一把**私钥签 proof。
+ *
+ * ⚠️ 刷新成功后还会再调一次 `fetchModelInfo`（SDK-HMAC-SHA256 签名）拉新的 MaaS
+ * Basic 凭据，这是一次额外网络往返（`refreshOfficeAceCredential` 内部完成）。
+ */
+async function refreshOfficeAce(credential: Record<string, unknown>): Promise<RefreshedCredential> {
+  const c = credential as unknown as OfficeAceCredential
+  if (typeof c.refreshToken !== 'string' || c.refreshToken.length === 0) {
+    throw new Error('OfficeAce 凭据缺少 refresh_token，请重新登录')
+  }
+  if (c.dpopPrivateJwk === undefined || typeof c.dpopPrivateJwk.x !== 'string') {
+    throw new Error('OfficeAce 凭据缺少 DPoP 私钥（dpopPrivateJwk），无法续期，请重新登录')
+  }
+  const next = await refreshOfficeAceCredential(c)
+  if (next === undefined) {
+    // refresh_token 一次性，被消费/失效 ⇒ 终态，需重新登录。
+    throw new RefreshTokenExpiredError('OfficeAce refresh_token 已失效（一次性），请重新登录')
+  }
+  return next as unknown as RefreshedCredential
+}
+
+/**
+ * Accio：`POST /api/auth/refresh_token`（**轮换 refresh_token**，返回后必须立即回写）。
+ *
+ * ⚠️ 参考实现明确记录「刷新会轮换 refresh_token」⇒ 必须由本项目既有的
+ * `RefreshCoordinator`（按凭据引用单飞）+ `refresh-account.ts`（锁内重读）保护，
+ * 否则并发下「1 成功、其余 invalid_grant」，失败方会把好账号标死。
+ */
+async function refreshAccio(credential: Record<string, unknown>, fetcher: typeof fetch): Promise<RefreshedCredential> {
+  const c = credential as unknown as AccioCredential
+  if (typeof c.refresh_token !== 'string' || c.refresh_token.length === 0) {
+    throw new Error('Accio 凭据缺少 refresh_token，请重新登录')
+  }
+  let token
+  try {
+    token = await refreshAccioCredential({ credential: c, fetcher })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    // 终态判据必须窄：只有服务端明确说「这份 refresh_token 不认了」才算终态；
+    // 网络抖动/5xx/超时是可重试的普通错误（否则一次瞬时失败被固化成单向门）。
+    if (isAccioTerminalRefreshError(error) || /401|403/.test(message)) {
+      throw new RefreshTokenExpiredError(`Accio refresh_token 已失效，请重新登录（${message}）`)
+    }
+    throw networkError('Accio', error)
+  }
+  // 保留无变化字段（region / user_id / accio_id / nickname）。
+  return {
+    ...credential,
+    access_token: token.access_token,
+    refresh_token: token.refresh_token,
+    expires_at: token.expires_at,
+    ...(token.sgcookie === undefined ? {} : { sgcookie: token.sgcookie }),
+    region: c.region ?? 'cn',
+  } as RefreshedCredential
+}
+
+/**
  * 刷新某账号的凭据并返回**新凭据**。
  *
  * ⚠️ 调用方（调度器/适配器回调）必须把返回值**立即回写**凭据存储——
@@ -319,6 +383,8 @@ export async function refreshProviderCredential(
     case 'trae': return refreshTrae(credential, fetcher)
     case 'cline': return refreshCline(credential, fetcher)
     case 'raccoon': return refreshRaccoon(credential, fetcher)
+    case 'officeace': return refreshOfficeAce(credential)
+    case 'accio': return refreshAccio(credential, fetcher)
     case 'loomy':
       throw new Error('Loomy 没有 refresh 端点，token 过期只能重新登录（手机号验证码路径成本很低）')
     default:

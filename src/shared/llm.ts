@@ -56,6 +56,22 @@ export interface ContentBlockLike {
   [key: string]: unknown
 }
 
+/**
+ * 内容块（判别联合）—— 供**纯翻译层**（如 `gemini-messages.ts`）按 `type` 收窄。
+ *
+ * ⚠️ 与 {@link ContentBlockLike} 的分工：那个是「宽松读取」（适配器从 harness
+ * 拿到什么就按结构读什么，未知块类型也能透传）；本类型是**判别联合**，
+ * 只在「我们已经把块**构造**成这几种」的翻译/产出路径上使用 —— 那时按
+ * `type` 收窄是安全的、且能拿到 `text` / `id` / `name` 等具名字段。
+ *
+ * 成员与来源 DSH 的 `ContentBlock` 对齐（本项目实际产出的子集）。
+ */
+export type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'tool-call'; id: ToolCallId; name: string; arguments: string }
+  | { type: 'image'; attachment: { attachmentId?: string; [key: string]: unknown } }
+
 /** 消息：角色 + 内容 + 工具结果所需的顶层字段。 */
 export interface RequestMessage {
   role: string
