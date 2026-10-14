@@ -276,6 +276,12 @@ export function raccoonDisplayName(model: RaccoonModelMeta): string {
  * 依据客户端 `createHeaders()`。`X-Client-Platform` 对
  * `desktop/v1/login/points/grant` **必需**（取值必须是
  * `desktop-windows` / `desktop-macos` / `desktop-linux`）。
+ *
+ * ⚠️ **`X-Org-Code` 只能放真正的组织码**（实测 2026-10-14）：个人账号的
+ * `office_identity` 是字面量 `'personal'`（官方客户端就往共享凭据文件里写这个值），
+ * 把它原样发过去，服务端会**当组织码去查库**并回
+ * `HTTP 400 code=200022 org_not_found_error` —— `/points/v1/balance` 首当其冲。
+ * 客户端对个人账号发的是**空串**，故这里同样折叠成空串。
  */
 export function raccoonHeaders(
   credential: RaccoonCredential,
@@ -286,7 +292,7 @@ export function raccoonHeaders(
     'Content-Type': 'application/json',
     Authorization: `Bearer ${credential.access_token}`,
     // 个人账号为空串；客户端总是发送该头
-    'X-Org-Code': credential.office_identity ?? '',
+    'X-Org-Code': orgCodeOf(credential),
     'X-Raccoon-Language': 'zh',
   }
   if (opts.platform !== undefined && opts.platform.length > 0) {
@@ -299,4 +305,41 @@ export function raccoonHeaders(
     headers['X-Client-Device-ID'] = credential.device_id
   }
   return headers
+}
+
+/**
+ * 取要发出去的 `X-Org-Code` 值。
+ *
+ * 只有**真正的组织码**才发出去；个人账号的 `'personal'` 与空值一律折叠成空串
+ * （服务端会把非空值当组织码查库，个人账号必然 `org_not_found_error`）。
+ */
+function orgCodeOf(credential: RaccoonCredential): string {
+  const raw = credential.office_identity
+  if (typeof raw !== 'string') return ''
+  const trimmed = raw.trim()
+  // `personal` 是官方客户端写进共享凭据文件的分身标识，不是组织码
+  if (trimmed.length === 0 || trimmed.toLowerCase() === 'personal') return ''
+  return trimmed
+}
+
+/**
+ * 鉴权失败的业务码（服务端 `authorization_verify_error`）。
+ *
+ * 与「上游整体不可用」（`200903 service_unavailable`）是**两种完全不同**的故障：
+ * 前者重试一万次也不会好（凭据已被服务端作废，只能重新登录），后者稍后重试即可。
+ * 混为一谈会把「需要重新登录」显示成「请稍后重试」—— 用户照做后永远修不好。
+ */
+export const RACCOON_AUTH_VERIFY_ERROR_CODE = 200003
+
+/**
+ * 判定一次响应是否为**鉴权失败**（而不是上游不可用）。
+ *
+ * 三条判据取或：HTTP 401、业务码 `200003`、文案含 `authorization_verify_error`。
+ * 文案这条不是冗余：实测同一故障有时只体现在 message 里（HTTP 401 + 该 message），
+ * 而业务码在个别响应里会缺失。
+ */
+export function isRaccoonAuthVerifyError(status: number, code: number, message: string): boolean {
+  if (status === 401) return true
+  if (code === RACCOON_AUTH_VERIFY_ERROR_CODE) return true
+  return /authorization_verify_error/i.test(message)
 }

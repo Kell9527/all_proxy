@@ -3,6 +3,7 @@ import * as React from 'react';
 import {
   supportsCreditBalance,
   supportsDailyCheckin,
+  supportsDailyKeepalive,
   supportsOnboardingTasks,
   supportsRateLimit,
   supportsPermanentLock,
@@ -165,6 +166,21 @@ const LOOMY_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg"
  */
 const RACCOON_ICON = 'data:image/png;base64,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';
 
+/**
+ * 第 11~13 个 provider 的图标：**内联 SVG**（不是 PNG）。
+ *
+ * 这三个渠道没有可提取的本地官方图标文件（OfficeAce / Accio 是 Web 产品，
+ * SenseNova 只有在线品牌素材），故用「品牌色圆角方块 + 缩写」的内联 SVG，
+ * 与 Loomy 的做法一致（见 `LOOMY_ICON`）。
+ *
+ * ⚠️ data URI 里的 `<` / `>` / `"` / `#` 必须**百分号编码**：裸写给部分浏览器
+ * 会整段解析失败，表现为图标位置一片空白（`raccoon-client-panel.spec.ts` 对
+ * RACCOON_ICON 的「必须是合法 PNG」断言就是防这类静默失效）。
+ */
+const OFFICEACE_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%23C7000B"/%3E%3Ctext x="12" y="17.5" font-size="13" font-family="sans-serif" font-weight="800" fill="white" text-anchor="middle"%3EOA%3C/text%3E%3C/svg%3E';
+const ACCIO_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%23FF6A00"/%3E%3Ctext x="12" y="17.5" font-size="13" font-family="sans-serif" font-weight="800" fill="white" text-anchor="middle"%3EAC%3C/text%3E%3C/svg%3E';
+const SENSENOVA_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="white"/%3E%3Ctext x="12" y="17.5" font-size="14" font-family="sans-serif" font-weight="800" fill="%23E60012" text-anchor="middle"%3ESN%3C/text%3E%3C/svg%3E';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -180,6 +196,9 @@ const PROVIDERS = Object.freeze([
   // ⚠️ 用『Raccoon (商汤)』而非『Raccoon Work (商汤)』—— 后者在 provider 列表里
   // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致。
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
+  { id: 'officeace', label: 'OfficeAce (华为云)', icon: OFFICEACE_ICON, logoClass: 'officeace' },
+  { id: 'accio', label: 'Accio (阿里)', icon: ACCIO_ICON, logoClass: 'accio' },
+  { id: 'sensenova', label: 'SenseNova (商汤)', icon: SENSENOVA_ICON, logoClass: 'sensenova' },
 ]);
 
 /**
@@ -961,6 +980,13 @@ function ProviderPanel({ provider, rpcCall }) {
   const [onboardingNotice, setOnboardingNotice] = React.useState(null);
   const canClaimOnboarding = supportsOnboardingTasks(provider);
 
+  // 每日积分保活（仅 Raccoon）：与「一键领取积分」（每日签到）**完全不同** ——
+  // 每日积分由服务端自动发放，但**不登录就当天 24:00 清零**；本操作模拟一次
+  // 「当日登录」把有效期延长到 7 天。用户场景：「半夜电脑没开机」。
+  const canKeepalive = supportsDailyKeepalive(provider);
+  const [keepaliveBusy, setKeepaliveBusy] = React.useState(false);
+  const [keepaliveNotice, setKeepaliveNotice] = React.useState(null);
+
   /**
    * Loomy「锁定永久积分」（全局开关，持久化在宿主侧）。
    *
@@ -1058,6 +1084,79 @@ function ProviderPanel({ provider, rpcCall }) {
   // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
+
+  /**
+   * 每日积分保活：把当天到账的每日积分有效期从「当天 24:00」延长到 7 天。
+   *
+   * ⚠️ 与「一键领取积分」（每日签到）是**完全不同**的操作，故独立按钮：
+   * 积分本来就会自动到账，本操作只是「保住它不过期」。
+   *
+   * ⚠️ **结果必须如实呈现「是否真的延长了」**：触发延长的具体端点尚未完全确证
+   * （见 `src/providers/raccoon-credits.ts` 的 `keepAliveRaccoonDailyPoints`），
+   * 后端因此采用「逐个候选尝试 + 复查账单自验证」。故这里必须区分五种结果
+   * ——「本次延长成功」「当天早已延长」「候选都没生效」「上游暂时不可用」
+   * 「登录态已失效」——**不能**把「没生效」显示成成功，那会让用户在积分已清零
+   * 时以为已保住。
+   *
+   * ⚠️ **「登录态已失效」与「上游暂时不可用」必须分开提示**（2026-10-14 用户
+   * 报障）：两者都表现为「候选端点都调不通」，但前者是凭据被服务端作废、
+   * 重试永远不会好（要重新登录），后者才该稍后重试。旧版把前者显示成
+   * 「上游暂时不可用（请稍后重试）」，用户照着重试无数次依旧失败。
+   */
+  const keepaliveDailyPoints = async () => {
+    if (!canKeepalive) return;
+    setKeepaliveBusy(true);
+    setKeepaliveNotice(null);
+    try {
+      const res = await rpcCall('credits.dailyKeepalive', { provider });
+      const { summary, results } = res;
+      const parts = [];
+      if (summary.extended > 0) parts.push(`${summary.extended} 个账号本次延长成功`);
+      if (summary.alreadyExtended > 0) parts.push(`${summary.alreadyExtended} 个今日已延长`);
+      if (summary.notExtended > 0) parts.push(`${summary.notExtended} 个未能延长`);
+      if (summary.unavailable > 0) parts.push(`${summary.unavailable} 个上游暂时不可用`);
+      if (summary.authExpired > 0) parts.push(`${summary.authExpired} 个登录态已失效`);
+      if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
+      // 逐账号列出细节：尤其「本次延长成功」要带上**命中的端点**——
+      // 那正是尚未确证的答案，显示出来可供用户/排查者核对。
+      const details = [];
+      for (const item of results || []) {
+        const name = item.nickname || item.accountId;
+        if (item.error) {
+          details.push(`${name}：失败 — ${item.error}`);
+          continue;
+        }
+        const outcome = item.outcome || {};
+        if (outcome.kind === 'extended') {
+          details.push(`${name}：本次延长成功（有效期至 ${outcome.expireAt || '?'}；命中 ${outcome.triggerLabel || outcome.trigger}）`);
+        } else if (outcome.kind === 'already-extended') {
+          details.push(`${name}：今天已是延长状态（有效期至 ${outcome.expireAt || '?'}）—— 本次保活未发请求；${outcome.note || ''}`);
+        } else if (outcome.kind === 'auth-expired') {
+          details.push(`${name}：登录态已失效 — ${outcome.lastError || outcome.message || '服务端拒绝鉴权'}（重试不会好转，请删除后用「+ 新建账号」重新登录该账号）`);
+        } else if (outcome.kind === 'unavailable') {
+          details.push(`${name}：上游暂时不可用 — ${outcome.lastError || outcome.message || '服务不可用'}（请稍后重试）`);
+        } else {
+          details.push(`${name}：未能延长 — ${outcome.message || '候选端点均调用成功但未生效'}`);
+        }
+      }
+      // 色调：只要有一个账号**未能延长/上游不可用/登录态失效/失败**就报 warn ——
+      // 那意味着该账号今天的积分很可能仍会在 24:00 清零，用户需要知道。
+      const needsAttention = summary.notExtended > 0 || summary.unavailable > 0
+        || summary.authExpired > 0 || summary.failed > 0;
+      setKeepaliveNotice({
+        tone: needsAttention ? 'warn' : 'ok',
+        text: parts.length > 0 ? parts.join('，') : '没有可保活的账号',
+        details,
+      });
+      if (canLoadCredits) await loadCredits();
+    } catch (caught) {
+      console.error('[jet-hub] keepalive daily points failed:', caught);
+      if (!mounted.current) return;
+      setKeepaliveNotice({ tone: 'error', text: caught?.message || '每日积分保活失败' });
+    } finally {
+      if (mounted.current) setKeepaliveBusy(false);
+    }
+  };
 
   /**
    * 一键领取当前 provider 下全部已启用账号的每日签到积分。
@@ -1515,6 +1614,19 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void claimCredits(),
             }, claiming ? '领取中…' : '一键领取积分')
           : null,
+        // 每日积分保活（仅 Raccoon）：积分服务端已自动发放，但**不登录就当天
+        // 24:00 清零**；点此模拟一次「当日登录」把有效期延长到 7 天。
+        // 面向「半夜电脑没开机」——手动点一下即可保住。
+        canKeepalive
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '每日积分服务端已自动发放，但不登录就当天 24:00 清零。'
+                + '点此模拟一次「当日登录」，把当天到账的每日积分有效期延长到 7 天。'
+                + '（半夜电脑没开机时，第二天手动点一下即可保住）',
+              disabled: keepaliveBusy || accounts.length === 0,
+              onClick: () => void keepaliveDailyPoints(),
+            }, keepaliveBusy ? '保活中…' : '保活今日积分')
+          : null,
         // 「重测 / 重置」只对**会返回限流错误**的 provider 有意义。
         // ⚠️ Loomy 不会限流（积分耗尽时静默降级为扣永久积分），故对它
         // 隐藏这两个按钮 —— 重测永远测不出限流、重置也没有标记可清，
@@ -1601,6 +1713,23 @@ function ProviderPanel({ provider, rpcCall }) {
         (onboardingNotice.details || []).length > 0
           ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
               onboardingNotice.details.map((line, index) =>
+                React.createElement('li', { key: index }, line)))
+          : null)
+      : null,
+    // 每日积分保活结果（仅 Raccoon）。逐账号区分「本次延长成功 / 今日已延长 /
+    // 未能延长 / 上游暂时不可用 / 登录态已失效」——**必须如实呈现**，
+    // 把「未生效」显示成成功会让用户在积分已清零时误以为已保住；
+    // 把「登录态已失效」显示成「稍后重试」会让用户白重试无数次。
+    keepaliveNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': keepaliveNotice.tone,
+          role: keepaliveNotice.tone === 'error' ? 'alert' : 'status',
+        },
+        React.createElement('div', null, keepaliveNotice.text),
+        (keepaliveNotice.details || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              keepaliveNotice.details.map((line, index) =>
                 React.createElement('li', { key: index }, line)))
           : null)
       : null,

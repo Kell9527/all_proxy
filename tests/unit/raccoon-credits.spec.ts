@@ -3,10 +3,11 @@ import { RACCOON } from '../../src/providers/raccoon-product.js'
 import {
   claimRaccoonLoginReward,
   fetchRaccoonCreditBalance,
+  fetchRaccoonCreditBalanceDetailed,
   fetchRaccoonOnboardingStatus,
   keepAliveRaccoonDailyPoints,
 } from '../../src/providers/raccoon-credits.js'
-import type { RaccoonCredential } from '../../src/providers/raccoon.js'
+import { isRaccoonAuthVerifyError, raccoonHeaders, type RaccoonCredential } from '../../src/providers/raccoon.js'
 
 const CRED: RaccoonCredential = { access_token: 't', refresh_token: 'r' }
 
@@ -435,5 +436,154 @@ describe('keepAliveRaccoonDailyPoints', () => {
     }
     await keepAliveRaccoonDailyPoints(RACCOON, CRED, fetcher as unknown as typeof fetch, { now: NOW })
     expect(triggerAuth).toBe('Bearer t')
+  })
+})
+
+/**
+ * 鉴权失效 vs 上游不可用（2026-10-14 用户报障「3 个上游暂时不可用」）。
+ *
+ * 真实形态：三个账号的 `refresh_token` 都被服务端作废，`/auth/v1/refresh` 与
+ * **全部**业务端点一致回 `HTTP 401` + `code=200003 authorization_verify_error`。
+ * 旧实现把它归入 `unavailable` 并提示「请稍后重试」—— 用户照着重试无数次
+ * 依旧失败，还误以为功能坏了。
+ *
+ * 本组锁死：**同一种「候选端点都调不通」，必须按根因分成两类提示**。
+ */
+describe('raccoon 鉴权失效与上游不可用的区分', () => {
+  /** 401 + 200003：鉴权失效（服务端不再接受这份凭据）。 */
+  function authFailure(): Response {
+    return jsonResponse({ code: 200003, message: 'authorization_verify_error', details: 'authorization verify failed' }, 401)
+  }
+
+  /** 503 + 200903：上游整体不可用（稍后重试即可）。 */
+  function serviceFailure(): Response {
+    return jsonResponse({ code: 200903, message: 'service_unavailable' }, 503)
+  }
+
+  it('账单查询即 401/200003 → auth-expired，且**不发**任何候选请求', async () => {
+    const calls: string[] = []
+    const fetcher = async (url: string): Promise<Response> => {
+      calls.push(String(url))
+      return authFailure()
+    }
+    const outcome = await keepAliveRaccoonDailyPoints(
+      RACCOON, CRED, fetcher as unknown as typeof fetch, { now: Date.parse('2026-10-09T02:00:00Z') },
+    )
+    expect(outcome.kind).toBe('auth-expired')
+    // 鉴权已失效，换候选端点没有意义（下一个同样 401）—— 不该白发请求。
+    expect(calls.length).toBe(1)
+    expect(calls[0]).toContain('/bills')
+    if (outcome.kind === 'auth-expired') {
+      expect(outcome.lastError).toContain('200003')
+      expect(outcome.lastError).toContain('authorization_verify_error')
+      expect(outcome.message).toContain('重新登录')
+    }
+  })
+
+  it('候选端点全部 401/200003 → auth-expired（不是 unavailable）', async () => {
+    const fetcher = async (url: string): Promise<Response> => {
+      const u = String(url)
+      if (u.includes('/bills')) {
+        return jsonResponse({ code: 0, data: { items: [] } })
+      }
+      return authFailure()
+    }
+    const outcome = await keepAliveRaccoonDailyPoints(
+      RACCOON, CRED, fetcher as unknown as typeof fetch, { now: Date.parse('2026-10-09T02:00:00Z') },
+    )
+    expect(outcome.kind).toBe('auth-expired')
+    if (outcome.kind === 'auth-expired') {
+      // 鉴权已失效 ⇒ 第一个候选就该收手，不该再把注定 401 的请求挨个发一遍。
+      expect(outcome.tried).toEqual(['setting_info'])
+      expect(outcome.attempts.every((a) => a.authFailed)).toBe(true)
+      expect(outcome.attempts[0]?.code).toBe(200003)
+    }
+  })
+
+  it('一端点 401、一端点 503 → auth-expired（鉴权失效优先，重试无用）', async () => {
+    const fetcher = async (url: string): Promise<Response> => {
+      const u = String(url)
+      if (u.includes('/bills')) return jsonResponse({ code: 0, data: { items: [] } })
+      if (u.includes('/setting_info')) return authFailure()
+      return serviceFailure()
+    }
+    const outcome = await keepAliveRaccoonDailyPoints(
+      RACCOON, CRED, fetcher as unknown as typeof fetch, { now: Date.parse('2026-10-09T02:00:00Z') },
+    )
+    expect(outcome.kind).toBe('auth-expired')
+  })
+
+  it('候选端点全部 503/200903 → 仍是 unavailable（与上面三种形成对照）', async () => {
+    const fetcher = async (url: string): Promise<Response> => {
+      const u = String(url)
+      if (u.includes('/bills')) return jsonResponse({ code: 0, data: { items: [] } })
+      return serviceFailure()
+    }
+    const outcome = await keepAliveRaccoonDailyPoints(
+      RACCOON, CRED, fetcher as unknown as typeof fetch, { now: Date.parse('2026-10-09T02:00:00Z') },
+    )
+    expect(outcome.kind).toBe('unavailable')
+  })
+})
+
+describe('fetchRaccoonCreditBalanceDetailed', () => {
+  it('成功时返回 ok 与 balance', async () => {
+    const fetcher = async (): Promise<Response> => jsonResponse({ code: 0, data: { available_points: 1948, daily_points: 1948 } })
+    const result = await fetchRaccoonCreditBalanceDetailed(RACCOON, CRED, fetcher)
+    expect(result.kind).toBe('ok')
+    if (result.kind === 'ok') expect(result.balance.total).toBe(1948)
+  })
+
+  it('401/200003 → auth-expired（文案必须指向「重新登录」）', async () => {
+    const fetcher = async (): Promise<Response> =>
+      jsonResponse({ code: 200003, message: 'authorization_verify_error' }, 401)
+    const result = await fetchRaccoonCreditBalanceDetailed(RACCOON, CRED, fetcher)
+    expect(result.kind).toBe('auth-expired')
+  })
+
+  it('503/200903 → unavailable（与 auth-expired 分开）', async () => {
+    const fetcher = async (): Promise<Response> =>
+      jsonResponse({ code: 200903, message: 'service_unavailable' }, 503)
+    const result = await fetchRaccoonCreditBalanceDetailed(RACCOON, CRED, fetcher)
+    expect(result.kind).toBe('unavailable')
+  })
+
+  it('响应缺 available_points → no-data（不编造 0）', async () => {
+    const fetcher = async (): Promise<Response> => jsonResponse({ code: 0, data: {} })
+    const result = await fetchRaccoonCreditBalanceDetailed(RACCOON, CRED, fetcher)
+    expect(result.kind).toBe('no-data')
+  })
+})
+
+describe('raccoonHeaders 的 X-Org-Code', () => {
+  it('office_identity 为 personal 时发空串（否则服务端按组织码查库 → 400 org_not_found）', () => {
+    // 实测 2026-10-14：官方客户端往共享凭据文件里写的就是字面量 'personal'，
+    // 原样发出去会让 /points/v1/balance 回 400 code=200022 org_not_found_error。
+    const headers = raccoonHeaders({ access_token: 't', refresh_token: 'r', office_identity: 'personal' })
+    expect(headers['X-Org-Code']).toBe('')
+  })
+
+  it('真正的组织码原样发送', () => {
+    const headers = raccoonHeaders({ access_token: 't', refresh_token: 'r', office_identity: 'ORG123' })
+    expect(headers['X-Org-Code']).toBe('ORG123')
+  })
+
+  it('无 office_identity 时发空串（个人账号）', () => {
+    const headers = raccoonHeaders({ access_token: 't', refresh_token: 'r' })
+    expect(headers['X-Org-Code']).toBe('')
+  })
+})
+
+describe('isRaccoonAuthVerifyError', () => {
+  it('401 / code=200003 / 文案三种判据都认', () => {
+    expect(isRaccoonAuthVerifyError(401, 0, '')).toBe(true)
+    expect(isRaccoonAuthVerifyError(200, 200003, 'authorization_verify_error')).toBe(true)
+    expect(isRaccoonAuthVerifyError(200, 0, 'authorization_verify_error')).toBe(true)
+  })
+
+  it('503/200903 等服务级错误不算鉴权失败', () => {
+    expect(isRaccoonAuthVerifyError(503, 200903, 'service_unavailable')).toBe(false)
+    expect(isRaccoonAuthVerifyError(200, 200022, 'org_not_found_error')).toBe(false)
+    expect(isRaccoonAuthVerifyError(200, 0, 'success')).toBe(false)
   })
 })

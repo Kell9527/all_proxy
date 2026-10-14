@@ -28,6 +28,7 @@ import {
   RACCOON_POINTS_PREFIX,
   RACCOON_DESKTOP_PREFIX,
   RACCOON_REQUEST_TIMEOUT_MS,
+  isRaccoonAuthVerifyError,
   raccoonHeaders,
   type RaccoonCredential,
 } from './raccoon.js'
@@ -59,6 +60,19 @@ export interface RaccoonDailyGrantRecord {
   points: number | undefined
 }
 
+/**
+ * 「今天有无 `daily_grant` 记录」的查询结果。
+ *
+ * ⚠️ **不能把 `auth-expired` / `unavailable` 并成 `none`**：那会让「凭据失效」
+ * 表现得跟「今天还没发放」一样，保活于是去调候选端点、拿到 401、再被误报成
+ * 「上游暂时不可用，请稍后重试」—— 正是用户报障的那条误导链路。
+ */
+export type RaccoonDailyGrantLookup =
+  | { kind: 'found'; record: RaccoonDailyGrantRecord }
+  | { kind: 'none' }
+  | { kind: 'auth-expired'; detail: { code: number; message: string } }
+  | { kind: 'unavailable'; detail: { code: number; message: string } }
+
 /** 单个候选端点的探测结果（诊断用，如实回传原始业务码）。 */
 export interface RaccoonKeepaliveAttempt {
   /** 端点 id。 */
@@ -71,6 +85,14 @@ export interface RaccoonKeepaliveAttempt {
   code: number
   /** 上游消息（失败时用于排查，如 `service_unavailable`）。 */
   message: string
+  /**
+   * 是否为**鉴权失败**（401 / `code=200003 authorization_verify_error`）。
+   *
+   * ⚠️ 与「服务级错误」必须分开：鉴权失败重试无用（凭据已被服务端作废），
+   * 服务级错误才该提示「稍后重试」。混为一谈会把「需要重新登录」说成
+   * 「上游暂时不可用」—— 用户照着重试一万次也不会好。
+   */
+  authFailed: boolean
 }
 
 /** 每日积分保活的结果。 */
@@ -129,6 +151,26 @@ export type RaccoonKeepaliveOutcome =
     lastError: string
     message: string
   }
+  | {
+    /**
+     * **鉴权失败**：上游回 `HTTP 401` + `code=200003 authorization_verify_error`。
+     *
+     * ⚠️ 与 `unavailable` **必须分开**，且这一条恰恰是最容易误判的一类：
+     * 它同样表现为「候选端点都调不通」，但根因是**凭据已被服务端作废**
+     * （一次性 `refresh_token` 被多方消费、或服务端主动踢了会话），
+     * **重试永远不会好**。正确动作是「重新登录」。
+     *
+     * 真实故障（2026-10-14，用户报障「3 个上游暂时不可用」）：三个账号的
+     * `refresh_token` 都已失效，`/auth/v1/refresh` 与全部业务端点一致回
+     * `200003`；旧实现把它归入 `unavailable` 并提示「请稍后重试」。
+     */
+    kind: 'auth-expired'
+    tried: string[]
+    attempts: RaccoonKeepaliveAttempt[]
+    /** 最后一次错误（含业务码），便于用户/排查者识别。 */
+    lastError: string
+    message: string
+  }
 
 /** 登录奖励的默认额度（服务端未在 popup 里给出时兜底）。 */
 export const RACCOON_LOGIN_REWARD_POINTS = 3000
@@ -142,6 +184,10 @@ interface Envelope {
   code: number
   message: string
   data: Record<string, unknown> | undefined
+  /** HTTP 状态码（用于区分鉴权失败与上游不可用）。 */
+  status: number
+  /** 是否鉴权失败（见 `isRaccoonAuthVerifyError`）。 */
+  authFailed: boolean
 }
 
 /** 解析信封；`code === 0` 为成功。 */
@@ -156,7 +202,14 @@ function parseEnvelope(payload: unknown, status: number): Envelope {
   const data = typeof record.data === 'object' && record.data !== null && !Array.isArray(record.data)
     ? record.data as Record<string, unknown>
     : undefined
-  return { ok: code === 0, code, message, data }
+  return {
+    ok: code === 0,
+    code,
+    message,
+    data,
+    status,
+    authFailed: isRaccoonAuthVerifyError(status, code, message),
+  }
 }
 
 /** 读成有限数字；非法返回 undefined（**不编造 0**）。 */
@@ -195,8 +248,16 @@ async function requestJson(
       code: -1,
       message: error instanceof Error ? error.message : String(error),
       data: undefined,
+      status: 0,
+      // 传输层失败（超时/DNS/连接被拒）不是鉴权失败：那类该提示重试。
+      authFailed: false,
     }
   }
+}
+
+/** 把信封的错误拼成 `code=… message`（诊断与 UI 文案共用）。 */
+function envelopeError(envelope: Envelope): string {
+  return `code=${envelope.code} ${envelope.message}`.trim()
 }
 
 /** 构造一个资源包条目。 */
@@ -215,18 +276,29 @@ function makePackage(name: string, remaining: number): CreditPackage {
 }
 
 /**
- * 查询积分余额（映射成既有的 `CreditBalance` 形状）。
+ * 余额查询结果（**带原因**，不是 `null`）。
+ *
+ * ⚠️ 旧的 `CreditBalance | null` 签名把「鉴权失效」「上游不可用」「响应形状不对」
+ * 压成同一个 `null`，UI 只能显示「余额查询失败」—— 用户无法据以行动。
+ * 真实故障（2026-10-14）正是鉴权失效被显示成一句无信息量的失败。
+ */
+export type RaccoonBalanceResult =
+  | { kind: 'ok'; balance: CreditBalance }
+  | { kind: 'auth-expired'; code: number; message: string }
+  | { kind: 'unavailable'; code: number; message: string }
+  | { kind: 'no-data'; code: number; message: string }
+
+/**
+ * 查询积分余额（**带原因**，映射成既有的 `CreditBalance` 形状）。
  *
  * ⚠️ 各池**分开作 package**，让用户看出「注册礼包 / 每日 / 充值」是独立来源
  * —— 它们的有效期与回补规则都不同（每日积分每日刷新、充值积分长期有效）。
- *
- * @returns 查不到时返回 `null`（卡片显示原因，**不是** 0）。
  */
-export async function fetchRaccoonCreditBalance(
+export async function fetchRaccoonCreditBalanceDetailed(
   product: RaccoonProduct,
   credential: RaccoonCredential,
   fetcher: typeof fetch = fetch,
-): Promise<CreditBalance | null> {
+): Promise<RaccoonBalanceResult> {
   const envelope = await requestJson(
     `${product.apiBase}${RACCOON_POINTS_PREFIX}/balance`,
     credential,
@@ -234,11 +306,17 @@ export async function fetchRaccoonCreditBalance(
     { method: 'GET' },
     fetcher,
   )
-  if (!envelope.ok || envelope.data === undefined) return null
+  if (!envelope.ok) {
+    const kind = envelope.authFailed ? 'auth-expired' : 'unavailable'
+    return { kind, code: envelope.code, message: envelopeError(envelope) }
+  }
+  if (envelope.data === undefined) return { kind: 'no-data', code: envelope.code, message: '响应缺少 data' }
 
   const available = readNumber(envelope.data.available_points)
   // `available_points` 是核心字段：没有它就说明响应形状不对，不编造数字。
-  if (available === undefined) return null
+  if (available === undefined) {
+    return { kind: 'no-data', code: envelope.code, message: '响应缺少 available_points' }
+  }
 
   const packages: CreditPackage[] = []
   const reward = readNumber(envelope.data.reward_points)
@@ -251,11 +329,30 @@ export async function fetchRaccoonCreditBalance(
   if (topup !== undefined) packages.push(makePackage('充值积分', topup))
 
   return {
-    total: available,
-    // 极端情形（服务端只给 total 不给分项）也要有至少一个包，否则 UI 空列表
-    packages: packages.length > 0 ? packages : [makePackage('可用积分', available)],
-    expiredTotal: 0,
+    kind: 'ok',
+    balance: {
+      total: available,
+      // 极端情形（服务端只给 total 不给分项）也要有至少一个包，否则 UI 空列表
+      packages: packages.length > 0 ? packages : [makePackage('可用积分', available)],
+      expiredTotal: 0,
+    },
   }
+}
+
+/**
+ * 查询积分余额（兼容旧签名：查不到时返回 `null`）。
+ *
+ * 保留它是为了让 `RaccoonAuth.fetchCreditBalance` 等既有调用方不变；
+ * **新代码请用** {@link fetchRaccoonCreditBalanceDetailed} —— `null` 丢掉了
+ * 「为什么查不到」，而那恰恰是用户唯一需要的信息。
+ */
+export async function fetchRaccoonCreditBalance(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch = fetch,
+): Promise<CreditBalance | null> {
+  const result = await fetchRaccoonCreditBalanceDetailed(product, credential, fetcher)
+  return result.kind === 'ok' ? result.balance : null
 }
 
 /**
@@ -356,7 +453,7 @@ export async function fetchRaccoonOnboardingStatus(
 /** 默认产品配置下的便捷包装（供 `RaccoonAuth` 调用）。 */
 export const raccoonCreditsForDefaultProduct = {
   fetchBalance: (credential: RaccoonCredential, fetcher?: typeof fetch) =>
-    fetchRaccoonCreditBalance(RACCOON, credential, fetcher),
+    fetchRaccoonCreditBalanceDetailed(RACCOON, credential, fetcher),
   claimLoginReward: (credential: RaccoonCredential, fetcher?: typeof fetch) =>
     claimRaccoonLoginReward(RACCOON, credential, fetcher),
   fetchOnboardingStatus: (credential: RaccoonCredential, fetcher?: typeof fetch) =>
@@ -417,9 +514,9 @@ export const raccoonCreditsForDefaultProduct = {
  *
  * 除候选端点本身外不写任何数据；候选均为 GET（见候选表说明）。
  *
- * @returns 四种结果：已延长 / 本次延长成功（带命中的端点）/ 端点调用成功但
- *   未触发 / **端点因服务级错误全部失败**。**不抛错** —— 失败也返回结果对象，
- *   保证批量调用不因单账号中断。
+ * @returns 五种结果：已延长 / 本次延长成功（带命中的端点）/ 端点调用成功但
+ *   未触发 / **端点因服务级错误全部失败** / **鉴权失效**。**不抛错** ——
+ *   失败也返回结果对象，保证批量调用不因单账号中断。
  */
 export async function keepAliveRaccoonDailyPoints(
   product: RaccoonProduct,
@@ -430,7 +527,8 @@ export async function keepAliveRaccoonDailyPoints(
   const now = options.now ?? Date.now()
 
   const before = await readTodayRaccoonDailyGrant(product, credential, fetcher, now)
-  if (before !== undefined && !isUtc8MidnightGrant(before.createdAt)) {
+  if (before.kind === 'auth-expired') return authExpiredOutcome([], [], before.detail)
+  if (before.kind === 'found' && !isUtc8MidnightGrant(before.record.createdAt)) {
     // 当天已经延长过（**可能来自用户自己打开官方客户端**，或本函数之前跑过）
     // —— 延长每天只发生一次且幂等，无需再发任何请求。
     //
@@ -439,9 +537,9 @@ export async function keepAliveRaccoonDailyPoints(
     // 区分展示。
     return {
       kind: 'already-extended',
-      createdAt: before.createdAt,
-      expireAt: before.expireAt,
-      points: before.points,
+      createdAt: before.record.createdAt,
+      expireAt: before.record.expireAt,
+      points: before.record.points,
       note: '今天已有非整点的每日积分发放记录（可能来自你打开官方客户端，或此前已保活过）；本次未发任何请求',
     }
   }
@@ -452,32 +550,40 @@ export async function keepAliveRaccoonDailyPoints(
     tried.push(candidate.id)
     const attempt = await callKeepaliveCandidate(candidate.id, candidate.label, product, credential, fetcher)
     attempts.push(attempt)
+    // 鉴权失效：换候选没有意义（凭据已被服务端作废，下一个端点同样 401），
+    // 立即收手并如实归类，别把时间浪费在注定失败的请求上。
+    if (attempt.authFailed) return authExpiredOutcome(tried, attempts, attempt)
     // 端点调用失败（服务级错误）：换下一个候选继续试。
     if (!attempt.ok) continue
     const after = await readTodayRaccoonDailyGrant(product, credential, fetcher, now)
-    if (after !== undefined && !isUtc8MidnightGrant(after.createdAt)) {
+    if (after.kind === 'auth-expired') return authExpiredOutcome(tried, attempts, after.detail)
+    if (after.kind === 'found' && !isUtc8MidnightGrant(after.record.createdAt)) {
       return {
         kind: 'extended',
         trigger: candidate.id,
         triggerLabel: candidate.label,
-        expireAt: after.expireAt,
-        points: after.points,
+        expireAt: after.record.expireAt,
+        points: after.record.points,
       }
     }
   }
 
-  // 区分两种「没延长」：
+  // 区分三种「没延长」：
+  // - **auth-expired**：候选端点因**鉴权失败**而全部调不通（401 /
+  //   code=200003）⇒ 凭据已被服务端作废，**重试永远不会好**，必须重新登录。
   // - **unavailable**：所有候选端点都**因服务级错误失败**（如上游整体 503 /
   //   code=200903）⇒ 延长**从未有机会发生**，属上游暂时不可用，用户应稍后重试。
   // - **not-extended**：至少有一个候选端点**调用成功**但账单没变 ⇒ 触发条件
   //   不止于这些端点（真正的触发源可能是客户端特有的握手/设备绑定）。
   //
-  // ⚠️ 混为一谈会把「服务端故障」说成「功能结论」—— 用户报障的
-  // `code=200903 service_unavailable` 正是这种情形。
+  // ⚠️ 三者混为一谈会把「需要重新登录」或「服务端故障」说成「功能结论」——
+  // 用户报障的 `code=200903 service_unavailable` 与 `code=200003
+  // authorization_verify_error` 分别是后两种情形的真实案例。
   const allFailed = attempts.length > 0 && attempts.every((a) => !a.ok)
   if (allFailed) {
     const last = attempts[attempts.length - 1]!
     const lastError = `code=${last.code} ${last.message}`.trim()
+    if (last.authFailed) return authExpiredOutcome(tried, attempts, last)
     return {
       kind: 'unavailable',
       tried,
@@ -494,6 +600,23 @@ export async function keepAliveRaccoonDailyPoints(
     attempts,
     message: '候选端点均调用成功但未触发延长；该账号可能已被服务端判定为「今天已登录」，'
       + '或触发条件不止于这些端点（例如客户端特有的握手/设备绑定）',
+  }
+}
+
+/** 构造「鉴权失效」结果（保活与账单查询共用同一形态）。 */
+function authExpiredOutcome(
+  tried: readonly string[],
+  attempts: readonly RaccoonKeepaliveAttempt[],
+  detail: { code: number; message: string },
+): RaccoonKeepaliveOutcome & { kind: 'auth-expired' } {
+  const lastError = `code=${detail.code} ${detail.message}`.trim()
+  return {
+    kind: 'auth-expired',
+    tried: [...tried],
+    attempts: [...attempts],
+    lastError,
+    message: `登录态已失效（${lastError}）—— 服务端不再接受该账号的 access_token 与 refresh_token，`
+      + '重试不会好转，请在「Raccoon (商汤)」面板用「+ 新建账号」重新登录该账号',
   }
 }
 
@@ -524,7 +647,8 @@ export const RACCOON_DAILY_KEEPALIVE_CANDIDATES: readonly RaccoonKeepaliveCandid
  * 发一个候选端点的 GET 请求，返回**结构化的探测结果**（不抛错）。
  *
  * ⚠️ 返回原始业务码而不是抛错：调用方需要区分「端点调用成功但没触发延长」
- * 与「端点因服务级错误失败」—— 前者是功能结论，后者是上游不可用。
+ * 「端点因服务级错误失败」与「鉴权失效」—— 三者分别对应功能结论、
+ * 上游不可用、需要重新登录，提示动作完全不同。
  */
 async function callKeepaliveCandidate(
   id: string,
@@ -543,6 +667,7 @@ async function callKeepaliveCandidate(
     ok: envelope.ok,
     code: envelope.code,
     message: envelope.message,
+    authFailed: envelope.authFailed,
   }
 }
 
@@ -552,15 +677,18 @@ async function callKeepaliveCandidate(
  * 判据是 `grant_at` 以 UTC+8 当日日期开头 —— **不能**用 `created_at`：
  * 后者是「延长发生时刻」，发放日的判定要用 `grant_at`。
  *
- * @returns 查不到（无记录 / 请求失败 / 响应形状不对）时返回 `undefined`，
- *   **不编造**。
+ * @returns 区分四种情形，**不编造**：
+ *   - `found`：查到了当天的记录；
+ *   - `none`：确实没有（干净初始态，或还没到发放时刻）；
+ *   - `auth-expired`：上游回 401 / `code=200003` —— 凭据已失效，**读不到≠没有**；
+ *   - `unavailable`：上游服务级错误（如 503 / `code=200903`）。
  */
 export async function readTodayRaccoonDailyGrant(
   product: RaccoonProduct,
   credential: RaccoonCredential,
   fetcher: typeof fetch = fetch,
   nowMs: number = Date.now(),
-): Promise<RaccoonDailyGrantRecord | undefined> {
+): Promise<RaccoonDailyGrantLookup> {
   const envelope = await requestJson(
     `${product.apiBase}${product.pointsApiPrefix}/bills?paging.limit=30&paging.offset=0`,
     credential,
@@ -568,7 +696,13 @@ export async function readTodayRaccoonDailyGrant(
     { method: 'GET' },
     fetcher,
   )
-  if (!envelope.ok || envelope.data === undefined) return undefined
+  if (!envelope.ok) {
+    const kind = envelope.authFailed ? 'auth-expired' : 'unavailable'
+    return { kind, detail: { code: envelope.code, message: envelopeError(envelope) } }
+  }
+  if (envelope.data === undefined) {
+    return { kind: 'unavailable', detail: { code: envelope.code, message: '响应缺少 data' } }
+  }
 
   const items = Array.isArray(envelope.data.items) ? envelope.data.items : []
   const today = utc8DateString(nowMs)
@@ -579,13 +713,16 @@ export async function readTodayRaccoonDailyGrant(
     const grantAt = typeof item.grant_at === 'string' ? item.grant_at : ''
     if (!grantAt.startsWith(today)) continue
     return {
-      grantAt,
-      createdAt: typeof item.created_at === 'string' ? item.created_at : undefined,
-      expireAt: typeof item.expire_at === 'string' ? item.expire_at : undefined,
-      points: readNumber(item.points),
+      kind: 'found',
+      record: {
+        grantAt,
+        createdAt: typeof item.created_at === 'string' ? item.created_at : undefined,
+        expireAt: typeof item.expire_at === 'string' ? item.expire_at : undefined,
+        points: readNumber(item.points),
+      },
     }
   }
-  return undefined
+  return { kind: 'none' }
 }
 
 /**

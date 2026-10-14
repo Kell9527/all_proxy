@@ -7,7 +7,7 @@ import { RefreshCoordinator } from '../../src/pool/refresh-coordinator.js'
 import { FileCredentialStore } from '../../src/pool/store.js'
 import { refreshProviderCredential, REFRESH_SUPPORTED_PROVIDERS } from '../../src/refresh/provider-refresher.js'
 import { refreshDueAccounts } from '../../src/refresh/runtime-helpers.js'
-import { fetchBalances, claimAll, claimOnboarding } from '../../src/admin/credits-endpoint.js'
+import { fetchBalances, claimAll, claimOnboarding, keepAliveDailyPoints } from '../../src/admin/credits-endpoint.js'
 
 /**
  * 续期接线与积分端点（补全 tasks 5.6 运行时接线与积分能力）。
@@ -292,6 +292,65 @@ describe('积分端点分派', () => {
     expect(result.accounts[0]!.error).toBeDefined()
     // 请求发到了中国版的 usage 端点。
     expect((fetcher as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toContain('/sash/api/v2/me/usage')
+  })
+
+  /**
+   * raccoon 的鉴权失效必须与「上游暂时不可用」分开（2026-10-14 用户报障）。
+   *
+   * 真实形态：三个账号的 refresh_token 都被服务端作废，`/auth/v1/refresh` 与
+   * 全部业务端点一致回 `HTTP 401` + `code=200003 authorization_verify_error`。
+   * 旧实现把它归入 `unavailable` 并在面板提示「请稍后重试」—— 用户照做无数次
+   * 依旧失败，还误以为功能坏了。
+   */
+  describe('raccoon 积分/保活的失败分类', () => {
+    /** 建一个 raccoon 账号并返回其 ref。 */
+    async function addRaccoonAccount(id: string, credential: Record<string, unknown>): Promise<void> {
+      await credentials.set(id, JSON.stringify(credential))
+      await pool.addAccount({
+        id: `raccoon-${id}`, provider: 'raccoon', nickname: 'raccoon', enabled: true,
+        credentialRef: id, createdAt: Date.now(), refreshable: true,
+      })
+    }
+
+    it('余额查询遇 401/200003 → 文案指向「重新登录」，不是笼统的「查询失败」', async () => {
+      await addRaccoonAccount('RACCOON_ACCOUNT_AUTH0001', { access_token: 'at', refresh_token: 'rt' })
+      const fetcher: typeof fetch = vi.fn(async () =>
+        jsonResp({ code: 200003, message: 'authorization_verify_error' }, 401))
+      const result = await fetchBalances('raccoon', { pool, credentials, fetcher })
+      expect(result.accounts[0]!.balance).toBeNull()
+      expect(result.accounts[0]!.error).toContain('登录态已失效')
+      expect(result.accounts[0]!.error).toContain('重新登录')
+      // 不得提示「稍后重试」——那会让用户白等
+      expect(result.accounts[0]!.error).not.toContain('稍后重试')
+    })
+
+    it('余额查询遇 503/200903 → 归为「上游暂时不可用，请稍后重试」', async () => {
+      await addRaccoonAccount('RACCOON_ACCOUNT_SVC00001', { access_token: 'at', refresh_token: 'rt' })
+      const fetcher: typeof fetch = vi.fn(async () =>
+        jsonResp({ code: 200903, message: 'service_unavailable' }, 503))
+      const result = await fetchBalances('raccoon', { pool, credentials, fetcher })
+      expect(result.accounts[0]!.error).toContain('上游暂时不可用')
+      expect(result.accounts[0]!.error).toContain('稍后重试')
+    })
+
+    it('保活遇 401/200003 → summary.authExpired 记 1（不是 unavailable）', async () => {
+      await addRaccoonAccount('RACCOON_ACCOUNT_AUTH0002', { access_token: 'at', refresh_token: 'rt' })
+      const fetcher: typeof fetch = vi.fn(async () =>
+        jsonResp({ code: 200003, message: 'authorization_verify_error' }, 401))
+      const result = await keepAliveDailyPoints('raccoon', { pool, credentials, fetcher })
+      expect(result.summary.authExpired).toBe(1)
+      expect(result.summary.unavailable).toBe(0)
+      expect(result.results[0]!.outcome?.kind).toBe('auth-expired')
+    })
+
+    it('保活遇 503/200903 → summary.unavailable 记 1（与上面形成对照）', async () => {
+      await addRaccoonAccount('RACCOON_ACCOUNT_SVC00002', { access_token: 'at', refresh_token: 'rt' })
+      const fetcher: typeof fetch = vi.fn(async () =>
+        jsonResp({ code: 200903, message: 'service_unavailable' }, 503))
+      const result = await keepAliveDailyPoints('raccoon', { pool, credentials, fetcher })
+      expect(result.summary.unavailable).toBe(1)
+      expect(result.summary.authExpired).toBe(0)
+    })
   })
 
   it('raccoon 新手任务：首次领取返回 claimed 与积分', async () => {

@@ -32,6 +32,7 @@ import {
   RACCOON_REQUEST_TIMEOUT_MS,
   decodeJwtExpMs,
   encryptRaccoonPhone,
+  isRaccoonAuthVerifyError,
   raccoonHeaders,
   type RaccoonCredential,
 } from './raccoon.js'
@@ -346,7 +347,7 @@ export async function refreshRaccoonCredential(
     { refresh_token: credential.refresh_token },
     fetcher,
   )
-  if (status === 401 || envelope.code === 200003) {
+  if (isRaccoonAuthVerifyError(status, envelope.code, `${envelope.message} ${envelope.details}`)) {
     throw new Error('raccoon: 登录态已过期，请重新登录')
   }
   if (envelope.code !== 0) throw envelopeError(envelope, '续期失败')

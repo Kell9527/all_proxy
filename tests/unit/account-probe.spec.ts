@@ -4,6 +4,7 @@
  * 全部使用桩函数：**不发起任何网络请求**（探测函数由 deps.probe 注入），
  * 遵循 tests/unit 的约定。
  */
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { LlmError } from '../../src/providers/llm.js'
 import {
@@ -270,5 +271,39 @@ describe('限流判定（isRateLimitFailure 经由默认探测暴露的行为）
       const error = new LlmError('频率限制', code)
       expect(error.code).toBe(code)
     }
+  })
+})
+
+/**
+ * 探测适配器分派表（源码级回归）。
+ *
+ * ⚠️ `probeWithAdapter` 里的分派表**已两次因「新增 provider 没同步」出缺陷**
+ * （workbuddy、trae，见 `account-probe.ts` 的文件头注释）：漏分支会让账号
+ * 落到 `else` 用 CodeArtsAdapter（华为云 HMAC 签名）去打别家端点，请求必然失败
+ * 而错误信息完全指错方向。raccoon 是第三个会写 `modelRateLimits` 的 provider
+ * （`raccoon-adapter.ts` 的换号分支），因此卡片上真有「重测」按钮，必须分派。
+ *
+ * 这里用源码级断言而不是行为测试：分支的存在本身就是要锁的东西，而真发一次
+ * 请求既慢又依赖上游状态。
+ */
+describe('探测适配器分派表覆盖 raccoon', () => {
+  const source = readFileSync(
+    new URL('../../src/providers/account-probe.ts', import.meta.url), 'utf8',
+  )
+
+  it('存在 raccoon 分支，且构造的是 RaccoonAdapter', () => {
+    expect(source).toContain("RACCOON_PROVIDER_ID = 'raccoon'")
+    expect(source).toContain("entry.provider === RACCOON_PROVIDER_ID")
+    expect(source).toContain('new RaccoonAdapter({')
+  })
+
+  it('raccoon 分支不传 accountPool（探测不得产生换号/限流副作用）', () => {
+    const start = source.indexOf("entry.provider === RACCOON_PROVIDER_ID")
+    expect(start).toBeGreaterThan(-1)
+    const raw = source.slice(start, source.indexOf('} else {', start))
+    expect(raw).toContain('new RaccoonAdapter({')
+    // 先剔掉注释行再判：分支说明里本就写着「不传 accountPool」这个词
+    const code = raw.split(/\n/).filter((l) => !l.trim().startsWith('//')).join('\n')
+    expect(code).not.toContain('accountPool')
   })
 })

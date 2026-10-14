@@ -36,6 +36,9 @@ const STYLES = `
 .dim-jh-providerIcon.raccoon { background: white; }
 /* SenseNova（商汤开放平台）：内联 SVG，白底容器中显示清晰。 */
 .dim-jh-providerIcon.sensenova { background: white; }
+/* OfficeAce（华为云 MaaS）/ Accio（阿里）：内联 SVG 自带不透明底色，容器跟着用白底即可。 */
+.dim-jh-providerIcon.officeace { background: white; }
+.dim-jh-providerIcon.accio { background: white; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }

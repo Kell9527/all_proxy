@@ -312,6 +312,10 @@ async function startServe(): Promise<{ port: number; host: string; adminBootstra
       usage,
       login,
       backupDir: join(dataDir, 'backups'),
+      // ⚠️ 与定时任务、适配器请求路径共用**同一个**单飞协调器：
+      // raccoon 的 refresh_token 一次性轮换，两个协调器等于没单飞
+      // （一次性 token 被消费两次，后那次必然失败）。
+      refreshCoordinator,
     }),
     onRequest: recorder,
     requestLog: rotating,

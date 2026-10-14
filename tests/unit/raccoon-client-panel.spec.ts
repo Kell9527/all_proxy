@@ -123,3 +123,59 @@ describe('Raccoon 的能力登记', () => {
     }
   })
 })
+
+/**
+ * 「保活今日积分」结果面板的分类呈现（源码级回归）。
+ *
+ * 背景（2026-10-14 用户报障）：三个 raccoon 账号的凭据都被服务端作废，
+ * 面板显示「3 个上游暂时不可用 — code=200003 authorization_verify_error
+ * （请稍后重试）」。但 200003 是**鉴权失效**，重试永远不会好 ——
+ * 正确提示是「重新登录」。
+ *
+ * 本组锁死前端必须把 `auth-expired` 与 `unavailable` 分开渲染。
+ */
+describe('保活结果面板的失败分类', () => {
+  /**
+   * 取某个 `else if (outcome.kind === '...')` 分支的**函数体文本**。
+   *
+   * ⚠️ 判据必须落在整块分支上而不是那一行 `else if (...)`：提示文案写在下一行，
+   * 只断言条件行等于什么都没锁住（本次就踩了这个坑）。
+   */
+  function branchBody(source: string, marker: string): string {
+    const lines = source.split('\n')
+    const index = lines.findIndex((l) => l.includes(marker))
+    expect(index, `未找到分支 ${marker}`).toBeGreaterThanOrEqual(0)
+    const indent = (lines[index] ?? '').match(/^\s*/)?.[0].length ?? 0
+    const body: string[] = []
+    for (const line of lines.slice(index + 1)) {
+      const current = line.match(/^\s*/)?.[0].length ?? 0
+      if (line.trim().length > 0 && current <= indent) break
+      body.push(line)
+    }
+    return body.join('\n')
+  }
+
+  it('渲染 auth-expired 分支，且文案指向「重新登录」而不是「稍后重试」', () => {
+    expect(clientSource).toContain("outcome.kind === 'auth-expired'")
+    const body = branchBody(clientSource, "outcome.kind === 'auth-expired'")
+    // 必须同时出现「重新登录」，且**不能**把这支也提示成「稍后重试」
+    expect(body).toContain('重新登录')
+    expect(body).not.toContain('稍后重试')
+  })
+
+  it('汇总计数里有 authExpired 一项（否则面板只会显示「上游暂时不可用」）', () => {
+    expect(clientSource).toContain('summary.authExpired > 0')
+    expect(clientSource).toContain('个登录态已失效')
+  })
+
+  it('unavailable 分支仍提示「稍后重试」（与 auth-expired 形成对照）', () => {
+    const body = branchBody(clientSource, "outcome.kind === 'unavailable'")
+    expect(body).toContain('稍后重试')
+    expect(body).not.toContain('重新登录')
+  })
+
+  it('「保活今日积分」按钮按 supportsDailyKeepalive 渲染', () => {
+    expect(clientSource).toContain('canKeepalive')
+    expect(clientSource).toContain("keepaliveBusy ? '保活中…' : '保活今日积分'")
+  })
+})

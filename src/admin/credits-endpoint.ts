@@ -18,6 +18,8 @@
 
 import type { AccountPool } from '../pool/account-pool.js'
 import type { CredentialStore } from '../pool/types.js'
+import type { RefreshCoordinator } from '../pool/refresh-coordinator.js'
+import { refreshAccountOnce } from '../refresh/refresh-account.js'
 import { claimCodeArtsDailyCheckin, fetchCodeArtsAccountInfoDetailed } from '../providers/codearts-credits.js'
 import type { CodeArtsCredential } from '../providers/types.js'
 import { claimDailyCheckin, fetchCheckinStatus, type CheckinStatus, type ClaimOutcome, type CreditBalance } from '../providers/credits.js'
@@ -44,12 +46,13 @@ import type { LoomyCredential } from '../providers/loomy.js'
 import { RACCOON } from '../providers/raccoon-product.js'
 import {
   claimRaccoonLoginReward,
-  fetchRaccoonCreditBalance,
+  fetchRaccoonCreditBalanceDetailed,
   fetchRaccoonOnboardingStatus,
   keepAliveRaccoonDailyPoints,
+  type RaccoonBalanceResult,
   type RaccoonKeepaliveOutcome,
 } from '../providers/raccoon-credits.js'
-import type { RaccoonCredential } from '../providers/raccoon.js'
+import { isRaccoonExpired, type RaccoonCredential } from '../providers/raccoon.js'
 import { credentialRef } from '../providers/credential-ref.js'
 import type { ProviderAccountEntry } from '../providers/types.js'
 
@@ -58,6 +61,14 @@ export interface CreditsEndpointDeps {
   pool: AccountPool
   credentials: CredentialStore
   fetcher?: typeof fetch
+  /**
+   * 单飞刷新协调器（**必须与定时任务/请求路径共用同一个实例**）。
+   *
+   * raccoon 的 `refresh_token` 一次性轮换：两条路径各持一个协调器等于没单飞，
+   * 一次性 token 会被消费两次、后那次必然失败。省略时 raccoon 的「按需续期」
+   * 自动降级为不续期（直接用现有凭据打上游，由上游 401 如实归类）。
+   */
+  coordinator?: RefreshCoordinator
   warn?(message: string): void
 }
 
@@ -106,6 +117,48 @@ async function resolveJson(deps: CreditsEndpointDeps, entry: ProviderAccountEntr
   } catch {
     return undefined
   }
+}
+
+/**
+ * 取 raccoon 账号「此刻最新」的凭据；**已过期则先续期**。
+ *
+ * ## 为什么面板路径也要续期
+ *
+ * 积分/保活是用户**主动点一下**的一次性动作。此时凭据若刚过期，直接拿它打上游
+ * 只会拿到 401，而用户看到的是「查询失败」—— 上游其实是好的。续一次就好。
+ *
+ * ## 为什么必须走 `refreshAccountOnce`
+ *
+ * 它做的正是「锁内重读 → 单飞刷新 → 立即回写」三步（`refresh-account.ts`），
+ * 与定时任务、请求路径**共用同一实现与同一个协调器**。raccoon 的
+ * `refresh_token` 一次性轮换，绕过它自己打一发 `/refresh` 会把好账号刷死。
+ *
+ * ⚠️ **续期失败不抛出**：凭据也可能只是被服务端作废（续期同样救不回来），
+ * 那时把原始凭据交出去，让上游的 401 被如实归类成「登录态已失效」——
+ * 那才是用户该看到的结论，而不是一句「查询失败」。
+ */
+async function resolveRaccoonCredential(
+  deps: CreditsEndpointDeps,
+  entry: ProviderAccountEntry,
+): Promise<Record<string, unknown> | undefined> {
+  const current = await resolveJson(deps, entry)
+  if (current === undefined) return undefined
+  if (deps.coordinator === undefined) return current
+  if (!isRaccoonExpired(current as unknown as RaccoonCredential)) return current
+
+  try {
+    await refreshAccountOnce({
+      credentials: deps.credentials,
+      pool: deps.pool,
+      coordinator: deps.coordinator,
+      logger: { info: () => {}, warn: (m) => deps.warn?.(m), error: (m) => deps.warn?.(m) },
+      ...deps.fetcher === undefined ? {} : { fetcher: deps.fetcher },
+    }, entry)
+  } catch (error) {
+    deps.warn?.(`[credits] raccoon 账号 ${entry.id} 按需续期失败: ${String(error)}`)
+  }
+  // 续期成功后凭据已写回存储，重读一次拿到新 token；读不到则退回原值。
+  return (await resolveJson(deps, entry)) ?? current
 }
 
 // ───────────────────────── 余额查询 ─────────────────────────
@@ -215,13 +268,61 @@ export async function fetchBalances(provider: string, deps: CreditsEndpointDeps)
     return collect((credential) => fetchLoomyCreditBalance(credential as unknown as LoomyCredential, LOOMY, fetcher))
   }
   if (provider === RACCOON.id) {
-    return collect((credential) => fetchRaccoonCreditBalance(RACCOON, credential as unknown as RaccoonCredential, fetcher))
+    // ⚠️ 单独一个循环而不用上面的 `collect`：余额结果带**原因分类**，
+    // 「登录态已失效」与「上游暂时不可用」要给用户完全不同的行动指令
+    // （前者重新登录、后者稍后重试），压成同一句「查询失败」等于没说。
+    for (const entry of accounts) {
+      let balance: CreditBalance | null = null
+      let error: string | undefined
+      try {
+        const credential = await resolveRaccoonCredential(deps, entry)
+        if (credential === undefined) {
+          error = '凭据未配置或已损坏'
+        } else {
+          const result = await fetchRaccoonCreditBalanceDetailed(
+            RACCOON,
+            credential as unknown as RaccoonCredential,
+            fetcher,
+          )
+          if (result.kind === 'ok') {
+            balance = result.balance
+          } else {
+            error = raccoonBalanceErrorMessage(result)
+          }
+        }
+      } catch (caught) {
+        deps.warn?.(`[credits] balances 账号 ${entry.id} 失败: ${String(caught)}`)
+        error = caught instanceof Error ? caught.message : String(caught)
+        balance = null
+      }
+      out.push({ accountId: entry.id, nickname: entry.nickname, balance, ...(error === undefined ? {} : { error }) })
+    }
+    return { accounts: out }
   }
   const product = productById(provider)
   if (product !== undefined) {
     return collect((credential) => fetchCreditBalance(credential as unknown as BuddyCredential, product, fetcher))
   }
   throw new Error(`provider ${provider} 不支持积分余额查询`)
+}
+
+// ───────────────────────── Raccoon 余额错误文案 ─────────────────────────
+
+/**
+ * 把 raccoon 余额查询结果翻成**可行动**的错误文案。
+ *
+ * ⚠️ 关键是 `auth-expired` 不能跟其余几种混：它意味着「重新登录」，
+ * 而 `unavailable` / `no-data` 意味着「稍后重试」或「服务端返回异常」。
+ * 旧实现三种都显示「余额查询失败」，用户无从判断该做什么。
+ */
+function raccoonBalanceErrorMessage(result: Exclude<RaccoonBalanceResult, { kind: 'ok' }>): string {
+  if (result.kind === 'auth-expired') {
+    return `登录态已失效，请重新登录（${result.code} ${result.message}）—— 重试不会好转`
+  }
+  if (result.kind === 'unavailable') {
+    return `上游暂时不可用（${result.code} ${result.message}），请稍后重试`
+  }
+  return `服务端未返回积分数据（${result.code} ${result.message}）`
 }
 
 // ───────────────────────── 每日签到 ─────────────────────────
@@ -358,7 +459,9 @@ export async function claimOnboarding(
   }
   const account = deps.pool.findAccount(accountId)
   if (account === undefined) throw new Error('账号不存在')
-  const credential = await resolveJson(deps, account)
+  const credential = await (provider === RACCOON.id
+    ? resolveRaccoonCredential(deps, account)
+    : resolveJson(deps, account))
   if (credential === undefined) throw new Error('凭据未配置或已损坏')
 
   if (provider === RACCOON.id) {
@@ -418,6 +521,15 @@ export interface KeepaliveSummary {
    * 用户应稍后重试。混为一谈会把服务端故障说成功能结论。
    */
   unavailable: number
+  /**
+   * **登录态已失效**（上游 401 / `code=200003 authorization_verify_error`）的账号数。
+   *
+   * ⚠️ 与 `unavailable` **必须分开**：两者都表现为「候选端点都调不通」，但
+   * 这一个的根因是凭据被服务端作废，**重试永远不会好**，只能重新登录。
+   * 旧实现把它并进 `unavailable` 并提示「请稍后重试」—— 用户照做无数次
+   * 依旧失败，还误以为功能坏了（2026-10-14 用户报障的真实形态）。
+   */
+  authExpired: number
   failed: number
 }
 
@@ -445,6 +557,11 @@ export interface KeepaliveResponse {
  *
  * 与 `claimAll` 同构：单账号失败（凭据过期、网络抖动）不应中断整批，
  * 且失败要带**可读原因**——用户需要区分「凭据坏了」与「端点没触发」。
+ *
+ * ## 为什么先按需续期
+ *
+ * 见 {@link resolveRaccoonCredential}：用户点按钮的那一刻凭据可能刚过期，
+ * 不续期就只能拿到一句 401，而服务端其实是好的。
  */
 export async function keepAliveDailyPoints(provider: string, deps: CreditsEndpointDeps): Promise<KeepaliveResponse> {
   const fetcher = deps.fetcher ?? fetch
@@ -453,11 +570,13 @@ export async function keepAliveDailyPoints(provider: string, deps: CreditsEndpoi
   }
   const accounts = await deps.pool.listAccounts(provider)
   const results: KeepaliveResultItem[] = []
-  const summary: KeepaliveSummary = { extended: 0, alreadyExtended: 0, notExtended: 0, unavailable: 0, failed: 0 }
+  const summary: KeepaliveSummary = {
+    extended: 0, alreadyExtended: 0, notExtended: 0, unavailable: 0, authExpired: 0, failed: 0,
+  }
 
   for (const entry of accounts) {
     try {
-      const credential = await resolveJson(deps, entry)
+      const credential = await resolveRaccoonCredential(deps, entry)
       if (credential === undefined) {
         summary.failed += 1
         results.push({ accountId: entry.id, nickname: entry.nickname, outcome: null, error: '凭据未配置或已损坏' })
@@ -472,6 +591,7 @@ export async function keepAliveDailyPoints(provider: string, deps: CreditsEndpoi
         case 'extended': summary.extended += 1; break
         case 'already-extended': summary.alreadyExtended += 1; break
         case 'unavailable': summary.unavailable += 1; break
+        case 'auth-expired': summary.authExpired += 1; break
         default: summary.notExtended += 1
       }
       results.push({ accountId: entry.id, nickname: entry.nickname, outcome })

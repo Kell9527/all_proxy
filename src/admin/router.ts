@@ -30,6 +30,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AccountPool } from '../pool/account-pool.js'
 import type { CredentialStore, ProviderAccountEntry } from '../pool/types.js'
+import type { RefreshCoordinator } from '../pool/refresh-coordinator.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import type { Logger } from '../pool/store.js'
 import { sensenovaNicknameFromKey } from '../providers/sensenova.js'
@@ -58,6 +59,14 @@ export interface AdminOptions {
   login?: LoginOrchestrator
   /** 备份导入前自动备份的存放目录。 */
   backupDir?: string
+  /**
+   * 单飞刷新协调器（raccoon 积分/保活端点的「按需续期」用）。
+   *
+   * ⚠️ 必须与 `index.ts` 里定时任务、适配器请求路径**同一个实例**：
+   * raccoon 的 `refresh_token` 一次性轮换，两个协调器等于没单飞。
+   * 省略时积分端点不自动续期（凭据过期就由上游 401 如实回报）。
+   */
+  refreshCoordinator?: RefreshCoordinator
   /** 注入的 fetch（积分查询/签到用；测试替身注入点）。 */
   fetcher?: typeof fetch
 }
@@ -687,7 +696,7 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       // 余额查询是只读性质（不写数据），但会向上游发请求；失败给出可读原因
       // （前端把 error 显示在账号卡片上，而不是笼统的「查询失败」）。
       try {
-        const result = await fetchBalances(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m) })
+        const result = await fetchBalances(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m), ...(options.refreshCoordinator === undefined ? {} : { coordinator: options.refreshCoordinator }) })
         sendJson(res, 200, result)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -701,7 +710,7 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
       const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
       await runWrite('credits-claim-all', provider, () =>
-        claimAllCredits(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m) }))
+        claimAllCredits(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m), ...(options.refreshCoordinator === undefined ? {} : { coordinator: options.refreshCoordinator }) }))
       return true
     }
 
@@ -711,7 +720,7 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
       const accountId = typeof body.value['accountId'] === 'string' ? body.value['accountId'] : ''
       await runWrite('credits-onboarding', `${provider}/${accountId}`, () =>
-        claimOnboarding(provider, accountId, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m) }))
+        claimOnboarding(provider, accountId, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m), ...(options.refreshCoordinator === undefined ? {} : { coordinator: options.refreshCoordinator }) }))
       return true
     }
 
@@ -725,7 +734,7 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
       const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
       await runWrite('credits-daily-keepalive', provider, () =>
-        keepAliveDailyPoints(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m) }))
+        keepAliveDailyPoints(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m), ...(options.refreshCoordinator === undefined ? {} : { coordinator: options.refreshCoordinator }) }))
       return true
     }
 

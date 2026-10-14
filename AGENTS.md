@@ -275,6 +275,24 @@ npm run dev          # 开发态（tsx watch）
   实验脚本 `scripts/probe-raccoon-daily-extension.mjs`，结果存档
   `data/logs/raccoon-daily-extension-probe.json`。面板按钮「保活今日积分」供
   「半夜电脑没开机」的用户次日手动补一次。
+- **Raccoon 的「候选端点都调不通」必须按根因分成两类提示**（2026-10-14 用户报障
+  「3 个上游暂时不可用 — code=200003 authorization_verify_error（请稍后重试）」）：
+  - **鉴权失效**（`HTTP 401` / `code=200003 authorization_verify_error`）⇒ 凭据已被
+    服务端作废，**重试永远不会好**，必须重新登录。判据见 `isRaccoonAuthVerifyError`；
+  - **上游暂时不可用**（`HTTP 503` / `code=200903 service_unavailable`）⇒ 稍后重试即可。
+  旧实现把前者并入后者，用户照着重试无数次依旧失败、还误以为功能坏了。
+  现在 `keepAliveRaccoonDailyPoints` 返回独立的 `auth-expired` 结果，
+  `fetchRaccoonCreditBalanceDetailed` 返回 `auth-expired` / `unavailable` / `no-data`
+  三种带原因的结果，前端 `jet-hub.js` 汇总里单独计 `summary.authExpired`。
+  ⚠️ 判据不能只看业务码：实测同一故障有时只体现在 `message` 里，故三条判据（401 /
+  `200003` / 文案含 `authorization_verify_error`）取或。
+- **Raccoon 的 `X-Org-Code` 只能放真正的组织码**（2026-10-14 实测）：官方客户端往
+  共享凭据文件里写的 `office_identity` 是字面量 `'personal'`，原样发出去会让
+  `/points/v1/balance` 回 `HTTP 400 code=200022 org_not_found_error`。个人账号必须
+  折叠成空串（`raccoonHeaders` 里的 `orgCodeOf`）。
+- **Raccoon 账号的「重测」也必须分派适配器**：`account-probe.ts` 的分派表已两次因
+  「新增 provider 没同步」出缺陷（workbuddy、trae），raccoon 是第三个会写
+  `modelRateLimits` 的 provider，漏分支会让它落到 CodeArts 的华为 HMAC 签名分支。
 - **`node:sqlite` 是 experimental**：启动时会打印警告，属预期。
 - **来源与本项目会逐渐分叉**：来源的缺陷修复不会自动同步；需要时按上表基线 commit
   对照 cherry-pick。
