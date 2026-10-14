@@ -195,8 +195,8 @@ UTC+8 当日 24:00）。
 `expiry-sync` / `accio-credits` / `officeace-credits` /
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
-`login-window-policy` / `officeace-dedupe` / `officeace-login`）。
-当前 **139 个文件 3282 条用例**（2026-10-14 实测；其中
+`login-window-policy` / `officeace-dedupe` / `officeace-login` / `account-phone`）。
+当前 **140 个文件 3294 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 
@@ -353,6 +353,18 @@ npm run dev          # 开发态（tsx watch）
 - **Raccoon 账号的「重测」也必须分派适配器**：`account-probe.ts` 的分派表已两次因
   「新增 provider 没同步」出缺陷（workbuddy、trae），raccoon 是第三个会写
   `modelRateLimits` 的 provider，漏分支会让它落到 CodeArts 的华为 HMAC 签名分支。
+- **账号卡片「凭据」一栏显示手机号**（2026-10-14，用户要求「跟 Loomy 一样」）：
+  Loomy 的凭据 JSON 里本来就有 `phone`，`GET /api/accounts?provider=…` 的
+  `credentialDisplay` 直接显示它。raccoon / accio 的登录响应**不回传**手机号，
+  故 `src/admin/account-phone.ts` 对这两家补一层**只读**上游查询（raccoon
+  `GET /v1/user_info` → 完整号；accio `POST /api/auth/userinfo` → 上游脱敏的
+  `maskedMobile`，原样呈现），结果**只在进程内缓存、绝不写回凭据** ——
+  读-改-写不在刷新单飞锁内，会与一次性 `refresh_token` 的轮换互相覆盖。
+  ⚠️ **OfficeAce 没有手机号可显示**：华为云 OAuth（scope 仅 `openid`）不下发，
+  `client-permission-validate` 只有 `account_id` / `principal_urn`，
+  `/v1/subscription` 只有 `domain_id`，`/v1/claw/{user,user_info,account,profile}`
+  全部 404（2026-10-14 实测）。故它退一档显示 `accountId`（与登录日志同源）。
+  ⚠️ 文件引用（`FILE:`）仍显示脱敏路径，不显示手机号 —— 与 Loomy 的既有行为一致。
 - **`node:sqlite` 是 experimental**：启动时会打印警告，属预期。
 - **来源与本项目会逐渐分叉**：来源的缺陷修复不会自动同步；需要时按上表基线 commit
   对照 cherry-pick。

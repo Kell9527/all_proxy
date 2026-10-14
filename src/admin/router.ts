@@ -44,6 +44,7 @@ import { retestAccount, retestAllAccounts, type ProbePool } from '../providers/a
 import { exportBackup, importBackup, type BackupPool as BackupPoolLike, type BackupCredentials as BackupCredentialsLike } from '../providers/backup.js'
 import { claimAll as claimAllCredits, claimOnboarding, fetchBalances, keepAliveDailyPoints } from './credits-endpoint.js'
 import { maskCredentialPath, parseCredentialRef, validateFileRefInput } from '../pool/credential-ref-kind.js'
+import { AccountPhoneResolver } from './account-phone.js'
 
 /** 管理 API 的依赖。 */
 export interface AdminOptions {
@@ -69,6 +70,12 @@ export interface AdminOptions {
   refreshCoordinator?: RefreshCoordinator
   /** 注入的 fetch（积分查询/签到用；测试替身注入点）。 */
   fetcher?: typeof fetch
+  /**
+   * 账号卡片「凭据」一栏的手机号解析器（省略时用 `credentials` + `fetcher` 自建）。
+   *
+   * 注入点主要给测试：解析器带进程内缓存，自建实例可隔离用例间的缓存。
+   */
+  accountPhone?: AccountPhoneResolver
 }
 
 /** 默认保留策略（用量端点可覆盖）。 */
@@ -114,41 +121,6 @@ function asBackupPool(p: AccountPool): BackupPoolLike & { getStateSnapshot(): Re
     getStateSnapshot: () => p.getStateSnapshot(),
     replaceAll: (accounts, disabledModels, loomyPermanentLocked) =>
       p.replaceAll({ accounts: [...accounts], disabledModels: { ...disabledModels }, loomyPermanentLocked: loomyPermanentLocked === true } as Parameters<AccountPool['replaceAll']>[0]),
-  }
-}
-
-/**
- * 读取凭据里的手机号，用作账号卡片的展示名。
- *
- * ## 为什么要这个
- *
- * 内置凭据的 ref 名是 `LOOMY_ACCOUNT_A1BAA706` 这类**机器生成**的标识，用户
- * 看不出「这条凭据是哪部手机的」。而 Loomy 只能靠手机号验证码重新登录，过期
- * 时用户必须对照手机号才知道该登哪个号 —— 故在卡片「凭据」一栏直接展示手机号。
- *
- * ## 为什么不做掩码
- *
- * 用户的用途是**照着重新登录**，掩码号（`138****8000`）没法直接输入，等于没
- * 显示。这里是本地管理端（默认仅监听 127.0.0.1），且凭据文件里本来就明文存着
- * 同一个手机号，展示明文**不新增任何泄露面**。
- *
- * ## 读不到就回退
- *
- * 无 `phone` 字段 / JSON 损坏 / 凭据缺失 / provider 不用手机号登录 —— 一律返回
- * `undefined`，调用方回退到 ref 名，行为与改动前完全一致。
- */
-async function displayPhoneOf(credentials: CredentialStore, ref: string): Promise<string | undefined> {
-  // 凭据读取失败不是错误：账号可能刚被删、或共享文件还没被官方客户端写出来。
-  const resolved = await credentials.resolve(ref).catch(() => undefined)
-  if (resolved === undefined) return undefined
-  try {
-    const parsed: unknown = JSON.parse(resolved.value)
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
-    const phone = (parsed as Record<string, unknown>)['phone']
-    return typeof phone === 'string' && phone.trim().length > 0 ? phone.trim() : undefined
-  } catch {
-    // 凭据值不保证是 JSON（各 provider 形态不一），解析失败即视为「无手机号」。
-    return undefined
   }
 }
 
@@ -199,6 +171,12 @@ async function createStaticKeyAccount(
 /** 创建管理 API 处理器。 */
 export function createAdminHandler(options: AdminOptions): AdminHandler {
   const { auth, apiKeys, pool, registry, logger, credentials } = options
+  // 账号卡片的手机号解析（进程内缓存；测试可注入独立实例隔离缓存）。
+  const accountPhone = options.accountPhone ?? new AccountPhoneResolver({
+    credentials,
+    ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+    logger,
+  })
 
   return async function handleAdmin(req, res, url): Promise<boolean> {
     if (!url.pathname.startsWith('/api/')) return false
@@ -459,15 +437,16 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       // 用户名等，管理端可能被截图或投屏）。原始 ref 仍照常返回，供绑定界面
       // 回填与备份对账。
       //
-      // 内置凭据额外读一次凭据：能取到手机号就显示手机号（见 `displayPhoneOf`），
-      // 取不到仍显示 ref 名。逐条 `catch` 保证单个凭据读失败（共享文件尚未被
-      // 官方客户端写出等）不会让整个列表 500。
+      // 内置凭据额外解析一次展示串：能取到手机号就显示手机号（Loomy 一向如此，
+      // raccoon / accio 由上游只读身份端点补齐，officeace 退到华为账号 id，
+      // 见 `account-phone.ts`），取不到仍显示 ref 名。逐条 `catch` 保证单个
+      // 凭据读失败（共享文件尚未被官方客户端写出等）不会让整个列表 500。
       const data = await Promise.all(listed.map(async (status) => {
         const parsed = parseCredentialRef(status.credentialRef)
         if (parsed.kind === 'file') {
           return { ...status, credentialKind: 'file', credentialDisplay: maskCredentialPath(parsed.path) }
         }
-        const phone = await displayPhoneOf(credentials, status.credentialRef)
+        const phone = await accountPhone.resolve(provider, status.credentialRef)
         return {
           ...status,
           credentialKind: 'inline',
