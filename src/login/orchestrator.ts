@@ -302,6 +302,8 @@ interface SessionRecord {
   flow: UrlFlowHandle
   settled: { status: 'done'; outcome: ChannelOutcome } | { status: 'failed'; message: string } | undefined
   account: ProviderAccountEntry | undefined
+  /** 本次登录命中判重（账号已在池中，未新建条目）。 */
+  reused: boolean
   closed: boolean
 }
 
@@ -317,6 +319,17 @@ export interface LoginOrchestratorOptions {
   sessionTtlMs?: number
   /** 设备码轮询间隔（测试注入短值，如 qoder 的授权轮询）。 */
   pollIntervalMs?: number
+  /**
+   * **登录判重**钩子（可选）。
+   *
+   * 落条目前调用：返回既有条目表示「这个账号已经加过了」，此时**不写新凭据、
+   * 不建新条目**，登录结果归到既有账号上（`poll` 的 `reused` 标记为 true，
+   * 前端提示「该账号已在池中」）。
+   *
+   * 用途：OfficeAce 的 SSO 静默授权会让用户不小心把同一账号授权多次
+   * （`src/login/officeace-dedupe.ts`）。没有判重的 provider 不注入即可。
+   */
+  dedupe?: (provider: string, credentialJson: string) => Promise<ProviderAccountEntry | undefined>
 }
 
 export class LoginOrchestrator {
@@ -345,6 +358,7 @@ export class LoginOrchestrator {
       flow,
       settled: undefined,
       account: undefined,
+      reused: false,
       closed: false,
     }
     this.sessions.set(id, record)
@@ -353,8 +367,11 @@ export class LoginOrchestrator {
     void flow.result.then(
       (outcome) => {
         record.settled = { status: 'done', outcome }
-        this.settle(provider, outcome)
-          .then(account => { record.account = account })
+        this.settleInternal(provider, outcome)
+          .then(({ entry, reused }) => {
+            record.account = entry
+            record.reused = reused
+          })
           .catch((error: unknown) => {
             // 落条目失败（如磁盘写坏）也要给出可读失败态，不能让 poll 悬着。
             record.settled = { status: 'failed', message: classifyLoginError(error) }
@@ -378,7 +395,7 @@ export class LoginOrchestrator {
   }
 
   /** 收割会话状态（前端轮询；幂等）。 */
-  async poll(sessionId: string): Promise<LoginSessionState & { sessionId: string }> {
+  async poll(sessionId: string): Promise<LoginSessionState & { sessionId: string; reused?: boolean }> {
     const record = this.sessions.get(sessionId)
     if (record === undefined) throw new Error(`登录会话不存在或已过期: ${sessionId}`)
     const settled = record.settled
@@ -388,7 +405,13 @@ export class LoginOrchestrator {
       // 落条目还在写盘（毫秒级窗口）：对外仍算 pending，下次 poll 拿到 done。
       return { sessionId, status: 'pending' }
     }
-    return { sessionId, status: 'done', account: record.account }
+    return {
+      sessionId,
+      status: 'done',
+      account: record.account,
+      // 判重命中：前端据此提示「该账号已在池中」，而不是让用户以为没登上。
+      ...(record.reused ? { reused: true } : {}),
+    }
   }
 
   /** 取消会话并清理监听资源（幂等；超时清理也走这里）。 */
@@ -515,15 +538,50 @@ export class LoginOrchestrator {
     throw new Error(`provider ${provider} 不支持密码登录`)
   }
 
-  // ── 落账号条目（tasks 10.14）──
-
   /**
-   * 登录产物 → 账号条目。
+   * 落账号条目（tasks 10.14）。
    *
    * ⚠️ **先写凭据、再写索引**：索引里出现账号的前提是凭据已经落盘。
    * 顺序颠倒会在「写索引成功、写凭据失败」时留下选号器看得见却用不了的账号。
+   *
+   * 判重（{@link LoginOrchestratorOptions.dedupe}）在**所有**落条目路径上
+   * 生效：URL 会话、SMS、密码三个通道都经过这里。命中时不建新条目，
+   * 新凭据写回既有 ref。
    */
   async settle(provider: string, outcome: ChannelOutcome): Promise<ProviderAccountEntry> {
+    const { entry } = await this.settleInternal(provider, outcome)
+    return entry
+  }
+
+  /**
+   * {@link settle} 的内部版：多带回一个 `reused`（是否判重命中）。
+   *
+   * `start` 的结果回调用它拿 `reused`（前端据此提示「该账号已在池中」）；
+   * 对外仍暴露 {@link settle}（返回条目，兼容 SMS/密码通道的既有签名）。
+   */
+  private async settleInternal(
+    provider: string,
+    outcome: ChannelOutcome,
+  ): Promise<{ entry: ProviderAccountEntry; reused: boolean }> {
+    if (this.options.dedupe !== undefined) {
+      try {
+        const existing = await this.options.dedupe(provider, outcome.access)
+        if (existing !== undefined) {
+          // 新凭据写回既有 ref：OfficeAce 的 refresh_token 一次性轮换，
+          // 旧那份已作废，不写回会让该账号下次刷新必失败。
+          await this.options.credentials.set(existing.credentialRef, outcome.access)
+          return { entry: existing, reused: true }
+        }
+      } catch (error) {
+        // 判重失败不阻断登录：按新账号落条目（重复条目比登不上去好）。
+        this.options.logger?.warn(`[login] ${provider} 判重失败，按新账号落条目: ${String(error)}`)
+      }
+    }
+    return { entry: await this.settleNew(provider, outcome), reused: false }
+  }
+
+  /** 无条件新建条目（{@link settle} 的判重未命中路径）。 */
+  private async settleNew(provider: string, outcome: ChannelOutcome): Promise<ProviderAccountEntry> {
     const ref = `${provider.toUpperCase()}_ACCOUNT_${randomBytes(4).toString('hex').toUpperCase()}`
     await this.options.credentials.set(ref, outcome.access)
     const entry: ProviderAccountEntry = {

@@ -133,6 +133,16 @@ UTC+8 当日 24:00）。
   当日 1000 分不领就当天作废，且 UI 上没有手动签到这回事）；分桶「永久/长期/临期」
   由前端按 `expiredTime` 与 `windowDays` 算。「锁定永久积分」已泛化为 per-provider
   （`pool.setPermanentLocked` + `PATCH /api/permanent-lock`）。
+  **新建账号不自动开窗**（2026-10-14 用户报障「每次都会自动登录同一个账号」）：
+  华为云授权页是 **SSO 页面**，浏览器里已登录的账号被**静默复用**（授权瞬间完成，
+  用户看不到选账号的界面），自动 `window.open` 等于替用户决定用哪个账号。来源的解法
+  是宿主 spawn 无痕窗口（`openIncognitoWindow`），但 Web 服务可能跑在远程/无 GUI
+  机器上，spawn 的是服务端浏览器——不可行。故本项目**只展示链接**，由用户自己决定
+  在哪个浏览器/无痕窗口打开（`plugin-src/client/login-window-policy.js`；
+  轮询式授权在任意机器上完成都会落账号）。另加**账号判重**
+  （`src/login/officeace-dedupe.ts`，按凭据 `accountId`）：用户不小心把同一账号
+  授权多次时不堆重复条目，新凭据写回既有 ref（refresh_token 一次性轮换，旧那份
+  已作废），`poll` 报 `reused` 让前端提示「该账号已在池中」。
 - **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
   `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts` / **`accio-credits.ts`**）：
   标准 OAuth 2.0 + **PKCE**（回调落本项目自己的 loopback），推理是 **Gemini 族协议**
@@ -154,8 +164,9 @@ UTC+8 当日 24:00）。
 `sensenova*` / `officeace*` / `accio*` / `trae-cooldown-table` / `serial-queue` /
 `expiry-sync` / `accio-credits` / `officeace-credits` /
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
-`provider-toggle` / `provider-switch-api` / `instance-watchdog`）。
-当前 **136 个文件 3257 条用例**（2026-10-14 实测；其中
+`provider-toggle` / `provider-switch-api` / `instance-watchdog` /
+`login-window-policy` / `officeace-dedupe`）。
+当前 **138 个文件 3272 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 

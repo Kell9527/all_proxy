@@ -34,6 +34,7 @@ import {
   providerToggleSummary,
   summarizeProviderToggle,
 } from './provider-toggle.js';
+import { loginLinkHint, shouldAutoOpenLoginWindow } from './login-window-policy.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -1553,9 +1554,16 @@ function ProviderPanel({ provider, rpcCall }) {
         // ⚠️ 绝不能在弹窗失败时回退到 `window.location.href = loginUrl`：
         // 那会把整个设置页（甚至用户正在编辑的会话）导航到外部登录页，
         // 登录完成了也回不来。这正是用户报障「主页面直接跳转过去了」的现象。
-        const loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
+        //
+        // ⚠️ **OfficeAce 刻意不自动开窗**（用户报障「每次都会自动登录同一个
+        // 账号」）：华为云授权页是 SSO 页面，会静默复用浏览器里已登录的账号，
+        // 自动开窗等于替用户决定了用哪个账号。改为只展示链接，由用户自己
+        // 决定在哪个浏览器/无痕窗口打开（见 login-window-policy.js 的文件头）。
+        const loginWindow = shouldAutoOpenLoginWindow(provider)
+          ? window.open(loginUrl, '_blank', 'width=800,height=600')
+          : null;
         // 无论弹窗是否成功，都展示链接：远程/无桌面环境下 window.open 无从
-        // 生效，用户需要自己复制 URL 到本机浏览器打开（见函数头说明）。
+        // 生效，用户需要自己复制 URL 到自己机器上登录（见函数头说明）。
         // 弹窗成功时它只是「备用入口」，登录完成后随轮询结束一起清除。
         setLoginUrlForManual(loginUrl);
         // 轮询等待登录完成
@@ -1566,6 +1574,15 @@ function ProviderPanel({ provider, rpcCall }) {
               clearInterval(pollTimer);
               if (loginWindow && !loginWindow.closed) loginWindow.close();
               setLoginUrlForManual(null);
+              // 判重命中（该账号已在池中）时如实说明——否则用户登完发现
+              // 账号没多一个，会以为操作失败了。
+              if (pollRes.reused === true && pollRes.account) {
+                setProbeNotice({
+                  tone: 'warn',
+                  text: `该账号已在账号池中（${pollRes.account.nickname || pollRes.account.id}），未重复添加。`,
+                  details: [],
+                });
+              }
               await loadAccounts();
             }
           } catch { /* 继续轮询 */ }
@@ -1965,7 +1982,12 @@ function ProviderPanel({ provider, rpcCall }) {
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
-          title: '通过浏览器登录一个新的账号并加入账号池。可多次点击以登录多个账号。',
+          // OfficeAce 的授权页是华为云 SSO（静默复用浏览器已登录账号），
+          // 故文案要点明「复制链接到其他浏览器/无痕窗口」而不是「浏览器登录」。
+          title: provider === 'officeace'
+            ? '生成华为云授权链接。在无痕窗口或其他浏览器打开可登**不同**的账号'
+              + '（授权页会复用当前浏览器已登录的账号）。可多次点击以添加多个账号。'
+            : '通过浏览器登录一个新的账号并加入账号池。可多次点击以登录多个账号。',
           onClick: () => {
             // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。
             if (provider === 'accio') setAskAccioRegion(true);
@@ -2040,13 +2062,15 @@ function ProviderPanel({ provider, rpcCall }) {
     // 登录链接：**始终**展示（见 createAccount 的函数头）。远程/无桌面环境下
     // window.open 无从生效，用户要能复制 URL 到自己机器上完成授权 ——
     // 授权在任意机器上完成都会落同一个账号条目（轮询在服务端进行）。
+    // OfficeAce 更是主路径：它的授权页会静默复用浏览器已登录账号，
+    // 必须由用户自己选浏览器/无痕窗口打开（loginLinkHint 讲清这件事）。
     loginUrlForManual
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
           'data-tone': 'warn',
           role: 'alert',
         },
-        React.createElement('div', null, '请在弹出的窗口中完成登录；若窗口被浏览器拦截、或你在远程管理本服务，点下方链接在**本机浏览器**打开。授权完成后账号自动加入账号池，可重复「+ 新建账号」登录多个账号：'),
+        React.createElement('div', null, loginLinkHint(provider)),
         React.createElement('a', {
           className: 'dim-jh-loginLink',
           href: loginUrlForManual,

@@ -40,6 +40,7 @@ import { UsageStore } from './usage/store.js'
 import { createUsageRecorder } from './usage/recorder.js'
 import { RotatingLogger, loggerAdapter } from './usage/logger.js'
 import { LoginOrchestrator } from './login/orchestrator.js'
+import { findExistingOfficeAceAccount } from './login/officeace-dedupe.js'
 import { RefreshCoordinator } from './pool/refresh-coordinator.js'
 import { refreshAccountOnce } from './refresh/refresh-account.js'
 import { refreshDueAccounts } from './refresh/runtime-helpers.js'
@@ -294,7 +295,16 @@ async function startServe(): Promise<{ port: number; host: string; adminBootstra
     minSecretLength: isLoopbackHost(host) ? MIN_LOOPBACK_ADMIN_SECRET_LENGTH : MIN_ADMIN_SECRET_LENGTH,
   })
 
-  const login = new LoginOrchestrator({ pool, credentials, logger })
+  const login = new LoginOrchestrator({
+    pool,
+    credentials,
+    logger,
+    // OfficeAce 判重：SSO 静默授权会让用户不小心把同一账号授权多次，
+    // 不判重就会在池里堆出多条指向同一账号的条目（用户报障「重复登录多次」）。
+    dedupe: async (provider, credentialJson) => (
+      provider === 'officeace' ? findExistingOfficeAceAccount(pool, credentialJson) : undefined
+    ),
+  })
 
   const server = createGatewayServer({
     registry,

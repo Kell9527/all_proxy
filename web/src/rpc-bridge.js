@@ -87,7 +87,9 @@ export function createRpcBridge() {
       case 'login.poll': {
         const r = await post('/api/login/poll', { sessionId: payload.accountId }, signal)
         if (r.status === 'failed') throw new Error(r.message || '登录失败')
-        return { done: r.status === 'done', account: r.account }
+        // reused：判重命中（该账号已在池中，未新建条目）——前端据此提示，
+        // 否则用户登完发现账号没多一个，会以为操作失败了。
+        return { done: r.status === 'done', account: r.account, reused: r.reused === true }
       }
       case 'account.update':
         return patch(`/api/accounts/${encodeURIComponent(payload.accountId)}`, payload.patch ?? {}, signal)
