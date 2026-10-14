@@ -545,10 +545,37 @@ describe('网关 · GET /health', () => {
       expect(res.status).toBe(200)
       const body = await res.json() as Record<string, unknown>
       expect(body['status']).toBe('ok')
+      // ⚠️ 实例启动时刻：管理端「重启看门狗」靠它识别「服务换了进程」
+      // （proxy.bat restart 后浏览器里的 SPA 不会自知，会一直把 RPC 打给
+      // 死上下文）。必须是进程启动时取的固定值，不能每次请求都变。
+      expect(typeof body['instanceStartedAt']).toBe('number')
+      expect(body['instanceStartedAt']).toBeGreaterThan(0)
+      expect(body['instanceStartedAt']).toBeLessThanOrEqual(Date.now())
       const providers = body['providers'] as Array<Record<string, unknown>>
       expect(providers.map(p => p['id'])).toEqual(['fake'])
       // ⚠️ 规格要求：健康检查不消耗上游额度。
       expect(h.adapter.calls).toHaveLength(0)
+    } finally {
+      await stopGateway(h)
+    }
+  })
+
+  it('instanceStartedAt 同一进程内恒定（看门狗的生命线：每次都变会无限刷新）', async () => {
+    const h = await startGateway()
+    try {
+      const first = ((await (await fetch(`${h.url}/health`)).json()) as Record<string, unknown>)['instanceStartedAt']
+      const second = ((await (await fetch(`${h.url}/health`)).json()) as Record<string, unknown>)['instanceStartedAt']
+      expect(first).toBe(second)
+    } finally {
+      await stopGateway(h)
+    }
+  })
+
+  it('健康检查不被缓存（缓存一次旧载荷会让看门狗漏判重启）', async () => {
+    const h = await startGateway()
+    try {
+      const res = await fetch(`${h.url}/health`)
+      expect(res.headers.get('cache-control')).toContain('no-store')
     } finally {
       await stopGateway(h)
     }

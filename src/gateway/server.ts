@@ -299,6 +299,10 @@ export function createGatewayServer(options: GatewayOptions): Server {
     // 规格 access-control 明确豁免：未携带凭据时也要能读到最小存活信息
     // （否则监控探针必须先配一把 key，而探针通常只需要知道「进程活着吗」）。
     if (path === '/health' && req.method === 'GET') {
+      // ⚠️ no-store：管理端的「重启看门狗」靠轮询本端点识别「服务换了实例」，
+      // 浏览器或中间代理缓存一次旧载荷会让它漏判（用户重启后停留在旧页面，
+      // 所有 RPC 打到一个已经死掉的上下文上）。
+      res.setHeader('Cache-Control', 'no-store')
       sendJson(res, 200, healthPayload(options))
       return
     }
@@ -667,6 +671,19 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 /**
+ * 进程启动时刻（模块加载时取一次，之后不变）。
+ *
+ * 用途：管理端「重启看门狗」的实例标识 —— `proxy.bat restart` 只换 node 进程，
+ * 浏览器里已打开的 SPA 不会自知。前端轮询 `/health` 比对这个值，发现变了就
+ * `location.reload()`，让界面跟上新实例（否则用户停在一屏打给死上下文的
+ * RPC 错误里，手动刷新才知道）。
+ *
+ * ⚠️ 必须是**启动时刻**而不是每次请求的 `Date.now()`：后者每次都变，
+ * 看门狗会陷入「无限刷新」。
+ */
+const PROCESS_STARTED_AT = Date.now()
+
+/**
  * 构造健康检查载荷。
  *
  * ⚠️ **只读内存状态**，不发起任何上游请求（规格要求不消耗额度）。
@@ -689,6 +706,7 @@ function healthPayload(options: GatewayOptions): Record<string, unknown> {
   return {
     status: 'ok',
     version: '0.1.0',
+    instanceStartedAt: PROCESS_STARTED_AT,
     globalModelsEnabled: options.pool.globalModelsEnabled(),
     providers,
   }

@@ -16,6 +16,7 @@ import { JetHubPage } from '../../plugin-src/client/jet-hub.js'
 import { createRpcBridge } from './rpc-bridge.js'
 import { initSecretFromUrl } from './admin-auth.js'
 import { AdminShell, setProvidersRenderer } from './admin-panels.js'
+import { startInstanceWatchdog } from './instance-watchdog.js'
 
 // 支持「首次直接带 ?admin_secret= 打开」：读取一次后立即从地址栏清除。
 initSecretFromUrl()
@@ -23,6 +24,11 @@ initSecretFromUrl()
 installJetHubStyles()
 
 const rpcCall = createRpcBridge()
+
+// 重启看门狗：`proxy.bat restart` 换掉 node 进程后，已打开的管理页不会自知，
+// 会继续把 RPC 打给死上下文（满屏「查询失败」）。轮询 /health 的实例启动时刻，
+// 发现变了就自动刷新界面（详见 instance-watchdog.js 的文件头）。
+startInstanceWatchdog()
 
 // Jet Hub 页面是重量级组件：挂进「Provider 管理」标签的内容区，
 // 切走时随标签卸载（它内部有轮询），避免后台空转。
