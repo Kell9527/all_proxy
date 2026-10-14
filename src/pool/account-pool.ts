@@ -64,8 +64,12 @@ export class AccountPool {
   private providerOffCache: Record<string, boolean> = {}
   /** 全局总开关：关闭后所有模型都不可用。 */
   private globalModelsEnabledCache = true
-  /** Loomy「锁定永久积分」的权威进程内副本（与 {@link cache} 同理）。 */
-  private loomyPermanentLockedCache = false
+  /**
+   * 「锁定永久积分」的权威进程内副本（**按 provider**，Loomy / OfficeAce 各自独立）。
+   *
+   * 与 {@link cache} 同理：`ensureLoaded` 时从状态文档载入，`buildState` 时写回。
+   */
+  private permanentLocksCache: Record<string, boolean> = {}
   /** 开关变更审计（只保留最近若干条）。 */
   private switchAuditCache: SwitchAuditEntry[] = []
   /** 是否已完成首次载入。 */
@@ -100,7 +104,11 @@ export class AccountPool {
     this.providerOffCache = state.disabledProviders ?? {}
     // 同理：这些开关也是后加的字段，缺失即视为默认值（既有行为）。
     this.globalModelsEnabledCache = state.globalModelsEnabled !== false
-    this.loomyPermanentLockedCache = state.loomyPermanentLocked === true
+    this.permanentLocksCache = { ...state.permanentLocks }
+    // 兼容旧文档：`permanentLocks` 缺席而老字段为 true 时，等价于 loomy 上锁。
+    if (state.loomyPermanentLocked === true) {
+      this.permanentLocksCache['loomy'] = true
+    }
     this.switchAuditCache = state.switchAudit ?? []
   }
 
@@ -116,12 +124,15 @@ export class AccountPool {
    * ⚠️ **所有写入点都必须经过这里**：整体写入漏掉任一字段就会把它抹掉。
    */
   private buildState(overrides: Partial<PoolState> = {}): PoolState {
+    const permanentLocks = overrides.permanentLocks ?? this.permanentLocksCache
     return {
       accounts: overrides.accounts ?? this.cache,
       disabledModels: overrides.disabledModels ?? this.modelCache,
       globalModelsEnabled: overrides.globalModelsEnabled ?? this.globalModelsEnabledCache,
       disabledProviders: overrides.disabledProviders ?? this.providerOffCache,
-      loomyPermanentLocked: overrides.loomyPermanentLocked ?? this.loomyPermanentLockedCache,
+      permanentLocks,
+      // 兼容镜像：老读者（备份/旧版前端）读 loomyPermanentLocked。
+      loomyPermanentLocked: permanentLocks['loomy'] === true,
       switchAudit: overrides.switchAudit ?? this.switchAuditCache,
     }
   }
@@ -322,10 +333,37 @@ export class AccountPool {
 
   // ───────────────────────── 全局开关 ─────────────────────────
 
-  /** Loomy「锁定永久积分」是否开启。 */
-  loomyPermanentLocked(): boolean {
+  /**
+   * 某 provider 的「锁定永久积分」是否开启（Loomy / OfficeAce 等各自独立）。
+   *
+   * 锁定后只允许消耗临时/临期额度：Loomy 是「每日赠送」，OfficeAce 是
+   * 「有到期时间的桶」（永久桶不参与）。
+   */
+  permanentLocked(provider: string): boolean {
     this.ensureLoaded()
-    return this.loomyPermanentLockedCache
+    return this.permanentLocksCache[provider] === true
+  }
+
+  /**
+   * 设置某 provider 的「锁定永久积分」开关（持久化）。
+   *
+   * 解锁时**删键**而不是存 `false`：表里只留「已锁定」的 provider，
+   * 状态文档不随开关反复切换而累积死条目。
+   *
+   * ⚠️ **必须连同账号与黑名单一起写回**（由 {@link buildState} 保证）。
+   */
+  async setPermanentLocked(provider: string, locked: boolean): Promise<void> {
+    this.ensureLoaded()
+    const next = { ...this.permanentLocksCache }
+    if (locked === true) next[provider] = true
+    else delete next[provider]
+    this.permanentLocksCache = next
+    this.store.save(this.buildState({ permanentLocks: next }))
+  }
+
+  /** Loomy「锁定永久积分」是否开启（{@link permanentLocked} 的 Loomy 特例）。 */
+  loomyPermanentLocked(): boolean {
+    return this.permanentLocked('loomy')
   }
 
   /**
@@ -334,9 +372,7 @@ export class AccountPool {
    * ⚠️ **必须连同账号与黑名单一起写回**（由 {@link buildState} 保证）。
    */
   async setLoomyPermanentLocked(locked: boolean): Promise<void> {
-    this.ensureLoaded()
-    this.loomyPermanentLockedCache = locked === true
-    this.store.save(this.buildState({ loomyPermanentLocked: this.loomyPermanentLockedCache }))
+    await this.setPermanentLocked('loomy', locked)
   }
 
   // ───────────────────────── 账号 CRUD ─────────────────────────
@@ -772,7 +808,8 @@ export class AccountPool {
       disabledModels,
       globalModelsEnabled: this.globalModelsEnabledCache,
       disabledProviders: { ...this.providerOffCache },
-      loomyPermanentLocked: this.loomyPermanentLockedCache,
+      permanentLocks: { ...this.permanentLocksCache },
+      loomyPermanentLocked: this.permanentLocksCache['loomy'] === true,
     }
   }
 
@@ -794,8 +831,12 @@ export class AccountPool {
     if (state.globalModelsEnabled !== undefined) {
       this.globalModelsEnabledCache = state.globalModelsEnabled !== false
     }
-    if (state.loomyPermanentLocked !== undefined) {
-      this.loomyPermanentLockedCache = state.loomyPermanentLocked === true
+    if (state.permanentLocks !== undefined) {
+      this.permanentLocksCache = { ...state.permanentLocks }
+    } else if (state.loomyPermanentLocked !== undefined) {
+      // 旧版备份只有 loomy 一个布尔：按老语义落到 per-provider 表上。
+      this.permanentLocksCache = { ...this.permanentLocksCache, loomy: state.loomyPermanentLocked === true }
+      if (this.permanentLocksCache['loomy'] !== true) delete this.permanentLocksCache['loomy']
     }
     this.loaded = true
     this.store.save(this.buildState())

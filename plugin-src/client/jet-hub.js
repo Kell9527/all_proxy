@@ -20,6 +20,14 @@ import {
   isFilterActive,
 } from './model-filter.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
+import {
+  CREDIT_EXPIRY_WINDOW_DAYS,
+  accioResetSeconds,
+  expirySplitParts,
+  formatAccioResetCountdown,
+  formatNamedPoolLine,
+  splitCreditsByExpiry,
+} from './credit-expiry.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -300,14 +308,63 @@ function formatPackageLine(pkg) {
 }
 
 /**
+ * 「锁定永久积分」按钮的 hover 文案（按 provider 的临时池口径）。
+ *
+ * 与 {@link permanentLockCopy}（结果文案）分开：按钮要讲清「是什么 + 点下去
+ * 会发生什么」，而结果文案只说「发生了什么」。
+ */
+function permanentLockTitle(provider, locked) {
+  if (provider === 'officeace') {
+    return locked
+      ? '当前已锁定永久积分：只消耗有到期时间的积分桶（长期/临期），永久桶不参与。只剩永久桶时将没有可用账号。点此解锁。'
+      : '锁定永久积分后只消耗有到期时间的积分桶（长期/临期），可保住永久积分。只剩永久桶时将没有可用账号。点此锁定。';
+  }
+  return locked
+    ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
+    : '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。';
+}
+
+/**
+ * 「锁定永久积分」按钮的**结果文案**（按 provider 的临时池口径）。
+ *
+ * ⚠️ 两个渠道的临时池不是一回事，文案不能共用：Loomy 是「每日赠送」，
+ * OfficeAce 是「有到期时间的桶（长期/临期）」。写错口径会让用户以为
+ * 锁的是另一种额度。
+ *
+ * @param locked - 变更**后**的状态。
+ */
+function permanentLockCopy(provider, locked) {
+  if (provider === 'officeace') {
+    return locked
+      ? '已锁定永久积分：只消耗有到期时间的积分桶（长期/临期），永久桶不参与。只剩永久桶时将无可用账号。'
+      : '已解锁永久积分：永久积分重新参与消耗。';
+  }
+  return locked
+    ? '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。'
+    : '已解锁永久积分：今日额度用尽后会继续使用永久积分。';
+}
+
+/**
  * 账号卡片上的积分余额行。
  *
  * 三种状态严格区分，不能混为一谈：
  * - 查不到（balance 为 null）→ 显示原因，不要显示成 0 积分
  * - 查到了但余额为 0 → 显示 0
  * - 还没有结果 → 显示"读取中"
+ *
+ * ## 分桶口径按 provider 分三种（互斥，不能同时渲染）
+ *
+ * | provider | 口径 | 例子 |
+ * |---|---|---|
+ * | `accio` | **命名池**：逐包按服务端下发顺序拼 | `每日 100 · 每月 0 · 推荐 700` |
+ * | `officeace` | **三档分桶**：按包的到期时间与 windowDays | `永久 500 · 长期 4000 · 临期 2000（10 小时 13 分钟）` |
+ * | 其余 | 原口径（Loomy 两池 / N/M 个资源包有效） | `永久 4800 · 每日 192` |
+ *
+ * ⚠️ 为什么 accio 不能走三档：它的三个桶是**不同类型**的额度（每日/每月/
+ * 推荐），不是「同一批额度的不同到期时间」—— 每日桶是**周期性刷新**的，
+ * 归进「临期」会让用户以为那 100 分即将作废（其实明天就刷新）。
  */
-function CreditBalanceRow({ balance, error, loading }) {
+function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays }) {
   if (loading) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
       React.createElement('dt', null, '积分'),
@@ -332,6 +389,29 @@ function CreditBalanceRow({ balance, error, loading }) {
    */
   const isLoomyTwoPools = all.length === 2
     && all[0].name === '永久积分' && all[1].name === '每日赠送';
+
+  // ── accio：命名池一行 + 每日额度刷新附注 ──
+  // 与三档分桶互斥（见函数头的口径表）：两类信息同时渲染会把「每日」显示两遍。
+  const accioNamedPools = provider === 'accio'
+    ? formatNamedPoolLine(all, formatCredits)
+    : null;
+  const accioResetNote = provider === 'accio'
+    ? (() => {
+        const countdown = formatAccioResetCountdown(accioResetSeconds(all, Date.now()));
+        return countdown === null ? null : `每日额度 ${countdown}后刷新`;
+      })()
+    : null;
+
+  // ── officeace：永久 / 长期 / 临期三档 ──
+  // windowDays 由后端随余额下发（缺省用前端常量，两端默认值一致故不会漂移）。
+  const expiryParts = provider === 'officeace'
+    ? expirySplitParts(
+        splitCreditsByExpiry(all, windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS, Date.now()),
+        formatCredits,
+        Date.now(),
+      )
+    : [];
+
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     React.createElement('dt', null, '积分'),
     React.createElement('dd', {
@@ -343,7 +423,29 @@ function CreditBalanceRow({ balance, error, loading }) {
       ? React.createElement('span', { className: 'dim-jh-creditPools' },
           `永久 ${formatCredits(all[0].remaining) ?? '0'} · 每日 ${formatCredits(all[1].remaining) ?? '0'}`)
       : null,
-    !isLoomyTwoPools && all.length > 1
+    // accio 命名池（每日/每月/推荐）
+    accioNamedPools !== null && accioNamedPools !== undefined
+      ? React.createElement('span', { className: 'dim-jh-creditPools' }, accioNamedPools)
+      : null,
+    // officeace 三档分桶（带色调；段间用 · 分隔）
+    expiryParts.length > 0
+      ? React.createElement('span', { className: 'dim-jh-creditPools' },
+          expiryParts.map((part, index) =>
+            React.createElement('span', {
+              key: part.key,
+              'data-tone': part.tone,
+              title: part.key === 'permanent'
+                ? '永久 = 服务端未给到期时间'
+                : part.key === 'longTerm'
+                  ? `长期 = 有到期时间，但距扣费截止还有 ${windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS} 天以上`
+                  : '临期 = 距扣费截止不足窗口天数，括号内是最早到期时刻的倒计时',
+            },
+            index > 0 ? ' · ' : '',
+            part.text)))
+      : null,
+    // 资源包计数：三档/命名池已经逐包展示时不再重复（accio 恒 active，
+    // 「3/3 个资源包有效」仍有信息量，故保留）。
+    !isLoomyTwoPools && expiryParts.length === 0 && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
@@ -351,10 +453,17 @@ function CreditBalanceRow({ balance, error, loading }) {
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatCredits(balance.expiredTotal)} 已失效`)
+      : null,
+    // accio 每日额度刷新附注（读不到倒计时时整句不渲染，不写死 86400）
+    accioResetNote !== null && accioResetNote !== undefined
+      ? React.createElement('span', {
+          className: 'dim-jh-creditReset',
+          title: '每日积分由服务端在登录时发放，有效期 24 小时，次日刷新、不累积',
+        }, accioResetNote)
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onBindCredentialFile, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, drag }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onBindCredentialFile, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, windowDays, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -439,6 +548,14 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
           account.expiresAt
             ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
             : '未知')),
+      // 账号规格（Accio 的 userLevel 等）：取不到时**整行不渲染** ——
+      // 它是一栏附注信息，不是错误。label 是短标签，上游原文在 title 里。
+      credits?.extra?.accountTier
+        ? React.createElement('div', { className: 'dim-jh-metaRow' },
+            React.createElement('dt', null, '账号规格'),
+            React.createElement('dd', { title: credits.extra.accountTier.title },
+              credits.extra.accountTier.label))
+        : null,
       // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
       // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
       // 的错误，不如不展示。
@@ -447,6 +564,9 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
             balance: credits?.balance ?? null,
             error: credits?.error,
             loading: creditsLoading,
+            provider: account.provider,
+            extra: credits?.extra,
+            windowDays,
           })
         : null),
     rateLimits.length > 0
@@ -849,17 +969,39 @@ function ProviderPanel({ provider, rpcCall }) {
   const [probeBusy, setProbeBusy] = React.useState(null);
   // 上一次重测/重置的结果文案（成功或失败）。
   const [probeNotice, setProbeNotice] = React.useState(null);
-  // 积分余额：accountId → { balance, error }。与账号列表分开加载——余额要逐
+  // 积分余额：accountId → { balance, error, extra }。与账号列表分开加载——余额要逐
   // 账号发网络请求，不能拖慢账号列表本身的渲染。
   const [credits, setCredits] = React.useState({});
   const [creditsLoading, setCreditsLoading] = React.useState(false);
+  /**
+   * 「长期 / 临期」分桶窗口天数（后端随 `credits.balances` 下发）。
+   *
+   * ⚠️ 必须随响应回落：各写一份默认值会让两端口径漂移，而漂移的表现是
+   * 「同一个包在两边归到不同档」—— 用户无法核对。缺省用前端常量兜底
+   * （后端默认值与它一致）。
+   */
+  const [expiryWindowDays, setExpiryWindowDays] = React.useState(CREDIT_EXPIRY_WINDOW_DAYS);
   /**
    * 弹窗被拦截时展示给用户手动打开的登录链接。
    *
    * 保留它而不是直接失败：弹窗拦截取决于浏览器设置，用户手动点一下就能继续，
    * 没必要让整个登录流程作废。
+   *
+   * ⚠️ 2026-10-14 起**无条件展示**（不再只在本弹窗被拦截时）：远程/无桌面
+   * 环境下 `window.open` 无从生效，用户要能复制 URL 到自己机器上登录
+   * （用户原话：「给我 URL，让我自己去登」）。
    */
   const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
+
+  /**
+   * Accio「+ 新建账号」的区域预选（`cn` 中国版 / `global` 国际版）。
+   *
+   * ⚠️ 区域是**登录参数**而不是第二个 provider：gateway 两区域共用同一个
+   * （`phoenix-gw.alibaba.com`），只有登录页域名不同。不预选的后果是
+   * 国际版用户拿到的却是中国版授权页、登完账号 region 不对。
+   */
+  const [accioRegion, setAccioRegion] = React.useState('cn');
+  const [askAccioRegion, setAskAccioRegion] = React.useState(false);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -932,9 +1074,13 @@ function ProviderPanel({ provider, rpcCall }) {
     try {
       const res = await rpcCall('credits.balances', { provider });
       if (!mounted.current) return;
+      // 分桶窗口以后端为准（响应缺省时才保持前端常量）。
+      if (typeof res.windowDays === 'number' && Number.isFinite(res.windowDays)) {
+        setExpiryWindowDays(res.windowDays);
+      }
       const next = {};
       for (const item of res.accounts || []) {
-        next[item.accountId] = { balance: item.balance, error: item.error };
+        next[item.accountId] = { balance: item.balance, error: item.error, extra: item.extra };
       }
       setCredits(next);
     } catch (caught) {
@@ -988,11 +1134,11 @@ function ProviderPanel({ provider, rpcCall }) {
   const [keepaliveNotice, setKeepaliveNotice] = React.useState(null);
 
   /**
-   * Loomy「锁定永久积分」（全局开关，持久化在宿主侧）。
+   * 「锁定永久积分」（全局开关，持久化在宿主侧；Loomy 与 OfficeAce 各自独立）。
    *
-   * 锁定后选号**只允许消耗今日赠送额度**；永久积分不参与，故只剩永久积分的
-   * 账号在锁定期间等同于不可用（用户语义：「锁定后没有临时积分后找可用账号
-   * 就是没有可用账号」）。
+   * 锁定后只允许消耗临时/临期额度：Loomy 是「每日赠送」，OfficeAce 是
+   * 「有到期时间的积分桶」—— 永久积分不参与，故只剩永久额度的账号在锁定
+   * 期间等同于不可用。
    */
   const canLockPermanent = supportsPermanentLock(provider);
   const [permanentLocked, setPermanentLocked] = React.useState(false);
@@ -1010,7 +1156,8 @@ function ProviderPanel({ provider, rpcCall }) {
     let alive = true;
     void (async () => {
       try {
-        const res = await rpcCall('loomy.permanentLock', {});
+        // provider 必传：锁是**按 provider** 的（Loomy 与 OfficeAce 互不影响）。
+        const res = await rpcCall('loomy.permanentLock', { provider });
         if (alive) setPermanentLocked(res?.locked === true);
       } catch (caught) {
         // 读失败不阻塞面板：保持「解锁」这一保守默认值（与后端缺省一致）。
@@ -1027,14 +1174,12 @@ function ProviderPanel({ provider, rpcCall }) {
     setLockBusy(true);
     setLockNotice(null);
     try {
-      const res = await rpcCall('loomy.permanentLock', { locked: next });
+      const res = await rpcCall('loomy.permanentLock', { provider, locked: next });
       if (!mounted.current) return;
       setPermanentLocked(res?.locked === true);
       setLockNotice({
         tone: 'ok',
-        text: next
-          ? '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。'
-          : '已解锁永久积分：今日额度用尽后会继续使用永久积分。',
+        text: permanentLockCopy(provider, next),
       });
     } catch (caught) {
       console.error('[jet-hub] toggle permanent lock failed:', caught);
@@ -1217,13 +1362,25 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
-  const createAccount = async () => {
+  /**
+   * 新建账号：两步式登录（`account.create` → 弹窗 → 轮询 `login.poll`）。
+   *
+   * @param region - Accio 的登录区域（`cn` / `global`）；其余 provider 忽略。
+   *
+   * ## 为什么拿到 loginUrl 后**始终**展示它（而不是只在弹窗被拦截时）
+   *
+   * 用户原话：「我需要登录多个账号，给我 URL，让我自己去登」。真实场景：
+   * 管理端可能跑在远程机器/无桌面环境里，`window.open` 打不开或打开的是
+   * **服务端**的浏览器；用户要能复制链接到**自己机器上**的浏览器完成授权。
+   * 轮询照常进行 —— 授权在任意机器上完成都会落同一个账号条目。
+   */
+  const createAccount = async (region) => {
     setCreating(true);
     let accountId = '';
     let loginUrl = '';
     try {
-      console.log('[jet-hub] account.create request, provider =', provider);
-      const res = await rpcCall('account.create', { provider });
+      console.log('[jet-hub] account.create request, provider =', provider, 'region =', region);
+      const res = await rpcCall('account.create', { provider, region });
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
@@ -1242,20 +1399,12 @@ function ProviderPanel({ provider, rpcCall }) {
         //
         // ⚠️ 绝不能在弹窗失败时回退到 `window.location.href = loginUrl`：
         // 那会把整个设置页（甚至用户正在编辑的会话）导航到外部登录页，
-        // 登录完成后也回不来。这正是用户报障「主页面直接跳转过去了」的现象。
-        // 早期 CodeArts/LobsterAI 走的是**阻塞式**登录（后端 await 到用户
-        // 授权完成才返回），拿到 URL 时手势早已过期、window.open 必被拦截，
-        // 于是每次都命中那个跳转兜底。根因已在后端修掉（改为两步式），
-        // 这里也不再保留那条破坏性兜底。
+        // 登录完成了也回不来。这正是用户报障「主页面直接跳转过去了」的现象。
         const loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
-        if (!loginWindow || loginWindow.closed) {
-          // 弹窗被拦截：展示可点击链接让用户自行打开，而不是劫持当前页面。
-          // 轮询照常进行，用户手动打开也能完成登录。
-          //
-          // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
-          // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
-          setLoginUrlForManual(loginUrl);
-        }
+        // 无论弹窗是否成功，都展示链接：远程/无桌面环境下 window.open 无从
+        // 生效，用户需要自己复制 URL 到本机浏览器打开（见函数头说明）。
+        // 弹窗成功时它只是「备用入口」，登录完成后随轮询结束一起清除。
+        setLoginUrlForManual(loginUrl);
         // 轮询等待登录完成
         const pollTimer = setInterval(async () => {
           try {
@@ -1648,14 +1797,12 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void runLimitAction('resetAll'),
             }, '重置所有')
           : null,
-        // 锁定永久积分（仅 Loomy）：只消耗每日赠送额度，保住永久积分。
+        // 锁定永久积分（Loomy / OfficeAce）：只消耗临时/临期额度，保住永久积分。
         canLockPermanent
           ? React.createElement('button', {
               className: 'dim-jh-btn',
               'data-kind': permanentLocked ? 'primary' : undefined,
-              title: permanentLocked
-                ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
-                : '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。',
+              title: permanentLockTitle(provider, permanentLocked),
               disabled: lockBusy,
               onClick: () => void togglePermanentLock(),
             }, lockBusy
@@ -1665,8 +1812,12 @@ function ProviderPanel({ provider, rpcCall }) {
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
-          title: '通过浏览器登录一个新的账号并加入账号池。',
-          onClick: () => void createAccount(),
+          title: '通过浏览器登录一个新的账号并加入账号池。可多次点击以登录多个账号。',
+          onClick: () => {
+            // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。
+            if (provider === 'accio') setAskAccioRegion(true);
+            else void createAccount();
+          },
           disabled: creating,
         }, creating ? '正在登录…' : '+ 新建账号'))),
     probeNotice
@@ -1733,20 +1884,63 @@ function ProviderPanel({ provider, rpcCall }) {
                 React.createElement('li', { key: index }, line)))
           : null)
       : null,
-    // 弹窗被拦截：给出可点击的登录链接。不劫持当前页面（见 createAccount 的说明）。
+    // 登录链接：**始终**展示（见 createAccount 的函数头）。远程/无桌面环境下
+    // window.open 无从生效，用户要能复制 URL 到自己机器上完成授权 ——
+    // 授权在任意机器上完成都会落同一个账号条目（轮询在服务端进行）。
     loginUrlForManual
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
           'data-tone': 'warn',
           role: 'alert',
         },
-        React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
+        React.createElement('div', null, '请在弹出的窗口中完成登录；若窗口被浏览器拦截、或你在远程管理本服务，点下方链接在**本机浏览器**打开。授权完成后账号自动加入账号池，可重复「+ 新建账号」登录多个账号：'),
         React.createElement('a', {
           className: 'dim-jh-loginLink',
           href: loginUrlForManual,
           target: '_blank',
           rel: 'noopener noreferrer',
         }, loginUrlForManual))
+      : null,
+    // Accio 区域预选（中国版/国际版，登录页域名不同；gateway 两区域共用）。
+    askAccioRegion
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'dialog',
+          'aria-label': '选择 Accio 登录区域',
+        },
+        React.createElement('div', null, '添加 Accio 账号：选择登录区域'),
+        React.createElement('label', { className: 'dim-jh-modelRow', title: 'www.accio-ai.com' },
+          React.createElement('span', { className: 'dim-jh-modelInfo' },
+            React.createElement('strong', { className: 'dim-jh-modelName' }, '中国版')),
+          React.createElement('input', {
+            type: 'radio',
+            name: 'accio-region',
+            className: 'dim-jh-switch',
+            checked: accioRegion === 'cn',
+            onChange: () => setAccioRegion('cn'),
+          })),
+        React.createElement('label', { className: 'dim-jh-modelRow', title: 'zh.accio.com' },
+          React.createElement('span', { className: 'dim-jh-modelInfo' },
+            React.createElement('strong', { className: 'dim-jh-modelName' }, '国际版')),
+          React.createElement('input', {
+            type: 'radio',
+            name: 'accio-region',
+            className: 'dim-jh-switch',
+            checked: accioRegion === 'global',
+            onChange: () => setAccioRegion('global'),
+          })),
+        React.createElement('div', { className: 'dim-jh-headerActions' },
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            disabled: creating,
+            onClick: () => { setAskAccioRegion(false); void createAccount(accioRegion); },
+          }, creating ? '正在登录…' : '确定并打开认证页'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            onClick: () => setAskAccioRegion(false),
+          }, '取消')))
       : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
@@ -1782,6 +1976,8 @@ function ProviderPanel({ provider, rpcCall }) {
                 showCredits: canLoadCredits,
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
                 showRateLimitActions: supportsRateLimit(provider),
+                // 分桶窗口（后端随余额下发）：officeace 的「长期 / 临期」判据。
+                windowDays: expiryWindowDays,
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),

@@ -19,7 +19,8 @@
  * | `model.list` | `GET /api/models`（**含被关闭的模型**） |
  * | `model.setDisabled` / `setAllDisabled` | `PATCH /api/models` / `POST /api/models/bulk` |
  * | `backup.export` / `import` / `status` | `POST`/`POST`/`GET /api/backup/*` |
- * | `credits.balances` | 返回空余额（积分查询尚未接入，面板照常渲染） |
+ * | `loomy.permanentLock` | `PATCH /api/permanent-lock`（按 provider；locked 省略=只读） |
+ * | `credits.balances` | `POST /api/credits/balances`（逐账号余额 + windowDays + extra） |
  */
 
 import { adminFetch } from './admin-auth.js'
@@ -65,9 +66,11 @@ export function createRpcBridge() {
       case 'account.create': {
         // 两步式：start **立即**返回 loginUrl；结果由 login.poll 收割。
         // method（可选）：loomy 默认手机号验证码（主路径），传 'wechat' 走扫码。
+        // region（可选）：accio 的登录区域（cn/global），其余 provider 忽略。
         const r = await post('/api/login/start', {
           provider: payload.provider,
           ...(payload.method ? { method: payload.method } : {}),
+          ...(payload.region ? { region: payload.region } : {}),
         }, signal)
         return { accountId: r.sessionId, loginUrl: r.loginUrl ?? '', userCode: r.userCode }
       }
@@ -140,7 +143,12 @@ export function createRpcBridge() {
         return post('/api/models/bulk', { provider: payload.provider, clear: true }, signal)
       }
       case 'loomy.permanentLock':
-        return patch('/api/loomy-lock', { locked: payload.locked === true }, signal)
+        // 「锁定永久积分」：**按 provider**（Loomy / OfficeAce 各自独立）。
+        // locked 省略 = 只读查询（后端 /api/permanent-lock 兼容两种语义）。
+        return patch('/api/permanent-lock', {
+          provider: payload.provider ?? 'loomy',
+          ...(payload.locked === undefined ? {} : { locked: payload.locked === true }),
+        }, signal)
       case 'backup.export':
         return post('/api/backup/export', {}, signal)
       case 'backup.import':

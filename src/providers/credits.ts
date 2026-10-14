@@ -172,7 +172,9 @@ export interface CreditPackage {
   expiredTime: string
 }
 
-/** 账号的积分余额汇总。 */
+/**
+ * 账号的积分余额汇总。
+ */
 export interface CreditBalance {
   /**
    * 当前可用总余额（各**有效**包的本周期剩余之和）。
@@ -192,6 +194,34 @@ export interface CreditBalance {
    * UI 可以据此提示「另有 N 已失效」，既不误导也不丢信息。
    */
   expiredTotal: number
+}
+
+/**
+ * 账号卡片的**附注信息**（搭余额查询这趟车回来，与余额彼此独立）。
+ *
+ * 取不到时整个字段缺席，前端据此**整行不渲染**（不是错误 —— 它只是一栏
+ * 附加信息，如 Accio 的「账号规格」）。
+ */
+export interface CreditsBalanceExtra {
+  /** 账号档位/规格（`label` 短标签 + `title` 上游原文）。 */
+  accountTier?: { label: string; title: string }
+}
+
+/**
+ * **带原因**的余额查询结果（多端点聚合型 provider 的统一返回形状）。
+ *
+ * ⚠️ 三条纪律（与来源 `provider-runtime.ts` 的 `ProviderBalanceDetail` 同）：
+ *
+ * 1. `balance: null` 表达「**查不到**」，与「查到了但是 0」严格区分 ——
+ *    0 是「已用光」的语义，把网络失败画成 0 会让用户以为额度被清空；
+ * 2. 失败必须带 `error` 原因（「未登录」与「查询失败」要给用户不同的行动
+ *    指令，压成一句「查询失败」等于没说）；
+ * 3. `extra` 与余额**彼此独立**：档位取不到不影响余额展示，反之亦然。
+ */
+export interface ProviderBalanceDetail {
+  balance: CreditBalance | null
+  error?: string
+  extra?: CreditsBalanceExtra
 }
 
 /**

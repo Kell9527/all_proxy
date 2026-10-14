@@ -46,6 +46,7 @@ import { loginRaccoonWithPassword, loginRaccoonWithSmsCode, sendRaccoonSmsCode }
 import { startRaccoonLoginFlow } from '../providers/raccoon-login-page.js'
 import { startOfficeAceLoginFlow } from '../providers/officeace-login.js'
 import { startAccioLoginFlow } from '../providers/accio-login.js'
+import type { AccioRegion } from '../providers/accio-product.js'
 
 /** 登录会话的存活上限：到点自动清理回调服务器与端口。 */
 export const LOGIN_SESSION_TTL_MS = 10 * 60 * 1000
@@ -102,7 +103,7 @@ function loomyOutcome(login: LoomyLoginResult & { phone: string; nickname?: stri
 async function startUrlFlow(
   provider: string,
   fetcher: typeof fetch,
-  flowOptions: { pollIntervalMs?: number; method?: string } = {},
+  flowOptions: { pollIntervalMs?: number; method?: string; region?: string } = {},
 ): Promise<UrlFlowHandle> {
   switch (provider) {
     case 'codearts': {
@@ -220,7 +221,10 @@ async function startUrlFlow(
     }
     case 'accio': {
       // 标准 PKCE：回调落在本项目自己的 loopback（Accio 对 return_url 无白名单校验）。
-      const flow = await startAccioLoginFlow({ fetcher })
+      // region：登录区域（cn/global），由管理端「+ 新建账号」时的区域选择透传；
+      // 缺省 cn（与 accio-login 的默认值一致）。非法值归一成 cn，不臆造。
+      const region: AccioRegion = flowOptions.region === 'global' ? 'global' : 'cn'
+      const flow = await startAccioLoginFlow({ fetcher, region })
       return {
         loginUrl: flow.loginUrl,
         result: flow.result.then(outcomeFromFlowResult),
@@ -323,10 +327,17 @@ export class LoginOrchestrator {
   /**
    * 启动一次 URL 登录（两步式契约）：**立即**返回 `loginUrl`，授权结果由
    * {@link poll} 收割。结果落定时立即落账号条目（不等服务被问询）。
+   *
+   * @param method - 登录方式（loomy：`wechat` 走扫码，缺省手机号验证码）。
+   * @param options.region - 登录区域（accio：`cn` / `global`）。
    */
-  async start(provider: string, method?: string): Promise<StartedLoginSession> {
+  async start(provider: string, method?: string, options?: { region?: string }): Promise<StartedLoginSession> {
     const fetcher = this.options.fetcher ?? fetch
-    const flow = await startUrlFlow(provider, fetcher, { pollIntervalMs: this.options.pollIntervalMs, method })
+    const flow = await startUrlFlow(provider, fetcher, {
+      pollIntervalMs: this.options.pollIntervalMs,
+      ...(method === undefined ? {} : { method }),
+      ...(options?.region === undefined ? {} : { region: options.region }),
+    })
     const id = `login-${randomUUID().slice(0, 8)}`
     const record: SessionRecord = {
       id,

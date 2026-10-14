@@ -320,6 +320,7 @@ export async function importFromDsh(options: ImportOptions): Promise<ImportResul
     disabledModels: disabledModelProviders > 0 ? disabledModels : snapshot.disabledModels,
     globalModelsEnabled: snapshot.globalModelsEnabled,
     disabledProviders: snapshot.disabledProviders,
+    permanentLocks: snapshot.permanentLocks,
     loomyPermanentLocked: snapshot.loomyPermanentLocked,
   })
 

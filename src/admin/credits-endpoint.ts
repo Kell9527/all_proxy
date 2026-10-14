@@ -53,8 +53,22 @@ import {
   type RaccoonKeepaliveOutcome,
 } from '../providers/raccoon-credits.js'
 import { isRaccoonExpired, type RaccoonCredential } from '../providers/raccoon.js'
+import { isAccioExpired, type AccioCredential } from '../providers/accio.js'
+import { fetchAccioBalanceDetailed } from '../providers/accio-credits.js'
+import { isExpiring, type OfficeAceCredential } from '../providers/officeace-auth.js'
+import { fetchOfficeAceBalanceDetailed } from '../providers/officeace-credits.js'
 import { credentialRef } from '../providers/credential-ref.js'
+import type { CreditsBalanceExtra } from '../providers/credits.js'
 import type { ProviderAccountEntry } from '../providers/types.js'
+
+/**
+ * 「长期 / 临期」分桶的窗口天数（前端 `splitCreditsByExpiry` 同值）。
+ *
+ * 距到期不足该天数的桶归「临期」，更远的归「长期」，无到期时间的归「永久」。
+ * 与来源 `buddyExpiringWindowDays()` 的默认值一致；本项目未做该环境变量覆盖，
+ * 需要时在此常量与前端 `credit-expiry.js` 同步改。
+ */
+export const CREDIT_EXPIRY_WINDOW_DAYS = 15
 
 /** 积分端点的依赖注入。 */
 export interface CreditsEndpointDeps {
@@ -78,10 +92,19 @@ export interface CreditBalanceItem {
   nickname: string
   balance: CreditBalance | null
   error?: string
+  /** 附注信息（账号档位等；取不到时缺席，前端整行不渲染）。 */
+  extra?: CreditsBalanceExtra
 }
 
 export interface CreditsBalancesResponse {
   accounts: CreditBalanceItem[]
+  /**
+   * 「长期 / 临期」分桶窗口天数（前端分桶判据，必须随响应下发）。
+   *
+   * ⚠️ 少了它前端只能回退默认值，两端口径可能漂移 —— 来源在这里的教训是
+   * 「`windowDays` 不回流 ⇒ 分桶行静默不渲染」。
+   */
+  windowDays?: number
 }
 
 /** 单账号的领取结果条目。 */
@@ -120,31 +143,31 @@ async function resolveJson(deps: CreditsEndpointDeps, entry: ProviderAccountEntr
 }
 
 /**
- * 取 raccoon 账号「此刻最新」的凭据；**已过期则先续期**。
+ * 取账号「此刻最新」的凭据；**已过期则先续期**（过期判据按 provider 分派）。
  *
  * ## 为什么面板路径也要续期
  *
- * 积分/保活是用户**主动点一下**的一次性动作。此时凭据若刚过期，直接拿它打上游
+ * 积分查询是用户**主动点一下**的一次性动作。此时凭据若刚过期，直接拿它打上游
  * 只会拿到 401，而用户看到的是「查询失败」—— 上游其实是好的。续一次就好。
  *
  * ## 为什么必须走 `refreshAccountOnce`
  *
  * 它做的正是「锁内重读 → 单飞刷新 → 立即回写」三步（`refresh-account.ts`），
- * 与定时任务、请求路径**共用同一实现与同一个协调器**。raccoon 的
+ * 与定时任务、请求路径**共用同一实现与同一个协调器**。raccoon / officeace 的
  * `refresh_token` 一次性轮换，绕过它自己打一发 `/refresh` 会把好账号刷死。
  *
  * ⚠️ **续期失败不抛出**：凭据也可能只是被服务端作废（续期同样救不回来），
  * 那时把原始凭据交出去，让上游的 401 被如实归类成「登录态已失效」——
  * 那才是用户该看到的结论，而不是一句「查询失败」。
  */
-async function resolveRaccoonCredential(
+async function resolveFreshCredential(
   deps: CreditsEndpointDeps,
   entry: ProviderAccountEntry,
 ): Promise<Record<string, unknown> | undefined> {
   const current = await resolveJson(deps, entry)
   if (current === undefined) return undefined
   if (deps.coordinator === undefined) return current
-  if (!isRaccoonExpired(current as unknown as RaccoonCredential)) return current
+  if (!credentialNeedsRefresh(entry.provider, current)) return current
 
   try {
     await refreshAccountOnce({
@@ -155,10 +178,19 @@ async function resolveRaccoonCredential(
       ...deps.fetcher === undefined ? {} : { fetcher: deps.fetcher },
     }, entry)
   } catch (error) {
-    deps.warn?.(`[credits] raccoon 账号 ${entry.id} 按需续期失败: ${String(error)}`)
+    deps.warn?.(`[credits] ${entry.provider} 账号 ${entry.id} 按需续期失败: ${String(error)}`)
   }
   // 续期成功后凭据已写回存储，重读一次拿到新 token；读不到则退回原值。
   return (await resolveJson(deps, entry)) ?? current
+}
+
+/** 该 provider 的凭据此刻是否已过期（需要按需续期）；未登记的 provider 恒否。 */
+function credentialNeedsRefresh(provider: string, credential: Record<string, unknown>): boolean {
+  if (provider === 'raccoon') return isRaccoonExpired(credential as unknown as RaccoonCredential)
+  if (provider === 'accio') return isAccioExpired(credential as unknown as AccioCredential)
+  // OfficeAce 的 STS 寿命约 2 小时，`isExpiring` 带 10 分钟提前量。
+  if (provider === 'officeace') return isExpiring(credential as unknown as OfficeAceCredential)
+  return false
 }
 
 // ───────────────────────── 余额查询 ─────────────────────────
@@ -168,8 +200,10 @@ async function resolveRaccoonCredential(
  *
  * 失败保留原因（`error` 字段）：余额查不到时用户最需要知道「为什么」，
  * 降级成 null 会让卡片显示空白或误导性的 0。
+ *
+ * 外层 {@link fetchBalances} 负责附带 `windowDays`（分桶窗口）。
  */
-export async function fetchBalances(provider: string, deps: CreditsEndpointDeps): Promise<CreditsBalancesResponse> {
+async function fetchBalancesInner(provider: string, deps: CreditsEndpointDeps): Promise<CreditsBalancesResponse> {
   const fetcher = deps.fetcher ?? fetch
   const accounts = await deps.pool.listAccounts(provider)
   const out: CreditBalanceItem[] = []
@@ -275,7 +309,7 @@ export async function fetchBalances(provider: string, deps: CreditsEndpointDeps)
       let balance: CreditBalance | null = null
       let error: string | undefined
       try {
-        const credential = await resolveRaccoonCredential(deps, entry)
+        const credential = await resolveFreshCredential(deps, entry)
         if (credential === undefined) {
           error = '凭据未配置或已损坏'
         } else {
@@ -299,11 +333,86 @@ export async function fetchBalances(provider: string, deps: CreditsEndpointDeps)
     }
     return { accounts: out }
   }
+  if (provider === 'accio') {
+    // Accio（阿里）：三个只读端点聚合（见 accio-credits.ts 的文件头）——
+    // 必需端点先行，未登录/网络故障短路返回；`extra.accountTier` 搭车回来
+    // （面板「账号规格」行）。三条失败路径全部 balance:null + 原因，
+    // 没有一条退化成 0。
+    for (const entry of accounts) {
+      let balance: CreditBalance | null = null
+      let error: string | undefined
+      let extra: CreditsBalanceExtra | undefined
+      try {
+        const credential = await resolveFreshCredential(deps, entry)
+        if (credential === undefined) {
+          error = '凭据未配置或已损坏'
+        } else {
+          const result = await fetchAccioBalanceDetailed(credential as unknown as AccioCredential, { fetcher })
+          balance = result.balance
+          extra = result.extra
+          if (result.balance === null) error = result.error ?? '积分查询失败'
+        }
+      } catch (caught) {
+        deps.warn?.(`[credits] balances 账号 ${entry.id} 失败: ${String(caught)}`)
+        error = caught instanceof Error ? caught.message : String(caught)
+        balance = null
+      }
+      out.push({
+        accountId: entry.id,
+        nickname: entry.nickname,
+        balance,
+        ...(extra === undefined ? {} : { extra }),
+        ...(error === undefined ? {} : { error }),
+      })
+    }
+    return { accounts: out }
+  }
+  if (provider === 'officeace') {
+    // OfficeAce（华为云）：V11-HMAC-SHA256 签名云侧直读订阅（见
+    // officeace-credits.ts 的文件头）。拉余额前自动领当日福利（节流：
+    // 每账号每小时最多一次）—— 当日 1000 分不领就当天作废。
+    for (const entry of accounts) {
+      let balance: CreditBalance | null = null
+      let error: string | undefined
+      try {
+        const credential = await resolveFreshCredential(deps, entry)
+        if (credential === undefined) {
+          error = '凭据未配置或已损坏'
+        } else {
+          const result = await fetchOfficeAceBalanceDetailed(
+            credential as unknown as OfficeAceCredential,
+            entry.credentialRef,
+            fetcher,
+          )
+          balance = result.balance
+          if (result.balance === null) error = result.error ?? '积分查询失败'
+        }
+      } catch (caught) {
+        deps.warn?.(`[credits] balances 账号 ${entry.id} 失败: ${String(caught)}`)
+        error = caught instanceof Error ? caught.message : String(caught)
+        balance = null
+      }
+      out.push({ accountId: entry.id, nickname: entry.nickname, balance, ...(error === undefined ? {} : { error }) })
+    }
+    return { accounts: out }
+  }
   const product = productById(provider)
   if (product !== undefined) {
     return collect((credential) => fetchCreditBalance(credential as unknown as BuddyCredential, product, fetcher))
   }
   throw new Error(`provider ${provider} 不支持积分余额查询`)
+}
+
+/**
+ * 逐账号查询积分余额（对外入口）。
+ *
+ * 比内层多带一份 `windowDays`：前端「长期 / 临期」分桶要以**同一个**窗口
+ * 判定，各写一份默认值会漂移（来源在这里的教训是窗口不下发 ⇒ 分桶行
+ * 静默不渲染）。
+ */
+export async function fetchBalances(provider: string, deps: CreditsEndpointDeps): Promise<CreditsBalancesResponse> {
+  const result = await fetchBalancesInner(provider, deps)
+  return { ...result, windowDays: CREDIT_EXPIRY_WINDOW_DAYS }
 }
 
 // ───────────────────────── Raccoon 余额错误文案 ─────────────────────────
@@ -460,7 +569,7 @@ export async function claimOnboarding(
   const account = deps.pool.findAccount(accountId)
   if (account === undefined) throw new Error('账号不存在')
   const credential = await (provider === RACCOON.id
-    ? resolveRaccoonCredential(deps, account)
+    ? resolveFreshCredential(deps, account)
     : resolveJson(deps, account))
   if (credential === undefined) throw new Error('凭据未配置或已损坏')
 
@@ -576,12 +685,12 @@ export async function keepAliveDailyPoints(provider: string, deps: CreditsEndpoi
 
   for (const entry of accounts) {
     try {
-      const credential = await resolveRaccoonCredential(deps, entry)
-      if (credential === undefined) {
-        summary.failed += 1
-        results.push({ accountId: entry.id, nickname: entry.nickname, outcome: null, error: '凭据未配置或已损坏' })
-        continue
-      }
+    const credential = await resolveFreshCredential(deps, entry)
+    if (credential === undefined) {
+      summary.failed += 1
+      results.push({ accountId: entry.id, nickname: entry.nickname, outcome: null, error: '凭据未配置或已损坏' })
+      continue
+    }
       const outcome = await keepAliveRaccoonDailyPoints(
         RACCOON,
         credential as unknown as RaccoonCredential,

@@ -302,7 +302,9 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       // method 目前只对 loomy 有意义：默认手机号验证码（主路径），
       // 'wechat' 走扫码（可选）。其余 provider 忽略该字段。
       const method = typeof body.value['method'] === 'string' ? body.value['method'].trim() : undefined
-      await runWrite('login-start', provider, () => options.login!.start(provider, method))
+      // region 目前只对 accio 有意义：登录区域（cn/global）。其余 provider 忽略。
+      const region = typeof body.value['region'] === 'string' ? body.value['region'].trim() : undefined
+      await runWrite('login-start', provider, () => options.login!.start(provider, method, region === undefined ? undefined : { region }))
       return true
     }
 
@@ -671,14 +673,45 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       return true
     }
 
-    // ═══════════════ Loomy 永久锁 ═══════════════
+    // ═══════════════ 永久积分锁（Loomy / OfficeAce 等，按 provider）═══════════════
 
+    // 兼容旧前端：Loomy 专用端点（新前端走下面的 /api/permanent-lock，带 provider）。
     if (path === '/api/loomy-lock' && method === 'PATCH') {
       const body = await readBody(req)
       if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
       await runWrite('loomy-permanent-lock', 'loomy', async () => {
-        await pool.setLoomyPermanentLocked(body.value['locked'] === true)
-        return { locked: pool.loomyPermanentLocked() }
+        await pool.setPermanentLocked('loomy', body.value['locked'] === true)
+        return { provider: 'loomy', locked: pool.permanentLocked('loomy') }
+      })
+      return true
+    }
+
+    // 通用端点：`{ provider, locked }`；`locked` 省略时为**只读**查询。
+    if (path === '/api/permanent-lock' && (method === 'PATCH' || method === 'GET')) {
+      if (method === 'GET') {
+        const provider = (url.searchParams.get('provider') ?? '').trim()
+        if (provider.length === 0) {
+          sendJson(res, 400, { error: { code: 'invalid_request_error', message: '缺少 provider' } })
+          return true
+        }
+        sendJson(res, 200, { provider, locked: pool.permanentLocked(provider) })
+        return true
+      }
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const provider = typeof body.value['provider'] === 'string' ? body.value['provider'].trim() : ''
+      if (provider.length === 0) {
+        sendJson(res, 400, { error: { code: 'invalid_request_error', message: '缺少 provider' } })
+        return true
+      }
+      // locked 缺席 = 只读（与来源 `credits.permanentLock` 的语义一致）。
+      if (body.value['locked'] === undefined) {
+        sendJson(res, 200, { provider, locked: pool.permanentLocked(provider) })
+        return true
+      }
+      await runWrite('permanent-lock', provider, async () => {
+        await pool.setPermanentLocked(provider, body.value['locked'] === true)
+        return { provider, locked: pool.permanentLocked(provider) }
       })
       return true
     }

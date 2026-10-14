@@ -119,29 +119,42 @@ UTC+8 当日 24:00）。
 （2026-10-14 从来源 HEAD 移植，均超出移植基线 `3611a62`，故不走 `port-providers.mjs`）：
 
 - **OfficeAce**（`officeace-product.ts` / `officeace-adapter.ts` / `officeace-auth.ts` /
-  `officeace-login.ts`）：华为云 OAuth + PKCE + **DPoP** 登录，推理走
-  `Authorization: Basic base64(app_key:app_secret)`；**OpenAI 兼容**（复用
-  `shared/openai-compat.ts`）。两个必须记住的点：① **`maasBaseUrl` 必须优先用凭据里
+  `officeace-login.ts` / **`officeace-credits.ts`**）：华为云 OAuth + PKCE + **DPoP**
+  登录，推理走 `Authorization: Basic base64(app_key:app_secret)`；**OpenAI 兼容**（复用
+  `shared/openai-compat.ts`）。必须记住的点：① **`maasBaseUrl` 必须优先用凭据里
   按账号下发的 host**（硬编码默认域会 401 `APIG.1009`）；② `max_tokens < 4096` 直接
-  丢弃（否则思考链烧光预算、正文零产出）。**DPoP 私钥随凭据 JSON 落盘**（刷新必须
+  丢弃（否则思考链烧光预算、正文零产出）；③ **DPoP 私钥随凭据 JSON 落盘**（刷新必须
   同一把），refresh_token **一次性**（进 `ROTATING_REFRESH_PROVIDERS` + `RefreshCoordinator`）。
-  裁掉了来源的 Windows 迁移桥（Redis 6399 / DPAPI / PowerShell）与 V11 签名
-  （余额/倍率，故 `credits-capabilities.js` 登记为无积分能力）。
+  裁掉了来源的 Windows 迁移桥（Redis 6399 / DPAPI / PowerShell）与本地 `127.0.0.1:3004`
+  API / 订阅磁盘缓存（多账号下本地 cookie 无法按 ref 区分账号，缓存则是第二个数据源）。
+  **积分**（2026-10-14 补齐，用户报障「本地仅显示登录状态，无其它显示」）：V11-HMAC-SHA256
+  签名云侧直读 `GET {defaultBaseUrl}/v1/subscription`（`officeace-credits.ts`，三条签名
+  规则见文件头），拉余额前**自动领当日福利**（`bonus/claim`，按 ref 每小时节流 ——
+  当日 1000 分不领就当天作废，且 UI 上没有手动签到这回事）；分桶「永久/长期/临期」
+  由前端按 `expiredTime` 与 `windowDays` 算。「锁定永久积分」已泛化为 per-provider
+  （`pool.setPermanentLocked` + `PATCH /api/permanent-lock`）。
 - **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
-  `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts`）：标准 OAuth 2.0 + **PKCE**
-  （回调落本项目自己的 loopback），推理是 **Gemini 族协议**（复用 `gemini-messages.ts`
-  的 `consumeGeminiSse` + 一层薄归一化）。四个必须记住的点：① **`token` 必须在请求
-  body**（放 Authorization 头恒流内 402）；② **`system_instruction` 必须是字符串**
-  （对象形态恒 HTTP 200 + 流内 400）；③ **对外 id 是「人话」slug、上行须反查上游
-  `modelCode`**（漏映射症状是「模型不回复」这种误导性形态）；④ **HTTP 200 也可能是
-  风控拦截页**（必须校验 `content-type: text/event-stream`）。refresh_token **轮换**
-  （同样进 `ROTATING_REFRESH_PROVIDERS`）。图片通路未实测 ⇒ `inputModalities` 恒省略、
-  收到图片显式 `UNSUPPORTED_CONTENT`。
+  `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts` / **`accio-credits.ts`**）：
+  标准 OAuth 2.0 + **PKCE**（回调落本项目自己的 loopback），推理是 **Gemini 族协议**
+  （复用 `gemini-messages.ts` 的 `consumeGeminiSse` + 一层薄归一化）。必须记住的点：
+  ① **`token` 必须在请求 body**（放 Authorization 头恒流内 402）；② **`system_instruction`
+  必须是字符串**（对象形态恒 HTTP 200 + 流内 400）；③ **对外 id 是「人话」slug、上行须
+  反查上游 `modelCode`**（漏映射症状是「模型不回复」这种误导性形态）；④ **HTTP 200 也可能
+  是风控拦截页**（必须校验 `content-type: text/event-stream`）；⑤ **三个积分端点传参方式
+  各不相同**（`userinfo` POST + body、`currentSubscription`/`quota` GET + query，用错即
+  405/400，见 `accio-credits.ts` 文件头），且 `code` 可能是**数字**（判未登录必须标量归一）。
+  refresh_token **轮换**（进 `ROTATING_REFRESH_PROVIDERS`）。图片通路未实测 ⇒
+  `inputModalities` 恒省略、收到图片显式 `UNSUPPORTED_CONTENT`。
+  **登录区域**（`cn`/`global`）经 `POST /api/login/start` 的 `region` 字段透传
+  （`orchestrator.start(provider, method, { region })`），管理端「+ 新建账号」先弹区域
+  预选；缺省与非法值归一成 `cn`。
 
 **测试**：来源 `tests/unit/` 的 84 个文件经 `scripts/port-tests.mjs` 移植，
 加上本项目自写的（`llm` / `account-pool` / `gateway` / `divergence-gating` /
 `sensenova*` / `officeace*` / `accio*` / `trae-cooldown-table` / `serial-queue` /
-`expiry-sync`）。当前 **128 个文件 3139 条用例**（2026-10-14 实测；其中
+`expiry-sync` / `accio-credits` / `officeace-credits` /
+`credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock`）。
+当前 **133 个文件 3224 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 

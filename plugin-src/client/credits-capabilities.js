@@ -28,6 +28,11 @@
  * | `qoder`     | ✓ `sash/api/v2/me/usage` | ✗ 未见签到接口            |
  * | `trae`      | ✓                   | ✓ `checkin_credits/*`        |
  * | `cline`     | ✓ `/api/v1/users/{id}/balance` | ✗ 后端无签到接口  |
+ * | `loomy`     | ✓ `/api/v1/points/records`     | ✓ `first-login`（另有一项新手任务）|
+ * | `raccoon`   | ✓ `/api/web/points/v1/balance` | ✗ 无端点（服务端自动发放 + 保活）|
+ * | `officeace` | ✓ V11 签名 `/v1/subscription`  | ✗ 无端点（拉余额时自动领）|
+ * | `accio`     | ✓ `/api/entitlement/*` 三 端点 | ✗ 无端点（登录时服务端发放）|
+ * | `sensenova` | ✗ 无积分概念                  | ✗                            |
  *
  * - `balance`：CodeBuddy 系用 `POST /v2/billing/meter/get-user-resource`
  *   （CodeBuddy 与 WorkBuddy 国际版**通用**，仅 baseURL 随 `product.endpoint`
@@ -144,15 +149,28 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // ⚠️ 限流能力**保持默认 true**（见下方 RATE_LIMIT_CAPABILITIES）：SenseNova
   // 确实会返回 429（tpm/rpm 限流），「重测 / 重置」按钮对它有效。
   sensenova: Object.freeze({ balance: false, dailyCheckin: false }),
-  // OfficeAce（华为云 ModelArts MaaS）：本轮**只移植推理**，未移植 V11-HMAC-SHA256
-  // 签名，故 `/v1/subscription` 余额与每日签到（`/v1/subscription/bonus/claim`）
-  // 端点均不可用 —— 两项皆 false，面板不得渲染对应按钮。
+  // OfficeAce（华为云 ModelArts MaaS）：**只有余额**，没有签到。
   //
-  // ⚠️ 若日后补上 V11 签名，可在此登记 `balance: true`（并接 `credits.balances`）。
-  officeace: Object.freeze({ balance: false, dailyCheckin: false }),
-  // Accio（阿里 Accio Work）：本轮**只移植推理**，未移植积分（`accio-credits.ts`
-  // 的 `/api/entitlement/*`）—— 两项皆 false，面板不得渲染对应按钮。
-  accio: Object.freeze({ balance: false, dailyCheckin: false }),
+  // 余额：V11-HMAC-SHA256 签名云侧直读 `GET {defaultBaseUrl}/v1/subscription`
+  // （`src/providers/officeace-credits.ts`），分桶为「永久 / 长期 / 临期」
+  // （判据是桶的到期时间与 windowDays，无到期时间 = 永久）。
+  //
+  // ⚠️ 每日 1000 福利**没有签到按钮**：果办客户端的做法是订阅页挂载即自动调
+  //    `/v1/subscription/bonus/claim`（UI 上不存在手动签到）。故本服务的实现
+  //    同样是「拉余额前自动领」（按账号每小时节流一次），`dailyCheckin` 恒
+  //    false —— 登记成签到按钮会让用户以为每天手动点才有。
+  officeace: Object.freeze({ balance: true, dailyCheckin: false }),
+  // Accio（阿里 Accio Work）：**只有余额**，没有签到。
+  //
+  // 余额：三个只读端点聚合（`src/providers/accio-credits.ts` 的文件头有完整
+  // 陷阱说明 —— 三个端点的传参方式各不相同）：
+  //   `GET  /api/entitlement/currentSubscription?accessToken=` → 三类桶（必需）
+  //   `GET  /api/entitlement/quota?accessToken=`               → 每日刷新倒计时
+  //   `POST /api/auth/userinfo  {accessToken}`                 → 账号等级
+  //
+  // ⚠️ 没有签到端点（每日积分由**登录**触发服务端发放），`dailyCheckin` 恒
+  //    false。账号等级搭余额这趟车回来，进 `extra.accountTier`（面板「账号规格」行）。
+  accio: Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**
@@ -188,15 +206,20 @@ export function supportsRateLimit(provider) {
 }
 
 /**
- * 该 provider 是否支持「锁定永久积分」（只允许消耗每日赠送额度）。
+ * 该 provider 是否支持「锁定永久积分」（只允许消耗临时/临期额度）。
  *
- * ⚠️ 目前只有 Loomy 具备：它有两个独立的积分池（永久 / 每日赠送），
- * 而其他渠道的积分模型不同（无「永久 vs 每日」的区分）。
+ * | provider | 临时池 | 锁定的效果 |
+ * |---|---|---|
+ * | `loomy` | 每日赠送 | 今日赠送用尽即无可用账号 |
+ * | `officeace` | 有到期时间的积分桶 | 只消耗会过期的桶，永久桶不参与 |
  *
- * 为 false 时面板**不得**渲染该按钮，也不得发起 `loomy.permanentLock`。
+ * 为 false 时面板**不得**渲染该按钮，也不得发起 `permanentLock` 请求
+ * （对不支持的 provider 发会拿到 bad-request，并在控制台留下必然失败的报错）。
  */
+const PERMANENT_LOCK_PROVIDERS = Object.freeze(['loomy', 'officeace'])
+
 export function supportsPermanentLock(provider) {
-  return provider === 'loomy';
+  return PERMANENT_LOCK_PROVIDERS.includes(provider);
 }
 
 /**

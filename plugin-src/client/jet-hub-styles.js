@@ -95,6 +95,13 @@ const STYLES = `
 .dim-jh-creditPackages { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 已失效额度：弱化的橙色提示，与主数值的蓝色明确区分 */
 .dim-jh-creditExpired { font-size: 11px; color: #b45309; }
+/* 三档分桶（永久/长期/临期）的段内色调：绿=永久、黄=长期、红=临期。
+   与 credit-expiry.js 的 tone 字段一一对应。 */
+.dim-jh-creditPools [data-tone="ok"] { color: #15803d; }
+.dim-jh-creditPools [data-tone="warn"] { color: #b45309; }
+.dim-jh-creditPools [data-tone="error"] { color: #d93025; }
+/* Accio 的「每日额度 X 后刷新」附注：弱化灰，不与三档分桶的语义色混淆 */
+.dim-jh-creditReset { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 限额重置徽章行 */
 .dim-jh-rateLimits { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }

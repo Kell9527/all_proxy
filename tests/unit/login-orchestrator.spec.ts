@@ -347,4 +347,29 @@ describe('登录编排器', () => {
       expect(vi.mocked(fetcher).mock.calls.length).toBe(1) // 登录时发过一次；此后读取凭据零网络
     })
   })
+
+  /**
+   * Accio 登录区域（2026-10-14 补：此前管理端无法登国际版账号）。
+   *
+   * 区域是**登录参数**而不是第二个 provider：gateway 两区域共用同一个
+   * （`phoenix-gw.alibaba.com`），只有登录页域名不同。管理端「+ 新建账号」
+   * 经 `start(provider, method, { region })` 透传，缺省与非法值都归一成 cn。
+   */
+  describe('accio 登录区域', () => {
+    it('region=global ⇒ 授权页落在国际版登录域', async () => {
+      const orchestrator = makeOrchestrator(fetch)
+      const started = await orchestrator.start('accio', undefined, { region: 'global' })
+      expect(started.loginUrl).toContain('zh.accio.com')
+      await orchestrator.cancel(started.sessionId)
+    })
+
+    it('缺省与非法值都归一成中国版（不臆造第三个区域）', async () => {
+      const orchestrator = makeOrchestrator(fetch)
+      for (const region of [undefined, 'cn', 'mars']) {
+        const started = await orchestrator.start('accio', undefined, region === undefined ? undefined : { region })
+        expect(started.loginUrl).toContain('www.accio-ai.com')
+        await orchestrator.cancel(started.sessionId)
+      }
+    })
+  })
 })

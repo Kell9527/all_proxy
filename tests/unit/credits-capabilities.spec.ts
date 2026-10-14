@@ -9,6 +9,7 @@ import {
   supportsDailyCheckin,
   supportsDailyKeepalive,
   supportsOnboardingTasks,
+  supportsPermanentLock,
 } from '../../plugin-src/client/credits-capabilities.js'
 
 /**
@@ -170,6 +171,44 @@ describe('积分能力矩阵', () => {
       expect(CREDITS_CAPABILITIES, `缺少 ${id} 的能力登记`).toHaveProperty(id)
     }
     expect(Object.keys(CREDITS_CAPABILITIES).sort()).toEqual([...providerIds].sort())
+  })
+
+  /**
+   * Accio / OfficeAce（2026-10-14 接入余额查询）。
+   *
+   * 此前两项皆 false 的根因是「只移植了推理」：Accio 的三个只读端点与
+   * OfficeAce 的 V11-HMAC-SHA256 签名都没移植，面板于是只剩登录态
+   * （用户报障「本地仅显示登录状态，无其它显示」）。
+   */
+  it('Accio 支持余额但不支持签到（每日积分由登录触发服务端发放）', () => {
+    expect(CREDITS_CAPABILITIES.accio).toEqual({ balance: true, dailyCheckin: false })
+    expect(supportsCreditBalance('accio')).toBe(true)
+    expect(supportsDailyCheckin('accio')).toBe(false)
+  })
+
+  it('OfficeAce 支持余额但不支持签到（拉余额时自动领当日福利）', () => {
+    expect(CREDITS_CAPABILITIES.officeace).toEqual({ balance: true, dailyCheckin: false })
+    expect(supportsCreditBalance('officeace')).toBe(true)
+    expect(supportsDailyCheckin('officeace')).toBe(false)
+  })
+
+  it('SenseNova 仍无任何积分能力（OpenAI 兼容按 token 计费，无 balance 端点）', () => {
+    expect(supportsCreditBalance('sensenova')).toBe(false)
+    expect(supportsDailyCheckin('sensenova')).toBe(false)
+  })
+
+  /**
+   * 「锁定永久积分」按 provider 白名单（Loomy / OfficeAce）。
+   *
+   * 白名单必须与后端 `permanentLocked(provider)` 支持的集合一致：前端给了
+   * 按钮、后端不认，会得到一个必然失败的开关。
+   */
+  it('锁定永久积分只对 Loomy 与 OfficeAce 为 true', () => {
+    expect(supportsPermanentLock('loomy')).toBe(true)
+    expect(supportsPermanentLock('officeace')).toBe(true)
+    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon', 'accio', 'sensenova']) {
+      expect(supportsPermanentLock(id), `${id} 不应支持锁定永久积分`).toBe(false)
+    }
   })
 })
 

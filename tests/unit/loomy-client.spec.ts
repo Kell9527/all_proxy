@@ -125,7 +125,10 @@ describe('Loomy 客户端接线', () => {
 
   it('锁定状态在面板挂载时读取一次（且只对支持的 provider 发请求）', () => {
     expect(hubSource).toMatch(/if \(!canLockPermanent\) return undefined/)
-    expect(hubSource).toMatch(/rpcCall\('loomy\.permanentLock', \{\}\)/)
+    // ⚠️ 锁是**按 provider** 的（Loomy / OfficeAce 各自独立）：读取时必须把
+    // provider 带上，否则后端不知道问的是哪一个（2026-10-14 泛化时的真实
+    // 缺陷形态：读出来的是 loomy 的锁，写进去的也是 loomy 的锁）。
+    expect(hubSource).toMatch(/rpcCall\('loomy\.permanentLock', \{ provider \}\)/)
   })
 
   /**

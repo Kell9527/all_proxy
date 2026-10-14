@@ -39,13 +39,20 @@ export interface PoolState {  accounts: ProviderAccountEntry[]
    */
   disabledProviders?: Record<string, boolean>
   /**
-   * Loomy「锁定永久积分」开关。
+   * 「锁定永久积分」开关（**按 provider**，Loomy 与 OfficeAce 各自独立）。
    *
-   * 锁定后选号**只允许消耗今日赠送额度**，永久积分不参与 —— 只剩永久积分的
+   * 锁定后选号**只允许消耗临时/临期额度**，永久积分不参与 —— 只剩永久积分的
    * 账号在锁定期间等同于不可用。
    *
    * ⚠️ 这是**全局**开关（不分账号），也是本状态文档的字段之一：每个写入点都
    * 必须携带它，漏一处就会被整体写入抹掉。
+   */
+  permanentLocks?: Record<string, boolean>
+  /**
+   * Loomy「锁定永久积分」的**兼容镜像**（由 `permanentLocks.loomy` 同步写出）。
+   *
+   * 保留它只为读旧文档与旧备份：载入时若 `permanentLocks` 缺席而该字段为
+   * true，等价于 `permanentLocks.loomy = true`。
    */
   loomyPermanentLocked?: boolean
   /**
@@ -106,6 +113,22 @@ export function sanitizeSwitchAudit(raw: unknown): SwitchAuditEntry[] {
  * 只保留显式 `true`（关闭）的 provider；未记录即视为开启。
  */
 export function sanitizeDisabledProviders(raw: unknown): Record<string, boolean> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: Record<string, boolean> = {}
+  for (const [provider, flag] of Object.entries(raw as Record<string, unknown>)) {
+    if (flag === true) result[provider] = true
+  }
+  return result
+}
+
+/**
+ * 归一化「锁定永久积分」表：只收**显式布尔**（`true` 才入表）。
+ *
+ * 与 {@link sanitizeDisabledProviders} 同形（键存在即真值），但多一层：
+ * 非布尔值（字符串 `'true'` / 数字 `1`）一律丢弃 —— 锁是**写操作的门控**，
+ * 手改文档时一个 loosely-truthy 值会让用户在不知情时被锁上。
+ */
+export function sanitizePermanentLocks(raw: unknown): Record<string, boolean> {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
   const result: Record<string, boolean> = {}
   for (const [provider, flag] of Object.entries(raw as Record<string, unknown>)) {
@@ -202,6 +225,7 @@ export class FileStateStore {
       disabledModels: sanitizeDisabledModels(parsed['disabledModels']),
       globalModelsEnabled: parsed['globalModelsEnabled'] !== false,
       disabledProviders: sanitizeDisabledProviders(parsed['disabledProviders']),
+      permanentLocks: sanitizePermanentLocks(parsed['permanentLocks']),
       loomyPermanentLocked: parsed['loomyPermanentLocked'] === true,
       switchAudit: sanitizeSwitchAudit(parsed['switchAudit']),
     }
