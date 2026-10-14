@@ -48,8 +48,16 @@ import { startOfficeAceLoginFlow } from '../providers/officeace-login.js'
 import { startAccioLoginFlow } from '../providers/accio-login.js'
 import type { AccioRegion } from '../providers/accio-product.js'
 
-/** 登录会话的存活上限：到点自动清理回调服务器与端口。 */
-export const LOGIN_SESSION_TTL_MS = 10 * 60 * 1000
+/**
+ * 登录会话的存活上限：到点自动清理回调服务器与端口。
+ *
+ * ⚠️ 2026-10-14 从 10 分钟提到 30 分钟（用户报障「授权后账号没添加」）：
+ * 两步式登录的等待期是**用户时间去完成授权**，不是我们的处理时间。现在的
+ * 链路可能是「点 + 新建账号 → 复制链接 → 换浏览器/无痕窗口 → 登上游账号
+ * （密码/2FA）→ 授权」，10 分钟经常不够。到点的后果是服务端停止收割
+ * （停 loopback / 停轮询），用户看着授权成功页，账号却进不来。
+ */
+export const LOGIN_SESSION_TTL_MS = 30 * 60 * 1000
 
 /** 通道统一产出：序列化凭据 + 元数据。 */
 export interface ChannelOutcome {

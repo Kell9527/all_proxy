@@ -143,6 +143,19 @@ UTC+8 当日 24:00）。
   （`src/login/officeace-dedupe.ts`，按凭据 `accountId`）：用户不小心把同一账号
   授权多次时不堆重复条目，新凭据写回既有 ref（refresh_token 一次性轮换，旧那份
   已作废），`poll` 报 `reused` 让前端提示「该账号已在池中」。
+  **授权成功但账号没添加**（2026-10-14 用户报障「网页提示欢迎使用 OfficeAce，
+  请返回客户端体验，但账号没有添加」）——授权其实成功了，问题在收割端，三处
+  缺陷叠加：① 前端轮询 **5 分钟**就停、后端会话 10 分钟才清 ⇒「后端落了账号、
+  界面不刷新」，用户看到旧列表；② `officeace-login.ts` 把「轮询 code」与
+  「换 token」放同一个 try，换 token 失败被当成「本轮没授权」吞掉后继续轮询，
+  而 code 很可能一次性 ⇒ 之后每轮取不到，空转到超时且**零错误提示**（原注释
+  还写着「由下面的分支区分」而分支根本不存在）；③ 不自动开窗后授权链变长
+  （复制链接→换浏览器→登华为→授权），10 分钟经常不够。现修为：两阶段错误
+  分离（换 token 失败立刻 reject 带原文并记日志）、两端超时统一 **30 分钟**、
+  前端显示「已等待 X 分 Y 秒」与超时后可操作提示。华为云侧实测：state 注册
+  匿名 200，未授权时 `/auth/code` 返 **HTTP 202 + `not ready`**（`Response.ok`
+  含 202，靠「无 code 字段」判未就绪 —— 改动 `pollLoginCode` 时勿「顺手」加
+  `status === 200` 判据）。
 - **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
   `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts` / **`accio-credits.ts`**）：
   标准 OAuth 2.0 + **PKCE**（回调落本项目自己的 loopback），推理是 **Gemini 族协议**
@@ -165,8 +178,8 @@ UTC+8 当日 24:00）。
 `expiry-sync` / `accio-credits` / `officeace-credits` /
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
-`login-window-policy` / `officeace-dedupe`）。
-当前 **138 个文件 3272 条用例**（2026-10-14 实测；其中
+`login-window-policy` / `officeace-dedupe` / `officeace-login`）。
+当前 **139 个文件 3279 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 

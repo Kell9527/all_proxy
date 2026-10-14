@@ -78,3 +78,21 @@ describe('登录开窗接线（源码级断言）', () => {
     expect(body).toContain('未重复添加')
   })
 })
+
+describe('授权等待时长（源码级断言）', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const hubSource = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+
+  it('前端轮询上限与后端会话 TTL 对齐（30 分钟）', () => {
+    // 用户报障「授权后账号没添加」的形态之一：前端 5 分钟就停轮询，后端
+    // 10 分钟才清会话 —— 后端落了账号而界面不刷新，用户看到的是旧列表。
+    expect(hubSource).toContain('const LOGIN_POLL_TIMEOUT_MS = 30 * 60 * 1000;')
+    // 不得再出现写死的 300000（5 分钟）
+    expect(hubSource).not.toContain('}, 300000);')
+  })
+
+  it('等待期间显示「已等待」与超时提示', () => {
+    expect(hubSource).toContain('已等待 ${Math.floor(waitSeconds / 60)} 分')
+    expect(hubSource).toContain('等待已超时（30 分钟），此链接已失效')
+  })
+})
