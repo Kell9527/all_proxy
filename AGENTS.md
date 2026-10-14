@@ -156,6 +156,14 @@ UTC+8 当日 24:00）。
   匿名 200，未授权时 `/auth/code` 返 **HTTP 202 + `not ready`**（`Response.ok`
   含 202，靠「无 code 字段」判未就绪 —— 改动 `pollLoginCode` 时勿「顺手」加
   `status === 200` 判据）。
+  **「授权后账号没加进来」的最终结论**（2026-10-14 用户二次报障，日志实证）：
+  授权链路完全正常（`已取得授权码 → 登录成功 accountId=bca660e1…`），账号
+  **本来就加过**——用户在无痕窗口里登的仍是**同一个华为账号**，判重正确生效
+  （`已在池中，未重复添加`）。⚠️ 华为授权页**不提供选账号**，它直接用浏览器
+  已登录的账号授权 ⇒ 加新账号必须在无痕窗口登**不同的华为账号**。这条已写进
+  链接提示与判重提示的文案（用户看不到区别就会一直困惑）。另：`completeLogin`
+  成功后 `cancelled`（会话被 TTL 取消/服务重启）时必须留痕，静默丢弃凭据会把
+  「授权成功但账号没进来」变成无头案。
 - **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
   `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts` / **`accio-credits.ts`**）：
   标准 OAuth 2.0 + **PKCE**（回调落本项目自己的 loopback），推理是 **Gemini 族协议**
@@ -179,7 +187,7 @@ UTC+8 当日 24:00）。
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
 `login-window-policy` / `officeace-dedupe` / `officeace-login`）。
-当前 **139 个文件 3279 条用例**（2026-10-14 实测；其中
+当前 **139 个文件 3280 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 
@@ -273,6 +281,11 @@ npm run dev          # 开发态（tsx watch）
   （已验证：放开权限后 4 个测试文件 55 条用例全部通过。）
 - **`tsc` 与 `node` 不受该限制**（纯进程内工作），故 `npm run build` / `npm run typecheck`
   在默认沙箱下即可正常运行。
+- **`proxy.bat` 启动前自动检测产物新鲜度**：`dist` 旧于 `src`、或 `web/dist` 旧于
+  `web/src` 与 `plugin-src/client` 时，先重新构建再启动（2026-10-14 用户两次追问
+  「通过这里的重启能生效吗？」——restart 只换进程、不编译，修复没进 dist 就不会
+  生效）。改 `proxy.bat` 要改 `scripts/proxy.bat.src`（UTF-8 源）再转换：
+  `sed 's/$/\r/' scripts/proxy.bat.src | iconv -f UTF-8 -t GBK > proxy.bat`。
 
 ## 技术栈与约束
 

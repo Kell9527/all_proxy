@@ -1601,12 +1601,18 @@ function ProviderPanel({ provider, rpcCall }) {
               setLoginUrlForManual(null);
               setWaitSeconds(0);
               // 判重命中（该账号已在池中）时如实说明——否则用户登完发现
-              // 账号没多一个，会以为操作失败了。
+              // 账号没多一个，会以为操作失败了。⚠️ 必须带上「怎么加新账号」
+              // 的指引：用户 2026-10-14 在这里卡了一整轮——他在无痕窗口登的
+              // 还是**同一个**华为账号，授权出来的自然是已加过的那一个。
               if (pollRes.reused === true && pollRes.account) {
                 setProbeNotice({
                   tone: 'warn',
                   text: `该账号已在账号池中（${pollRes.account.nickname || pollRes.account.id}），未重复添加。`,
-                  details: [],
+                  details: [
+                    '如果要添加的是另一个账号：复制登录链接到无痕窗口，'
+                    + '登录一个**不同的华为账号**再授权——授权页不能选账号，'
+                    + '它用的是浏览器里已登录的那一个。',
+                  ],
                 });
               }
               await loadAccounts();
@@ -2021,8 +2027,8 @@ function ProviderPanel({ provider, rpcCall }) {
           // OfficeAce 的授权页是华为云 SSO（静默复用浏览器已登录账号），
           // 故文案要点明「复制链接到其他浏览器/无痕窗口」而不是「浏览器登录」。
           title: provider === 'officeace'
-            ? '生成华为云授权链接。在无痕窗口或其他浏览器打开可登**不同**的账号'
-              + '（授权页会复用当前浏览器已登录的账号）。可多次点击以添加多个账号。'
+            ? '生成华为云授权链接。在无痕窗口登录一个**不同的华为账号**后打开，'
+              + '即可添加新账号（授权页不能选账号，登同一个账号授权出来的还是已加过的那一个）。'
             : '通过浏览器登录一个新的账号并加入账号池。可多次点击以登录多个账号。',
           onClick: () => {
             // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。

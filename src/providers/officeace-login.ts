@@ -86,7 +86,13 @@ export async function startOfficeAceLoginFlow(
         try {
           // ⚠️ code 秒级时效：拿到后立刻换 token。
           const credential = await completeLogin(code, start._internal.codeVerifier, start._internal.dpopPrivateJwk)
-          if (cancelled) return
+          if (cancelled) {
+            // ⚠️ 这里必须留痕：会话已被取消（TTL 到点 / 用户取消 / 服务重启），
+            // 凭据换到手也没人要。静默 return 会让「授权成功但账号没进来」
+            // 变成无头案（用户报障过的形态），日志是唯一的线索。
+            console.warn('[officeace] token 交换完成但会话已取消，凭据丢弃（授权期间服务可能重启过或会话已超时）')
+            return
+          }
           console.info(`[officeace] 登录成功（accountId=${credential.accountId ?? '未知'}）`)
           resolve(toLoginResult(credential, start.authorizeUrl))
           return
@@ -95,6 +101,8 @@ export async function startOfficeAceLoginFlow(
             const message = error instanceof Error ? error.message : String(error)
             console.warn(`[officeace] token 交换失败（终态，不再重试）: ${message}`)
             reject(new Error(`华为云 token 交换失败：${message}。请重新点「+ 新建账号」再试一次`))
+          } else {
+            console.warn(`[officeace] token 交换期间会话被取消: ${error instanceof Error ? error.message : String(error)}`)
           }
           return
         }

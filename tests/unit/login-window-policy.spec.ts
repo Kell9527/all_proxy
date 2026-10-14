@@ -33,12 +33,19 @@ describe('shouldAutoOpenLoginWindow', () => {
 })
 
 describe('loginLinkHint', () => {
-  it('OfficeAce 的提示必须点明「静默复用」与「无痕窗口」', () => {
+  it('OfficeAce 的提示必须点明「不能选账号」与「不同的华为账号」', () => {
     const hint = loginLinkHint('officeace')
+    // 用户 2026-10-14 卡点：在无痕窗口登的还是同一个华为账号，授权出来的
+    // 自然是已加过的那一个（判重提示「已在池中」）。不说「不能选账号 +
+    // 要登不同的账号」，用户会一直对着「欢迎使用」回调页困惑。
+    expect(hint).toContain('不能选账号')
+    expect(hint).toContain('不同的华为账号')
     expect(hint).toContain('无痕')
     expect(hint).toContain('其他浏览器')
-    // 关键警告：不说这句话，用户在当前浏览器点链接还是登同一个账号
-    expect(hint).toContain('复用')
+  })
+
+  it('OfficeAce 的提示要说明「欢迎使用」回调页即授权成功（不是错误）', () => {
+    expect(loginLinkHint('officeace')).toContain('欢迎使用OfficeAce')
   })
 
   it('其余 provider 的提示讲拦截与远程场景', () => {
@@ -68,7 +75,7 @@ describe('登录开窗接线（源码级断言）', () => {
     expect(hubSource).toContain('loginLinkHint(provider)')
   })
 
-  it('判重命中时前端提示「已在池中」（reused 一路透传）', () => {
+  it('判重命中时前端提示「已在池中」并指引如何加新账号（reused 一路透传）', () => {
     // rpc-bridge：login.poll 透传 reused
     expect(bridgeSource).toContain('reused: r.reused === true')
     // jet-hub：done 时消费 reused
@@ -76,6 +83,9 @@ describe('登录开窗接线（源码级断言）', () => {
     const body = hubSource.slice(start, hubSource.indexOf('\n  };', start))
     expect(body).toContain('pollRes.reused === true')
     expect(body).toContain('未重复添加')
+    // ⚠️ 提示必须带「怎么加新账号」的指引：用户 2026-10-14 在这里卡了一整轮
+    // —— 他在无痕窗口登的还是同一个华为账号，授权出来的自然是同一个。
+    expect(body).toContain('不同的华为账号')
   })
 })
 

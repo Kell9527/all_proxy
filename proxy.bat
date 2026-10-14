@@ -17,6 +17,9 @@ rem    两者混用时 PID 语义可能不一致（msys pid vs Windows pid），
 rem    停止动作一律带「按端口兜底清理」，保证能停干净。
 rem  - taskkill /F 为强制结束（控制台进程对普通关闭消息不响应）；
 rem    服务数据为 SQLite + JSON 文件，单进程写入下强杀无损坏风险。
+rem  - **启动前自动检测产物新鲜度**：dist 旧于 src、或 web\dist 旧于
+rem    web/src 与 plugin-src/client 时，先重新构建再启动（restart 只换
+rem    进程、不编译，否则改了代码重启「不生效」——用户两次追问过此事）。
 rem  - 本文件须以 GBK 编码 + CRLF 行尾保存（cmd 原生兼容）；
 rem    UTF-8 源在 scripts/proxy.bat.src，改后执行：
 rem      sed 's/$/\r/' scripts/proxy.bat.src | iconv -f UTF-8 -t GBK > proxy.bat
@@ -110,6 +113,22 @@ for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT% " ^| findstr LISTENI
 )
 goto :eof
 
+rem == 工具：产物是否旧于源码（结果在 STALE） =====================
+rem 为什么需要：restart 只换进程、不重新编译，跑的还是旧 dist ——
+rem 用户 2026-10-14 两次追问「通过这里的重启能生效吗？」根因就在此
+rem（修复没进 dist）。现在启动前自动比对时间戳，旧了先构建。
+rem   STALE=1 后端旧（dist/index.js 旧于 src/**.ts）
+rem   STALE=2 前端旧（web/dist 旧于 web/src、plugin-src/client）
+rem   STALE=0 都新鲜
+:detect_stale
+set "STALE=0"
+powershell -NoProfile -Command "$s = Get-ChildItem -Path 'src' -Recurse -Include *.ts | Sort-Object LastWriteTime -Descending | Select-Object -First 1; $d = Get-Item 'dist\index.js' -ErrorAction SilentlyContinue; if (-not $d) { exit 1 }; if ($s -and $s.LastWriteTime -gt $d.LastWriteTime) { exit 1 }; exit 0" >nul 2>&1
+if errorlevel 1 set "STALE=1"
+if "%STALE%"=="1" goto :eof
+powershell -NoProfile -Command "$s = Get-ChildItem -Path 'web\src','plugin-src\client' -Recurse -Include *.js,*.jsx | Sort-Object LastWriteTime -Descending | Select-Object -First 1; $d = Get-Item 'web\dist\index.html' -ErrorAction SilentlyContinue; if (-not $d) { exit 0 }; if ($s -and $s.LastWriteTime -gt $d.LastWriteTime) { exit 1 }; exit 0" >nul 2>&1
+if errorlevel 1 set "STALE=2"
+goto :eof
+
 rem == 启动 ===================================================
 :do_start
 call :pid_alive
@@ -127,6 +146,18 @@ del "%PID_FILE%" 2>nul
 if not exist node_modules (
     echo 缺少依赖，先安装（npm install）……
     call npm install || ( echo 安装失败，中止启动 & exit /b 1 )
+)
+rem 产物新鲜度：旧于源码就先构建（否则重启跑的是旧代码，修复「不生效」）
+call :detect_stale
+if "%STALE%"=="1" (
+    echo 检测到后端源码有更新，先重新构建……
+    call npm run build && call npm run build:assets || ( echo 构建失败，中止启动 & exit /b 1 )
+    rem 后端刚构建过，前端顺带也查一次
+    call :detect_stale
+)
+if "%STALE%"=="2" (
+    echo 检测到前端源码有更新，先重新构建管理端……
+    call npm run build:web || ( echo 前端构建失败，中止启动 & exit /b 1 )
 )
 if not exist dist\index.js (
     echo 未找到 dist\index.js，先构建……
