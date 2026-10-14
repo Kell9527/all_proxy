@@ -28,6 +28,12 @@ import {
   formatNamedPoolLine,
   splitCreditsByExpiry,
 } from './credit-expiry.js';
+import {
+  providerCloseConfirmCopy,
+  providerSwitchRows,
+  providerToggleSummary,
+  summarizeProviderToggle,
+} from './provider-toggle.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -958,6 +964,153 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   // 其中；一旦不在，require 会抛「missed the module table」，弹窗直接白屏。
   // 现有登录弹窗已证明 fixed 定位在这些面板里工作正常。
   return dialog;
+}
+
+/**
+ * 供应商总开关弹窗（页头「供应商」按钮打开）。
+ *
+ * 移植自来源的 `ProviderSwitchPanel`，**语义按本项目分叉调整**（见
+ * `provider-toggle.js` 文件头的两处差异）：
+ * - 开关状态由 `GET /api/providers` 的 `enabled` 直接给出，前端不重算；
+ * - 关闭只切 provider 开关（硬拦截 404），**不停用账号**。
+ *
+ * 三条交互纪律（同来源）：
+ * 1. **关闭前 confirm**，文案如实说明影响面（404 + 选号跳过 + 账号不受影响）；
+ * 2. **不做乐观更新**：开关是服务端权威状态，本地猜容易不一致；失败保留原状；
+ * 3. **失败只提示、不清空列表** —— 把整张表换成错误页会让用户以为供应商没了。
+ *
+ * ⚠️ 与 ModelListPanel 同款：弹窗直接渲染在组件树内、靠 fixed 定位覆盖全屏，
+ * **刻意不用 createPortal**（客户端模块表由宿主注入，无法离线确认 react-dom
+ * 是否在其中；一旦不在，require 会抛「missed the module table」直接白屏）。
+ */
+function ProviderSwitchPanel({ rpcCall, onClose }) {
+  const [rows, setRows] = React.useState(null);
+  const [summary, setSummary] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  /** 正在切换的 provider id（只锁被点的那一行，其余行仍可操作）。 */
+  const [busyId, setBusyId] = React.useState(null);
+  const [notice, setNotice] = React.useState(null);
+  const mounted = React.useRef(true);
+
+  const load = React.useCallback(async () => {
+    setError(null);
+    try {
+      const res = await rpcCall('provider.list', {});
+      if (!mounted.current) return;
+      const statuses = {};
+      for (const item of res.providers || []) statuses[item.id] = item;
+      setRows(providerSwitchRows(PROVIDERS, statuses));
+      setSummary(providerToggleSummary(PROVIDERS, statuses));
+    } catch (caught) {
+      if (!mounted.current) return;
+      // 读不到状态**不渲染开关**（而不是默认全开让用户误关）：宁可重试，
+      // 也不能在错误状态下让用户做出影响全部模型的批量操作。
+      setError(caught?.message || '无法读取供应商状态');
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => {
+    mounted.current = true;
+    void load();
+    return () => { mounted.current = false; };
+  }, [load]);
+
+  // ESC 关闭（同 ModelListPanel：挂在 document 上，焦点可能落在任意开关上）。
+  React.useEffect(() => {
+    const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  const toggle = async (row) => {
+    const next = !row.checked;
+    // 关闭是影响面最大的批量操作，必须确认；打开无破坏性，直接生效。
+    if (!next && !confirm(providerCloseConfirmCopy(row.label, { accountCount: row.accountCount }))) return;
+    setBusyId(row.id);
+    setNotice(null);
+    try {
+      await rpcCall('provider.setEnabled', { provider: row.id, enabled: next });
+      if (!mounted.current) return;
+      setNotice({ tone: 'ok', text: summarizeProviderToggle(row.label, next, { accountCount: row.accountCount }) });
+      // 重拉权威状态（开关是推导自服务端的展示，不做本地猜测）。
+      await load();
+    } catch (caught) {
+      console.error('[jet-hub] toggle provider failed:', caught);
+      if (!mounted.current) return;
+      setNotice({ tone: 'error', text: `切换失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setBusyId(null);
+    }
+  };
+
+  const all = rows || [];
+  const countsFor = (row) => {
+    if (row.accountCount === null) return '账号数未知';
+    const enabled = row.enabledAccountCount === null ? row.accountCount : row.enabledAccountCount;
+    return `${row.accountCount} 个账号（${enabled} 个启用）`;
+  };
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': '供应商开关',
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' },
+          React.createElement('strong', null, '供应商'),
+          React.createElement('span', { className: 'dim-jh-modalSubtitle' },
+            summary !== null && summary.known
+              ? `已打开 ${summary.open} · 已关闭 ${summary.closed}`
+              : '总开关'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            onClick: onClose,
+          }, '关闭'))),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        React.createElement('p', { className: 'dim-jh-orderHint' },
+          '关闭一个供应商 = 它的全部模型立即不可用（调用返回 404），自动选号跳过它的账号。'
+          + '账号与凭据不受影响，随时可以重新打开。已关闭的供应商排在后面。'),
+        notice !== null
+          ? React.createElement('div', {
+              className: 'dim-jh-probeNotice',
+              'data-tone': notice.tone,
+              role: notice.tone === 'error' ? 'alert' : 'status',
+            }, React.createElement('div', null, notice.text))
+          : null,
+        error !== null
+          ? React.createElement('div', { className: 'dim-jh-empty' },
+              React.createElement('p', null, error),
+              React.createElement('button', { className: 'dim-jh-btn', onClick: () => void load() }, '重试'))
+          : rows === null
+            ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取供应商状态…')
+            : React.createElement('div', { className: 'dim-jh-modelList' },
+                all.map(row => React.createElement('label', {
+                  key: row.id,
+                  className: 'dim-jh-modelRow',
+                  'data-disabled': row.checked ? 'false' : 'true',
+                  title: row.known
+                    ? (row.checked ? '点击关闭该供应商' : '该供应商已关闭，点击重新打开')
+                    : row.reason,
+                },
+                  React.createElement(ProviderLogo, { provider: row.id }),
+                  React.createElement('span', { className: 'dim-jh-modelInfo' },
+                    React.createElement('strong', { className: 'dim-jh-modelName' }, row.label),
+                    React.createElement('code', { className: 'dim-jh-modelId' }, countsFor(row))),
+                  React.createElement('input', {
+                    type: 'checkbox',
+                    className: 'dim-jh-switch',
+                    role: 'switch',
+                    checked: row.checked,
+                    // 状态未知时禁用（显示可以保守，操作必须明确）。
+                    disabled: !row.known || busyId === row.id,
+                    'aria-label': `${row.checked ? '关闭' : '打开'} ${row.label}`,
+                    onChange: () => void toggle(row),
+                  })))))));
 }
 
 function ProviderPanel({ provider, rpcCall }) {
@@ -2379,6 +2532,8 @@ export function JetHubPage({ close, rpcCall }) {
   // 一键签到：busy 防重复点击，notice 显示上一次结果摘要。
   const [checkinBusy, setCheckinBusy] = React.useState(false);
   const [checkinNotice, setCheckinNotice] = React.useState(null);
+  // 供应商总开关弹窗（页头「供应商」按钮；见 ProviderSwitchPanel）。
+  const [showProviderSwitch, setShowProviderSwitch] = React.useState(false);
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
 
@@ -2496,6 +2651,14 @@ export function JetHubPage({ close, rpcCall }) {
           disabled: checkinBusy,
           onClick: () => void checkinAll(),
         }, checkinBusy ? '签到中…' : '一键签到'),
+        // 供应商总开关：破坏性批量操作单独进弹窗，不与左侧导航（高频无害的
+        // 「选择看哪个供应商」）挤在同一行——来源在这点上有过真实误点教训。
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: '供应商总开关：关闭后该供应商的全部模型不可用（调用返回 404），'
+            + '自动选号跳过它的账号；账号与凭据不受影响。',
+          onClick: () => setShowProviderSwitch(true),
+        }, '供应商'),
         React.createElement(BackupPanel, {
           rpcCall,
           // 导入成功会整体替换账号，ProviderPanel 只在挂载时拉列表；
@@ -2548,5 +2711,13 @@ export function JetHubPage({ close, rpcCall }) {
             provider: p.id,
             rpcCall,
           })
-        : null))));
+        : null)),
+    // 供应商总开关弹窗：与 ModelListPanel 同款「组件树内 fixed 定位」做法
+    // （刻意不用 createPortal，理由见 ProviderSwitchPanel 的注释）。
+    showProviderSwitch
+      ? React.createElement(ProviderSwitchPanel, {
+          rpcCall,
+          onClose: () => setShowProviderSwitch(false),
+        })
+      : null));
 }

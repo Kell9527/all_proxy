@@ -638,7 +638,11 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
         }
         const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
         if (provider.length === 0) throw new Error('缺少 provider')
+        // ⚠️ provider 开关必须是**已注册的 id**：`disabledProviders` 是自由
+        // Record，拼错一个字母就会留下一个永不生效的死键（界面上看不见、
+        // 排查时对不上），且它还会让「全部开启」的清理逻辑多扫一项。
         if (typeof body.value['enabled'] === 'boolean') {
+          if (!registry.has(provider)) throw new Error(`未知的 provider: ${provider}`)
           await pool.setProviderEnabled(provider, body.value['enabled'])
           return { ok: true }
         }

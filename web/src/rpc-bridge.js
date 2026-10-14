@@ -18,6 +18,7 @@
  * | `account.update` / `delete` / `reorder` | `PATCH`/`DELETE`/`POST` 对应端点 |
  * | `model.list` | `GET /api/models`（**含被关闭的模型**） |
  * | `model.setDisabled` / `setAllDisabled` | `PATCH /api/models` / `POST /api/models/bulk` |
+ * | `provider.list` / `setEnabled` | `GET /api/providers` / `PATCH /api/models {provider, enabled}` |
  * | `backup.export` / `import` / `status` | `POST`/`POST`/`GET /api/backup/*` |
  * | `loomy.permanentLock` | `PATCH /api/permanent-lock`（按 provider；locked 省略=只读） |
  * | `credits.balances` | `POST /api/credits/balances`（逐账号余额 + windowDays + extra） |
@@ -129,6 +130,20 @@ export function createRpcBridge() {
           provider: payload.provider,
           modelId: payload.modelId,
           disabled: payload.disabled === true,
+        }, signal)
+      case 'provider.list': {
+        // 供应商总开关弹窗的状态源：每项带 enabled / 账号数。
+        // ⚠️ 零网络：只读账号池与注册表的内存状态，不触发任何 provider 的
+        // 远端目录拉取（打开弹窗不该打上游）。
+        const r = await get('/api/providers', signal)
+        return { providers: r.data ?? [] }
+      }
+      case 'provider.setEnabled':
+        // 供应商总开关（写）。复用 /api/models 的 { provider, enabled } 分支 ——
+        // 后端对 provider 开关与模型黑名单共用该端点（审计操作名 model-set）。
+        return patch('/api/models', {
+          provider: payload.provider,
+          enabled: payload.enabled === true,
         }, signal)
       case 'model.setAllDisabled': {
         if (payload.disabled === true) {

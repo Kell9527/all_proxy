@@ -153,8 +153,9 @@ UTC+8 当日 24:00）。
 加上本项目自写的（`llm` / `account-pool` / `gateway` / `divergence-gating` /
 `sensenova*` / `officeace*` / `accio*` / `trae-cooldown-table` / `serial-queue` /
 `expiry-sync` / `accio-credits` / `officeace-credits` /
-`credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock`）。
-当前 **133 个文件 3224 条用例**（2026-10-14 实测；其中
+`credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
+`provider-toggle` / `provider-switch-api` / `instance-watchdog`）。
+当前 **136 个文件 3257 条用例**（2026-10-14 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 
