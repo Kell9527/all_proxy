@@ -8,7 +8,9 @@ import {
   providerSwitchRows,
   providerSwitchState,
   providerToggleSummary,
+  resolveRailSelection,
   summarizeProviderToggle,
+  visibleRailProviders,
 } from '../../plugin-src/client/provider-toggle.js'
 
 /**
@@ -117,6 +119,69 @@ describe('providerToggleSummary', () => {
   })
 })
 
+// ───────────────────────── 左侧导航只列已打开的供应商 ─────────────────────────
+
+describe('visibleRailProviders', () => {
+  it('摘掉已关闭的，组内保持声明顺序', () => {
+    const visible = visibleRailProviders(PROVIDERS, {
+      codearts: { enabled: true },
+      buddy: { enabled: false },
+      officeace: { enabled: true },
+      accio: { enabled: false },
+    })
+    expect(visible.map(p => p.id)).toEqual(['codearts', 'officeace'])
+  })
+
+  it('判据与 groupProviders 一致：只认显式 false，缺失按打开', () => {
+    const visible = visibleRailProviders(PROVIDERS, {
+      codearts: {},
+      buddy: { enabled: undefined },
+      officeace: { enabled: 'false' },
+      accio: { enabled: 0 },
+    })
+    expect(visible).toHaveLength(4)
+  })
+
+  it('statuses 整体读不到 ⇒ 全量返回（不为一次失败把供应商从导航里摘掉）', () => {
+    expect(visibleRailProviders(PROVIDERS, undefined)).toHaveLength(4)
+    expect(visibleRailProviders(PROVIDERS, null)).toHaveLength(4)
+    expect(visibleRailProviders(PROVIDERS, 'nope')).toHaveLength(4)
+  })
+
+  it('全部关闭 / providers 为空都不抛错', () => {
+    expect(visibleRailProviders(PROVIDERS, {
+      codearts: { enabled: false },
+      buddy: { enabled: false },
+      officeace: { enabled: false },
+      accio: { enabled: false },
+    })).toEqual([])
+    expect(visibleRailProviders([], { codearts: { enabled: false } })).toEqual([])
+    expect(visibleRailProviders(undefined, undefined)).toEqual([])
+  })
+})
+
+describe('resolveRailSelection', () => {
+  it('选中的仍可见 ⇒ 保持原选（不无故跳走）', () => {
+    expect(resolveRailSelection(visibleRailProviders(PROVIDERS, {
+      codearts: { enabled: true },
+      buddy: { enabled: false },
+    }), 'codearts')).toBe('codearts')
+  })
+
+  it('选中的被关掉 ⇒ 换到第一个可见项（否则右侧显示左侧看不见的供应商）', () => {
+    expect(resolveRailSelection(visibleRailProviders(PROVIDERS, {
+      codearts: { enabled: false },
+      buddy: { enabled: true },
+      officeace: { enabled: true },
+    }), 'codearts')).toBe('buddy')
+  })
+
+  it('没有可见供应商 ⇒ null（界面显示「全部已关闭」空态，不是空白）', () => {
+    expect(resolveRailSelection([], 'codearts')).toBeNull()
+    expect(resolveRailSelection(undefined, 'codearts')).toBeNull()
+  })
+})
+
 describe('结果与确认文案', () => {
   it('关闭文案讲清本项目语义：404 + 选号跳过 + 账号不受影响', () => {
     const text = summarizeProviderToggle('OfficeAce (华为云)', false, { accountCount: 2 })
@@ -183,5 +248,54 @@ describe('供应商开关接线（源码级断言）', () => {
     expect(bridgeSource).toContain("case 'provider.list':")
     expect(bridgeSource).toContain("case 'provider.setEnabled':")
     expect(bridgeSource).toContain("get('/api/providers'")
+  })
+})
+
+// ───────────────────────── 左侧导航隐藏已关闭的供应商（源码级） ─────────────────────────
+
+describe('左侧导航只列已打开的供应商（源码级断言）', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const hubSource = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+  // JetHubPage 是文件里最后一个函数，切片到末尾即是它的函数体。
+  const pageStart = hubSource.indexOf('export function JetHubPage(')
+  const pageBody = hubSource.slice(pageStart)
+
+  it('导航渲染 visibleRailProviders 的结果，不再直接 map 全部 PROVIDERS', () => {
+    expect(pageBody).toContain('visibleRailProviders(PROVIDERS, providerStatuses)')
+    expect(pageBody).toContain('resolveRailSelection(visibleProviders, selected)')
+    const railStart = pageBody.indexOf("React.createElement('nav', { className: 'dim-jh-rail'")
+    expect(railStart).toBeGreaterThan(-1)
+    const railBody = pageBody.slice(railStart, pageBody.indexOf("React.createElement('main'", railStart))
+    expect(railBody).toContain('visibleProviders.map(')
+    // 选中态跟随派生值：被关掉的供应商不可能仍是 aria-selected
+    expect(railBody).toContain("'aria-selected': p.id === activeProvider")
+    expect(railBody).not.toContain('PROVIDERS.map(')
+    // 全部关掉时导航不放按钮，但要说清为什么空着、去哪恢复
+    expect(railBody).toContain('所有供应商都已关闭')
+  })
+
+  it('JetHubPage 挂载时读 provider.list，读失败不清空（保持全量显示）', () => {
+    expect(pageBody).toContain("rpcCall('provider.list'")
+    expect(pageBody).toContain('loadProviderStatuses')
+    // 读不到时**不能**把供应商从导航里摘掉：注释与实现都要在
+    expect(pageBody).toContain('读不到就保持旧状态')
+  })
+
+  it('选中的供应商被关掉 ⇒ 主区显示空态并给出去总开关的入口（不是一片空白）', () => {
+    expect(pageBody).toContain('activeProvider === null')
+    const mainStart = pageBody.indexOf("React.createElement('main'")
+    const mainBody = pageBody.slice(mainStart, pageBody.indexOf('showProviderSwitch', mainStart))
+    expect(mainBody).toContain('打开供应商总开关')
+    expect(mainBody).toContain('404 model_not_found')
+  })
+
+  it('弹窗每次成功切换后回调 onChanged，左侧导航随即刷新', () => {
+    expect(pageBody).toContain('onChanged: () => void loadProviderStatuses()')
+    const panelStart = hubSource.indexOf('function ProviderSwitchPanel(')
+    const panelBody = hubSource.slice(panelStart, hubSource.indexOf('\nfunction ProviderPanel(', panelStart))
+    expect(panelBody).toContain('onChanged?.()')
+    // 提示文案要讲清新的行为：关掉的供应商在左侧导航里彻底消失
+    expect(panelBody).toContain('不再出现在左侧导航')
+    expect(panelBody).not.toContain('排在后面')
   })
 })

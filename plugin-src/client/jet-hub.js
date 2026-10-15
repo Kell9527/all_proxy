@@ -7,6 +7,7 @@ import {
   supportsOnboardingTasks,
   supportsRateLimit,
   supportsPermanentLock,
+  supportsStaticKey,
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
@@ -32,9 +33,23 @@ import {
   providerCloseConfirmCopy,
   providerSwitchRows,
   providerToggleSummary,
+  resolveRailSelection,
   summarizeProviderToggle,
+  visibleRailProviders,
 } from './provider-toggle.js';
 import { loginLinkHint, shouldAutoOpenLoginWindow } from './login-window-policy.js';
+import { officeaceConsumeOrderNotice } from './officeace-consume-order.js';
+import {
+  emptyAccountsHint,
+  newAccountButtonLabel,
+  newAccountButtonTitle,
+  newAccountBusyLabel,
+  normalizeApiKeyInput,
+  staticKeyDialogTitle,
+  staticKeyFieldHint,
+  staticKeyNicknameHint,
+  staticKeyVerifyHint,
+} from './static-key-entry.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -992,8 +1007,11 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
  * ⚠️ 与 ModelListPanel 同款：弹窗直接渲染在组件树内、靠 fixed 定位覆盖全屏，
  * **刻意不用 createPortal**（客户端模块表由宿主注入，无法离线确认 react-dom
  * 是否在其中；一旦不在，require 会抛「missed the module table」直接白屏）。
+ *
+ * `onChanged`：每次成功切换后回调，让宿主（JetHubPage）刷新左侧导航 ——
+ * 关闭的供应商不再出现在左侧，重新打开的要出现（用户 2026-10-15 要求）。
  */
-function ProviderSwitchPanel({ rpcCall, onClose }) {
+function ProviderSwitchPanel({ rpcCall, onClose, onChanged }) {
   const [rows, setRows] = React.useState(null);
   const [summary, setSummary] = React.useState(null);
   const [error, setError] = React.useState(null);
@@ -1044,6 +1062,8 @@ function ProviderSwitchPanel({ rpcCall, onClose }) {
       setNotice({ tone: 'ok', text: summarizeProviderToggle(row.label, next, { accountCount: row.accountCount }) });
       // 重拉权威状态（开关是推导自服务端的展示，不做本地猜测）。
       await load();
+      // 通知宿主刷新左侧导航（关掉的从左侧消失、打开的回到左侧）。
+      onChanged?.();
     } catch (caught) {
       console.error('[jet-hub] toggle provider failed:', caught);
       if (!mounted.current) return;
@@ -1084,7 +1104,7 @@ function ProviderSwitchPanel({ rpcCall, onClose }) {
       React.createElement('div', { className: 'dim-jh-modalBody' },
         React.createElement('p', { className: 'dim-jh-orderHint' },
           '关闭一个供应商 = 它的全部模型立即不可用（调用返回 404），自动选号跳过它的账号。'
-          + '账号与凭据不受影响，随时可以重新打开。已关闭的供应商排在后面。'),
+          + '账号与凭据不受影响，随时可以重新打开。已关闭的供应商不再出现在左侧导航，只能在这里重新打开。'),
         notice !== null
           ? React.createElement('div', {
               className: 'dim-jh-probeNotice',
@@ -1175,6 +1195,23 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const [accioRegion, setAccioRegion] = React.useState('cn');
   const [askAccioRegion, setAskAccioRegion] = React.useState(false);
+
+  /**
+   * 静态 API Key 建号（SenseNova）的粘贴弹窗。
+   *
+   * 为什么不能走 `createAccount`：这类 provider **没有任何登录可走**
+   * （凭据就是一把 `sk-...`），`account.create` 到后端只会得到
+   * 「provider sensenova 不支持链接式登录」。建号走 `account.addKey`
+   * → `POST /api/accounts`（写凭据 + 落账号索引，无会话、无轮询）。
+   *
+   * key 输入用 `type="password"`：管理端可能被投屏/截图，且浏览器不该把
+   * 它记进表单历史。粘贴操作本身不受影响。
+   */
+  const [askApiKey, setAskApiKey] = React.useState(false);
+  const [apiKeyInput, setApiKeyInput] = React.useState('');
+  const [apiKeyNickname, setApiKeyNickname] = React.useState('');
+  const [addingKey, setAddingKey] = React.useState(false);
+  const [apiKeyError, setApiKeyError] = React.useState(null);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -1661,6 +1698,42 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
+   * 静态 API Key 建号（SenseNova）：粘贴 key → `account.addKey` → 刷新列表。
+   *
+   * 与 `createAccount` 的根本差别是**没有会话、没有轮询、没有 loginUrl**：
+   * 后端 `POST /api/accounts` 同步写完凭据与账号索引就返回，所以这里
+   * 成功即刷新列表，失败即把原因显示在弹窗里（不清空输入，用户改完再提交）。
+   */
+  const addStaticKeyAccount = async () => {
+    const normalized = normalizeApiKeyInput(apiKeyInput);
+    if (!normalized.ok) {
+      setApiKeyError(normalized.message);
+      return;
+    }
+    setAddingKey(true);
+    setApiKeyError(null);
+    try {
+      console.log('[jet-hub] account.addKey request, provider =', provider);
+      await rpcCall('account.addKey', {
+        provider,
+        apiKey: normalized.apiKey,
+        ...(apiKeyNickname.trim().length > 0 ? { nickname: apiKeyNickname.trim() } : {}),
+      });
+      if (!mounted.current) return;
+      setAskApiKey(false);
+      setApiKeyInput('');
+      setApiKeyNickname('');
+      await loadAccounts();
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] add api key failed:', caught);
+      setApiKeyError(caught?.message || '添加失败');
+    } finally {
+      if (mounted.current) setAddingKey(false);
+    }
+  };
+
+  /**
    * 停用 / 启用账号。
    *
    * ## 与模型可见性的联动（用户明确要求）
@@ -2043,17 +2116,24 @@ function ProviderPanel({ provider, rpcCall }) {
           'data-kind': 'primary',
           // OfficeAce 的授权页是华为云 SSO（静默复用浏览器已登录账号），
           // 故文案要点明「复制链接到其他浏览器/无痕窗口」而不是「浏览器登录」。
-          title: provider === 'officeace'
-            ? '生成华为云授权链接。在无痕窗口登录一个**不同的华为账号**后打开，'
-              + '即可添加新账号（授权页不能选账号，登同一个账号授权出来的还是已加过的那一个）。'
-            : '通过浏览器登录一个新的账号并加入账号池。可多次点击以登录多个账号。',
+          title: newAccountButtonTitle(provider)
+            || (provider === 'officeace'
+              ? '生成华为云授权链接。在无痕窗口登录一个**不同的华为账号**后打开，'
+                + '即可添加新账号（授权页不能选账号，登同一个账号授权出来的还是已加过的那一个）。'
+              : '通过浏览器登录一个新的账号并加入账号池。可多次点击以登录多个账号。'),
           onClick: () => {
+            // 静态 API Key provider（SenseNova）：开粘贴弹窗，**不走登录**
+            // —— 后端没有链接式登录可走，走了只会得到「不支持链接式登录」。
+            if (supportsStaticKey(provider)) setAskApiKey(true);
             // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。
-            if (provider === 'accio') setAskAccioRegion(true);
+            else if (provider === 'accio') setAskAccioRegion(true);
             else void createAccount();
           },
-          disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号'))),
+          disabled: creating || addingKey,
+          // ⚠️ 行尾四个右括号：① 收 newAccountBusyLabel 调用，②③④ 依次收
+          // button / 按钮组 headerActions / 面板头 panelHead（原文这里是三个，
+          // 因为那时的第三参数是字符串字面量，不需要自己的收尾括号）。
+        }, newAccountBusyLabel(provider, { creating, addingKey })))),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -2072,6 +2152,17 @@ function ProviderPanel({ provider, rpcCall }) {
           'data-tone': lockNotice.tone,
           role: lockNotice.tone === 'error' ? 'alert' : 'status',
         }, lockNotice.text)
+      : null,
+    // OfficeAce 的**积分消耗顺序**（2026-10-15 用户指定）：先临期、再长期、
+    // 最后永久 —— 不这么做的话，排在首位的账号会先把自己的永久积分烧掉，
+    // 而别的账号里的临期积分到期作废。文案与显示条件在
+    // `officeace-consume-order.js`（纯函数，可单测）。
+    officeaceConsumeOrderNotice(provider, accounts.length) !== null
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'status',
+        }, officeaceConsumeOrderNotice(provider, accounts.length))
       : null,
     claimNotice
       ? React.createElement('div', {
@@ -2190,6 +2281,72 @@ function ProviderPanel({ provider, rpcCall }) {
             onClick: () => setAskAccioRegion(false),
           }, '取消')))
       : null,
+    // 静态 API Key 粘贴弹窗（SenseNova）。结构与 Accio 区域预选一致：
+    // 不另做模态遮罩，面板内联展示，避免引入新的层级与焦点管理。
+    askApiKey
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'dialog',
+          'aria-label': staticKeyDialogTitle(provider),
+        },
+        React.createElement('div', null, staticKeyDialogTitle(provider)),
+        React.createElement('label', { className: 'dim-jh-modelRow' },
+          React.createElement('span', { className: 'dim-jh-modelInfo' },
+            React.createElement('strong', { className: 'dim-jh-modelName' }, staticKeyFieldHint())),
+          React.createElement('input', {
+            type: 'password',
+            className: 'dim-jh-input',
+            value: apiKeyInput,
+            autoComplete: 'off',
+            spellCheck: false,
+            placeholder: 'sk-...',
+            onChange: (e) => setApiKeyInput(e.target.value),
+            // Enter 直接提交：粘贴 key 是最常见的操作，不该逼用户移开手
+            // 再去点「添加」（昵称框里按 Enter 同样提交，那里是可选字段）。
+            onKeyDown: (e) => {
+              if (e.key === 'Enter' && !addingKey) void addStaticKeyAccount();
+            },
+          })),
+        React.createElement('label', { className: 'dim-jh-modelRow' },
+          React.createElement('span', { className: 'dim-jh-modelInfo' },
+            React.createElement('strong', { className: 'dim-jh-modelName' }, staticKeyNicknameHint())),
+          React.createElement('input', {
+            type: 'text',
+            className: 'dim-jh-input',
+            value: apiKeyNickname,
+            autoComplete: 'off',
+            spellCheck: false,
+            placeholder: '留空自动生成',
+            onChange: (e) => setApiKeyNickname(e.target.value),
+            onKeyDown: (e) => {
+              if (e.key === 'Enter' && !addingKey) void addStaticKeyAccount();
+            },
+          })),
+        React.createElement('p', { className: 'dim-jh-orderHint' }, staticKeyVerifyHint()),
+        apiKeyError
+          ? React.createElement('div', { role: 'alert' }, `添加失败：${apiKeyError}`)
+          : null,
+        React.createElement('div', { className: 'dim-jh-headerActions' },
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            disabled: addingKey,
+            onClick: () => void addStaticKeyAccount(),
+          }, addingKey ? '正在添加…' : '添加'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            disabled: addingKey,
+            onClick: () => {
+              setAskApiKey(false);
+              setApiKeyError(null);
+              // 取消时清空已粘贴的 key：敏感信息不该在界面上长驻
+              // （面板可能被投屏或截图）。
+              setApiKeyInput('');
+              setApiKeyNickname('');
+            },
+          }, '取消')))
+      : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
       : phase === 'error'
@@ -2199,7 +2356,8 @@ function ProviderPanel({ provider, rpcCall }) {
         : accounts.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty' },
               React.createElement('p', null, '尚未配置账号'),
-              React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。'))
+              React.createElement('p', null,
+                emptyAccountsHint(provider) || '点击"+ 新建账号"进行浏览器登录。'))
           : React.createElement('div', null,
               // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
               // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
@@ -2629,8 +2787,43 @@ export function JetHubPage({ close, rpcCall }) {
   const [checkinNotice, setCheckinNotice] = React.useState(null);
   // 供应商总开关弹窗（页头「供应商」按钮；见 ProviderSwitchPanel）。
   const [showProviderSwitch, setShowProviderSwitch] = React.useState(false);
+  /**
+   * 供应商开关状态：`provider.list` 的 `id → { enabled, accountCount, … }`。
+   *
+   * `null` = 还没读到 ⇒ 左侧导航按「全部打开」渲染（与 `provider-toggle.js`
+   * 同一纪律：显示可以保守，不能因为没读到就把供应商从导航里摘掉）。
+   * 读失败时**保持原值不清空**，理由相同。
+   */
+  const [providerStatuses, setProviderStatuses] = React.useState(null);
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
+
+  /**
+   * 拉一次供应商开关状态。
+   *
+   * 纯内存读（后端 `/api/providers` 不碰上游，见 rpc-bridge 的 provider.list），
+   * 故挂载时读一次 + 每次成功切换后由弹窗回调触发，不做轮询。
+   */
+  const loadProviderStatuses = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('provider.list', {});
+      if (!mounted.current) return;
+      const statuses = {};
+      for (const item of res.providers || []) statuses[item.id] = item;
+      setProviderStatuses(statuses);
+    } catch (caught) {
+      // 读不到就保持旧状态（初始 null = 全量显示）。为一次失败把供应商藏掉，
+      // 用户看到的是「账号莫名消失」，而这里只是没读到开关状态。
+      console.error('[jet-hub] load provider statuses failed:', caught);
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void loadProviderStatuses(); }, [loadProviderStatuses]);
+
+  // 左侧导航只列已打开的供应商（2026-10-15 用户要求：关掉的不要出现在左侧）。
+  const visibleProviders = visibleRailProviders(PROVIDERS, providerStatuses);
+  // 选中的那个被关掉 ⇒ 换到第一个可见项；全部关掉 ⇒ null（下面渲染空态）。
+  const activeProvider = resolveRailSelection(visibleProviders, selected);
 
   const selectProvider = (id) => {
     setSelected(id);
@@ -2785,33 +2978,53 @@ export function JetHubPage({ close, rpcCall }) {
       : null,
     React.createElement('div', { className: 'dim-jh-layout' },
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
-        PROVIDERS.map(p => React.createElement('button', {
-          key: p.id,
-          type: 'button',
-          role: 'tab',
-          className: 'dim-jh-provider',
-          'aria-selected': p.id === selected,
-          onClick: () => selectProvider(p.id),
-        },
-        React.createElement(ProviderLogo, { provider: p.id }),
-        React.createElement('span', null,
-          React.createElement('strong', null, p.label))))),
+        // 只渲染**已打开**的供应商（关掉的不出现在左侧）。全部关掉时导航里
+        // 不放任何按钮，但要说清为什么空着、去哪恢复 —— 一片空白会被当成
+        // 「页面坏了」，而这是有意为之的状态。
+        visibleProviders.length === 0
+          ? React.createElement('p', { className: 'dim-jh-orderHint' },
+              '所有供应商都已关闭。在页头「供应商」里可以重新打开。')
+          : visibleProviders.map(p => React.createElement('button', {
+            key: p.id,
+            type: 'button',
+            role: 'tab',
+            className: 'dim-jh-provider',
+            'aria-selected': p.id === activeProvider,
+            onClick: () => selectProvider(p.id),
+          },
+          React.createElement(ProviderLogo, { provider: p.id }),
+          React.createElement('span', null,
+            React.createElement('strong', null, p.label))))),
       React.createElement('main', {
         className: 'dim-jh-panel',
         role: 'tabpanel',
       },
-      PROVIDERS.map(p => p.id === selected
-        ? React.createElement(ProviderPanel, {
+      // 全部关掉：不渲染任何面板，显示空态 + 去总开关的入口。没有这个分支
+      // 时右侧是一片纯白，用户无从知道该点什么。
+      activeProvider === null
+        ? React.createElement('div', { className: 'dim-jh-empty' },
+          React.createElement('p', null,
+            '所有供应商都已关闭：调用它们的模型会返回 404 model_not_found。'),
+          React.createElement('p', null, '账号与凭据都不受影响，重新打开后全部恢复。'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            onClick: () => setShowProviderSwitch(true),
+          }, '打开供应商总开关'))
+        : PROVIDERS.map(p => p.id === activeProvider
+          ? React.createElement(ProviderPanel, {
             key: p.id + '-' + version,
             provider: p.id,
             rpcCall,
           })
-        : null)),
+          : null)),
     // 供应商总开关弹窗：与 ModelListPanel 同款「组件树内 fixed 定位」做法
     // （刻意不用 createPortal，理由见 ProviderSwitchPanel 的注释）。
     showProviderSwitch
       ? React.createElement(ProviderSwitchPanel, {
           rpcCall,
+          // 每次成功切换后刷新左侧导航：关掉的随即消失、打开的要出现。
+          // 放在这里而不是 onClose：用户可能在弹窗里连切几个再关。
+          onChanged: () => void loadProviderStatuses(),
           onClose: () => setShowProviderSwitch(false),
         })
       : null));

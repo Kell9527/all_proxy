@@ -49,6 +49,42 @@ export function groupProviders(providers, statuses) {
 }
 
 /**
+ * 左侧导航（rail）要显示的供应商：**只列已打开的**。
+ *
+ * 2026-10-15 用户要求「当供应商[被]关闭时，直接不要在左侧显示」。判据与
+ * `groupProviders` 逐字一致（只认显式 `false`，缺失按打开）—— 藏不藏是
+ * **展示层**的事，不能反过来改开关语义：状态读不到时若把供应商从导航里
+ * 摘掉，用户会以为它莫名消失，且页头弹窗之外再无处可点。故 `statuses`
+ * 整体缺失 / 非对象 ⇒ 全量返回。
+ *
+ * @param providers - PROVIDERS 常量（声明顺序即展示顺序）。
+ * @param statuses - `GET /api/providers` 的 enabled 映射（`id → { enabled }`）。
+ * @returns 过滤后的数组；组内保持 providers 的声明顺序（不重排）。
+ */
+export function visibleRailProviders(providers, statuses) {
+  const map = (statuses && typeof statuses === 'object') ? statuses : {};
+  return (providers || []).filter(p => map[p?.id]?.enabled !== false);
+}
+
+/**
+ * 左侧导航当前应展示的供应商 id。
+ *
+ * 选中的那个被关掉时必须换到第一个可见项，否则右侧面板会显示一个左侧
+ * 看不见的供应商（用户点不到它，也不知道怎么切回去）。全部关掉时返回
+ * `null` —— 界面据此显示「全部已关闭」空态并给出去总开关的入口，
+ * 而不是留一片没有任何说明的空白。
+ *
+ * @param visible - `visibleRailProviders` 的结果（已按声明顺序）。
+ * @param selectedId - 用户当前选中的 id（可能已经不可见）。
+ * @returns 可见的选中 id、第一个可见 id，或 `null`（无可见供应商）。
+ */
+export function resolveRailSelection(visible, selectedId) {
+  if (!visible || visible.length === 0) return null;
+  if (visible.some(p => p.id === selectedId)) return selectedId;
+  return visible[0].id;
+}
+
+/**
  * 单个供应商的开关态。
  *
  * @param status - `GET /api/providers` 里该项（`{ enabled, accountCount, … }`）。

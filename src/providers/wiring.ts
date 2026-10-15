@@ -40,6 +40,8 @@ import { buildLobsteraiModelsUrl } from './lobsterai-adapter.js'
 import { parseLobsteraiModels } from './lobsterai-adapter.js'
 import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import type { LoomyCredential } from './loomy.js'
+import { OfficeAceExpirySelector } from './officeace-expiry-selector.js'
+import type { OfficeAceCredential } from './officeace-auth.js'
 import { currentAccountIdFor, recordCurrentAccount } from './current-account.js'
 
 /** LobsterAI 客户端版本号解析器（进程内缓存，Buddy 侧 /v3/config 无此概念）。 */
@@ -497,6 +499,19 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
   // 不返回能力元数据，故 `catalogSource: 'static-only'`）。
   //
   // 不写 `modelRateLimits`（无请求级换号），故 `rotatesAccounts: false`。
+  //
+  // **选号按积分到期分档**（2026-10-15 用户指定：先临期、再长期、最后永久）：
+  // OfficeAce 的积分是「一组带到期时间的包」，按账号数组顺序取第一个会把
+  // 排第一账号里的永久积分先烧掉，而别的账号里的临期积分到期作废。故这里
+  // 与 Loomy 同构地先查各账号分桶再选号（档内仍保持用户手动顺序）。
+  //
+  // ⚠️ 查询走 `fetchOfficeAceCloudSubscription`（**只读**）：推理路径上不该
+  //    触发「自动领当日福利」的写操作，那件事由管理端拉余额时做。
+  const officeaceExpirySelector = new OfficeAceExpirySelector({
+    resolveCredential: (credentialRef) => ctx.pool.resolveCredentialByRef(credentialRef),
+    fetcher,
+    logger: (message) => ctx.logger.info(message),
+  })
   registry.register(
     descriptorFor('officeace', OFFICEACE.displayName, OFFICEACE.defaultBaseUrl, {
       authKind: 'custom',
@@ -505,7 +520,34 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       rotatesAccounts: false,
     }),
     new OfficeAceAdapter({
-      resolveCredential: () => ctx.resolveCredential('officeace') as never,
+      resolveCredential: async () => {
+        const allowPermanent = !ctx.pool.permanentLocked(OFFICEACE.id)
+        const candidates = ctx.pool.listAccountsByProvider(OFFICEACE.id)
+          .filter(a => a.enabled)
+          .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
+        if (candidates.length > 0) {
+          const picked = await officeaceExpirySelector.select(candidates, { allowPermanent })
+          if (picked !== undefined) {
+            const credential = await ctx.pool.resolveCredentialByRef(picked.account.credentialRef) as OfficeAceCredential | undefined
+            // 推理凭据是 modelAppKey/modelAppSecret（缺了它请求必然 401）——
+            // 选号选中但凭据不完整时落到下面的通用兜底，让池去报明确错误。
+            if (credential !== undefined && typeof credential.modelAppKey === 'string' && credential.modelAppKey.length > 0) {
+              // 登记实际选中的账号：定向续期（wiringRefresh）与用量记录都以它为准。
+              recordCurrentAccount(OFFICEACE.id, picked.account.id)
+              return credential
+            }
+          } else if (!allowPermanent) {
+            // ⚠️ 锁定永久积分时绝不可落到下面的通用兜底 —— 那会绕过锁定、
+            // 照样消耗永久积分，锁定形同虚设。直接抛明确错误（与 Loomy 同语义）。
+            throw new Error(
+              'OfficeAce：没有可用账号。已锁定永久积分，而所有账号都只剩永久积分桶'
+              + '（或积分查询失败）。请在管理端解锁永久积分，或等待临期/长期积分到账。',
+            )
+          }
+        }
+        // 兜底：无候选或选出的凭据不可解析时，退回通用池选号（会抛「没有可用账号」）。
+        return await ctx.resolveCredential(OFFICEACE.id) as OfficeAceCredential
+      },
       refresh: () => ctx.refresh('officeace'),
       readImage: ctx.readImage,
     }),

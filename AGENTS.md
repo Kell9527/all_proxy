@@ -114,6 +114,19 @@ UTC+8 当日 24:00）。
 账号来源是**管理端粘贴 key**（`POST /api/accounts`，见 `src/admin/router.ts` 的
 `STATIC_KEY_PROVIDERS`）或环境变量 `SENSENOVA_API_KEYS` 首次引导，故它**没有**
 `*-oauth.ts` / `*-auth.ts`，也不在 `REFRESH_SUPPORTED_PROVIDERS` 里。
+**管理端粘贴入口**（2026-10-15 用户报障「点新建账号提示：provider sensenova
+  不支持链接式登录」）：后端能力一直齐全（`POST /api/accounts` +
+  `createStaticKeyAccount` + `account.addKey` + `supportsStaticKey`），
+  **缺的只是面板里的入口** —— 「+ 新建账号」只有链接式登录一条路，点下去
+  必然被 orchestrator 拒绝。已补：`plugin-src/client/static-key-entry.js`
+  （纯函数：按钮文案 / 忙碌标签 / 弹窗说明 / 输入归一）+ `jet-hub.js` 的
+  分叉（`supportsStaticKey(provider)` → 开粘贴弹窗 → `account.addKey` → 刷新列表）。
+  ⚠️ 三条纪律：① 能力判定**只认** `supportsStaticKey`，不另写 provider 名单
+  （否则后端新增静态 key provider 时会出现「后端认、按钮不认」）；② 输入先过
+  `normalizeApiKeyInput` 剥空白 —— 从控制台复制极易带上换行，原样提交会得到
+  一个「看起来对却 401」的账号，而日志不能打印 key 明文，等于无头案；
+  ③ 建号**不校验 key 有效性**（后端只写凭据与索引，不打上游），故弹窗常驻一句
+  提示把验证手段指到面板既有的「重测」。
 
 **第 12、13 个 provider —— OfficeAce（华为云 ModelArts MaaS）与 Accio（阿里 Accio Work）**
 （2026-10-14 从来源 HEAD 移植，均超出移植基线 `3611a62`，故不走 `port-providers.mjs`）：
@@ -173,6 +186,23 @@ UTC+8 当日 24:00）。
   前端停损并显示原因；`fetchModelInfo` 的错误文案讲清「未开通 + 怎么办」。
   ⚠️ 排查这类问题的顺序：先看 `data/run/all-proxy.out.log` / `all-proxy.err.log`
   （console 日志走 stdout，proxy.bat 只重定向 out/err 两个文件，**warn 在 out**）。
+  **积分按到期顺序消耗**（2026-10-15 用户要求「先消耗临期的，等所有账号临期的没有了，
+  再消耗长期的，最后才是永久的」）：OfficeAce 的积分是「一组带到期时间的包」，按账号
+  数组顺序取第一个会把排首位的**永久**积分先烧掉，而别的账号里的**临期**积分到期作废。
+  实现与 Loomy 的 `loomy-balance-selector.ts` 同构：`officeace-expiry-rank.ts`（纯函数：
+  分桶 `splitOfficeAceCreditGroups` + 分档 `officeaceExpiryTier` + 稳定排序
+  `rankOfficeAceAccountsByExpiry`）与 `officeace-expiry-selector.ts`（60 秒 TTL 缓存 +
+  查询），接线在 `wiring.ts` 的 `resolveCredential` 里。三条纪律：① **档内保持手动顺序**
+  （`expiring` → `longTerm` → `permanent` → `unknown` → `empty`，档内不重排，拖拽仍然有效）；
+  ② **查询失败归 `unknown` 档而不是抛错** —— 全部查不到时稳定排序退化成手动顺序，
+  与加本模块之前的行为一致；③ **查询走只读的 `fetchOfficeAceCloudSubscription`**，不用
+  `fetchOfficeAceBalanceDetailed`（后者会在查询前触发「自动领当日福利」的 POST，推理
+  请求路径上不该有写操作）。分桶口径必须与面板逐字同源（同一份 `creditGroups`、同一个
+  `OFFICEACE_EXPIRY_WINDOW_DAYS = 15`、同一条「已失效/剩余 ≤ 0 不计入」），否则用户会
+  在面板看到「临期 2000」却被永久账号抢走请求。顺带把**锁定永久积分**在 OfficeAce 上
+  真正接上了（按钮前端早就有，后端此前不认）：锁定时 `permanent` / `unknown` / `empty`
+  一律不可用，全部不可用即报「没有可用账号」而不是烧永久积分。
+  面板说明（≥ 2 个账号时常驻）在 `plugin-src/client/officeace-consume-order.js`。
 - **Accio**（`accio-product.ts` / `accio.ts` / `accio-oauth.ts` / `accio-messages.ts` /
   `accio-adapter.ts` / `accio-auth.ts` / `accio-login.ts` / **`accio-credits.ts`**）：
   标准 OAuth 2.0 + **PKCE**（回调落本项目自己的 loopback），推理是 **Gemini 族协议**
@@ -195,8 +225,10 @@ UTC+8 当日 24:00）。
 `expiry-sync` / `accio-credits` / `officeace-credits` /
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
-`login-window-policy` / `officeace-dedupe` / `officeace-login` / `account-phone`）。
-当前 **140 个文件 3294 条用例**（2026-10-14 实测；其中
+`login-window-policy` / `officeace-dedupe` / `officeace-login` / `account-phone` /
+`static-key-entry` / `officeace-expiry-rank` / `officeace-expiry-selector` /
+`officeace-consume-order`）。
+当前 **144 个文件 3375 条用例**（2026-10-15 实测；其中
 `buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
 `validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
 
@@ -260,7 +292,10 @@ all_proxy/
    **不要**登记 `REFRESH_SUPPORTED_PROVIDERS`（那会让定时任务对一个不存在的
    端点发请求），账号一律 `refreshable: false`；
 4. 管理端新增账号：把 provider 加进 `src/admin/router.ts` 的
-   `STATIC_KEY_PROVIDERS`，前端 `supportsStaticKey()` 才会渲染「粘贴 API Key」按钮；
+   `STATIC_KEY_PROVIDERS`，前端 `supportsStaticKey()` 才会渲染「粘贴 API Key」按钮
+   （文案与输入归一在 `plugin-src/client/static-key-entry.js`，接线见 `jet-hub.js`
+   的 `addStaticKeyAccount`；`supportsStaticKey` 目前在 `credits-capabilities.js`
+   里按 provider 字面量判定，新增静态 key provider 时**两边都要加**）；
 5. **凭据字段必须写 `access_token`**（值是 key）——`findAccountIdByCredential`
    对非 codearts 一律取该字段，改字段名会让账号永远登记不上（换号/限流/用量全失效）；
 6. `account-probe.ts` 的探测分派表补该 provider（否则「重测」会落到 CodeArts 签名分支）；
@@ -365,6 +400,14 @@ npm run dev          # 开发态（tsx watch）
   `/v1/subscription` 只有 `domain_id`，`/v1/claw/{user,user_info,account,profile}`
   全部 404（2026-10-14 实测）。故它退一档显示 `accountId`（与登录日志同源）。
   ⚠️ 文件引用（`FILE:`）仍显示脱敏路径，不显示手机号 —— 与 Loomy 的既有行为一致。
+- **关闭的供应商不在左侧导航显示**（2026-10-15 用户要求「当供应商列表关闭时，直接不要在
+  左侧显示」）：`JetHubPage` 挂载时读一次 `provider.list`（后端纯内存，不碰上游），左侧
+  rail 只渲染 `visibleRailProviders` 的结果。配套的三个约束：① 状态**读不到时全量显示**
+  （初始 `null` 即全量；读失败保持旧值）—— 藏不藏是展示层的事，不能因为一次失败让供应商
+  「莫名消失」；② 选中的那个被关掉时换到第一个可见项（`resolveRailSelection`），否则右侧
+  会显示一个左侧看不见、点不到的供应商；③ 全部关掉时导航与主区都给空态说明 + 「打开供应商
+  总开关」入口，不留无说明的空白。弹窗每次成功切换后经 `onChanged` 回调刷新导航（不是
+  `onClose`：用户可能连切几个再关）。
 - **`node:sqlite` 是 experimental**：启动时会打印警告，属预期。
 - **来源与本项目会逐渐分叉**：来源的缺陷修复不会自动同步；需要时按上表基线 commit
   对照 cherry-pick。
