@@ -17,6 +17,7 @@
 | [04-accio.md](04-accio.md) | Accio（阿里 Accio Work）账号管理：PKCE 登录、Gemini 族协议、region 预选 | 差异合并（来源 HEAD 已有） |
 | [05-sensenova.md](05-sensenova.md) | SenseNova（商汤开放平台）静态 API Key provider：请求级换号 | **全新引入**（来源没有） |
 | [06-login-tabs.md](06-login-tabs.md) | 短信登录 / 密码登录 tab 页（管理端顶层 tab + 弹窗内 tab）与登录编排 | 混合（新架构 + 新端点） |
+| [07-tencent-11128.md](07-tencent-11128.md) | 腾讯系 `code 11128`：`X-Conversation-*` 三头 + 内容级指纹改写（WorkBuddy / CodeBuddy） | 差异合并（来源 HEAD 已有，本项目移植时漏搬） |
 
 ## 总原则（回移植前必读）
 

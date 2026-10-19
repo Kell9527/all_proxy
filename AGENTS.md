@@ -73,6 +73,24 @@
     （`src/pool/refresh-coordinator.ts`）——同账号并发刷新会让第二次拿着刚作废的
     token 去打。该能力做在**凭据存储层**，`src/providers/raccoon*.ts` 依旧零文件访问
     （`raccoon-client-independence.spec.ts` 锁死这条，勿在 provider 内加 `readFileSync`）。
+12. **腾讯系 `code 11128` 有两个不同子原因，必须看 `msg` 不能只看 `code`**
+    （2026-10-19，`docs/07-tencent-11128.md`）：
+    - `msg:"request illegal"` / `"conversation id missing"` = **渠道校验**，判据是
+      三枚 `X-Conversation-*` 头**同时存在且非空**（`tencent-conversation-headers.ts`）；
+      ⚠️ **按账号生效**（来源实测 2/5、3/5 两种比例）⇒「本机不带三头也 200」
+      **不能**论证「不必发」，缺任一即对那类账号整条渠道不可用。
+      ⚠️ 该措辞**与 11140 共用** ⇒ 分类判据必须同时按 `code === 11128` 收窄。
+    - `msg:"Illegal API invocation from an unapproved channel"` = **内容级风控**，
+      拦 `system` 与 **`assistant` 正文**里的客户端模板句
+      （`tencent-fingerprint.ts`）。⚠️ **`assistant` 那一格不能省**：历史里的正文
+      每轮原样重放 ⇒ 「这个 provider 从此每轮都失败，换任何腾讯系模型都一样」
+      （跟会话走，不跟模型走）。`user` / `tool` / `reasoning_content` /
+      `tool_calls.arguments` 实测**都不拦**，改它们等于篡改用户原话与工具证据。
+    - 三族的 `displayMsg` / `displayTips` **逐字相同** ⇒ 绝不能拿它判原因。
+    - ⚠️ 指纹改写共**四个产出点**（`serializeMessages` 的 assistant / system 分支 +
+      `stream()` 里 `options.system` 的 `unshift`）；`serializeMessages` 是独立函数，
+      `provider` 必须作为第三参数传入。将来若新增直发 `/v2/chat/completions` 的代码，
+      必须同样调用 `applyTencentConversationHeaders()` 与指纹改写。
 
 ### 已移植文件清单（基线 `3611a62`）
 
