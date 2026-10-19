@@ -20,10 +20,11 @@ import type { CredentialStore } from '../pool/types.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Logger } from '../pool/store.js'
-import type { BuddyCredential } from './types.js'
+import type { BuddyCredential, CodeArtsCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import { ProviderRegistry, type ProviderDescriptor } from './registry.js'
 import { fetchModels as fetchBuddyModels } from './buddy-oauth.js'
+import { fetchCodeArtsRemoteModels } from './models.js'
 import {
   TRAE_BATCH_MODELS_PATH,
   TRAE_REQUEST_TIMEOUT_MS,
@@ -189,6 +190,25 @@ import { fetchAccioRemoteModels, parseAccioCredential } from './accio-auth.js'
 import type { AccioCredential } from './accio.js'
 import { SENSENOVA } from './sensenova-product.js'
 
+/**
+ * 取账号池里第一个**凭据可解析且含 AK/SK** 的 CodeArts 凭据。
+ *
+ * 移植自来源 `service.firstUsableCredential`（逐字保留其取舍）：
+ * - 用 `listAccountsByProvider` 的既有顺序（用户的拖拽顺序），短路返回；
+ * - **不**按 `enabled` 与限流状态过滤 —— 拉模型目录既不需要账号启用，
+ *   也与限流无关（这正是不能用 `getAvailableAccount` 的原因）。
+ *
+ * ⚠️ 模型目录是**账号无关**的（同一华为云账号体系下发同一份目录），
+ * 取第一个可用账号即可，不必为每个账号各拉一次。
+ */
+async function firstUsableCodeArtsCredential(pool: AccountPool): Promise<CodeArtsCredential | undefined> {
+  for (const entry of pool.listAccountsByProvider('codearts')) {
+    const credential = await pool.resolveCredentialForAccount(entry.id) as CodeArtsCredential | undefined
+    if (credential?.access_key_id && credential.secret_access_key) return credential
+  }
+  return undefined
+}
+
 /** 装配上下文：适配器需要的全部外部依赖。 */
 export interface WiringContext {
   pool: AccountPool
@@ -274,6 +294,20 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       resolveCredential: () => ctx.resolveCredential('codearts') as never,
       refresh: () => ctx.refresh('codearts'),
       accountPool: ctx.pool,
+      // 远端目录：opengw `gateway/config`（benefit 模型）+ snap-access
+      // `/v1/model/builtin`（常规模型）两个端点的并集，见 `models.ts`。
+      //
+      // ⚠️ 这条接线此前**缺失**（用户报障「上游有 glm-5.3，本项目列表没有」）：
+      // 不注入 `fetchRemoteModels` 时适配器只会播报静态兜底表 `DEFAULT_MODELS`，
+      // 而该表停在 `glm-5.3-flash` 那一代 —— 上游后来在 builtin 端点新增的
+      // `glm-5.3` / `glm-5.2-sft-harmony` / `kimi-k2.6-vl` 等一律看不到。
+      // 远端目录是**账号无关**的，故用 listAccountsByProvider 顺序取第一个
+      // 可解析凭据（含停用账号），与来源 `service.refreshModels` 同语义。
+      fetchRemoteModels: () => fetchRemoteCatalog('codearts', async () => {
+        const credential = await firstUsableCodeArtsCredential(ctx.pool)
+        if (credential === undefined) return []
+        return fetchCodeArtsRemoteModels(credential, fetcher)
+      }),
     }),
   )
 
