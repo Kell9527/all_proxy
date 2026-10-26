@@ -178,6 +178,14 @@ export class ClineAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 远端模型目录缓存（首次成功后填充）。 */
   private remoteModels: ClineModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
   /** 正在进行中的目录加载（避免并发重复请求）。 */
   private loading: Promise<void> | undefined
 

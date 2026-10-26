@@ -497,6 +497,14 @@ export class AccioAdapter extends LlmAdapter {
   private readonly utdid: string
   /** 远端目录缓存（成功拉取后永久保留）。 */
   private remoteModels: AccioFallbackModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
   /** 目录拉取失败冷却（避免每模型重试放大）。 */
   private catalogFailedAt: number | undefined
 

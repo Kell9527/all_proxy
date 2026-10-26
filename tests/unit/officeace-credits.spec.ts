@@ -3,6 +3,8 @@ import {
   claimOfficeAceDailyBonus,
   fetchOfficeAceBalanceDetailed,
   fetchOfficeAceCloudSubscription,
+  maybeClaimOfficeAceBonus,
+  officeAceDayKey,
   parseOfficeAceSubscription,
   resetOfficeAceBonusClaimThrottle,
 } from '../../src/providers/officeace-credits.js'
@@ -101,7 +103,6 @@ describe('officeace-credits：V11 签名', () => {
     const signed = /SignedHeaders=([^,]+),/.exec(headers['Authorization']!)![1]!
     expect(signed).toContain('content-type')
   })
-
   it('签名随凭据变化（access/secret 换一对，Authorization 必须不同）', async () => {
     const seen: string[] = []
     const grab = fakeFetch(() => json({
@@ -250,5 +251,143 @@ describe('officeace-credits：fetchOfficeAceBalanceDetailed', () => {
     ))
     const result = await fetchOfficeAceBalanceDetailed(cred(), 'REF', f)
     expect(result.balance?.total).toBe(6500)
+  })
+})
+
+describe('officeace-credits：每日福利领取的结果分类', () => {
+  it('领到新桶 ⇒ kind=claimed 并带出活动与分值', async () => {
+    const { fetch: f } = fakeFetch(() => json({
+      bonus_skus: [{ activity_id: 'bonus-daily-checkin-2026', activity_name: '每日签到有礼', points: 100 }],
+    }))
+    const result = await claimOfficeAceDailyBonus(cred(), f)
+    expect(result.kind).toBe('claimed')
+    expect(result.claimed).toEqual([
+      { activityId: 'bonus-daily-checkin-2026', activityName: '每日签到有礼', points: 100 },
+    ])
+  })
+
+  it('上游回 200 但空桶 ⇒ kind=empty（实测即「今天已经领过」）', async () => {
+    // 2026-10-23 对已领账号实测：HTTP 200 + {"bonus_skus":[]}
+    const { fetch: f } = fakeFetch(() => json({ bonus_skus: [] }))
+    expect((await claimOfficeAceDailyBonus(cred(), f)).kind).toBe('empty')
+  })
+
+  it('非 2xx ⇒ kind=failed（不可与 empty 混淆：后者不该重试）', async () => {
+    const { fetch: f } = fakeFetch(() => json({}, 500))
+    expect((await claimOfficeAceDailyBonus(cred(), f)).kind).toBe('failed')
+  })
+
+  it('2xx 但不是 JSON ⇒ kind=failed（重试有意义）', async () => {
+    const { fetch: f } = fakeFetch(() => new Response('<html>gateway</html>', { status: 200 }))
+    expect((await claimOfficeAceDailyBonus(cred(), f)).kind).toBe('failed')
+  })
+
+  it('凭据缺 STS ⇒ failed 且不发请求', async () => {
+    const { fetch: f, calls } = fakeFetch(() => json({ bonus_skus: [] }))
+    const result = await claimOfficeAceDailyBonus(cred({ securityToken: '' }), f)
+    expect(result.kind).toBe('failed')
+    expect(calls).toHaveLength(0)
+  })
+})
+
+describe('officeace-credits：领取去重（UTC+8 自然日）', () => {
+  it('officeAceDayKey 取 UTC+8 日界，不取本机时区', () => {
+    // UTC 2026-10-22T16:30Z = 北京时间 2026-10-23 00:30 ⇒ 属于 10-23
+    expect(officeAceDayKey(new Date('2026-10-22T16:30:00Z'))).toBe('2026-10-23')
+    // UTC 2026-10-23T15:59Z = 北京时间 23:59，仍是 10-23
+    expect(officeAceDayKey(new Date('2026-10-23T15:59:00Z'))).toBe('2026-10-23')
+    // UTC 2026-10-23T16:00Z = 北京时间次日 00:00 ⇒ 进入 10-24
+    expect(officeAceDayKey(new Date('2026-10-23T16:00:00Z'))).toBe('2026-10-24')
+  })
+
+  it('同一 UTC+8 自然日内成功领取后不再打上游', async () => {
+    const { fetch: f } = fakeFetch(() => json({ bonus_skus: [] }))
+    const at = Date.parse('2026-10-23T01:00:00Z')
+    await maybeClaimOfficeAceBonus(cred(), 'REF_A', f, () => at)
+    expect(await maybeClaimOfficeAceBonus(cred(), 'REF_A', f, () => at + 60_000)).toBeUndefined()
+    expect(f).toHaveBeenCalledTimes(1)
+  })
+
+  it('跨 UTC+8 自然日后重新领取', async () => {
+    const { fetch: f } = fakeFetch(() => json({ bonus_skus: [] }))
+    const day1 = Date.parse('2026-10-23T01:00:00Z')
+    await maybeClaimOfficeAceBonus(cred(), 'REF_B', f, () => day1)
+    // 次日（UTC 16:00 之后即北京次日）
+    const day2 = Date.parse('2026-10-23T16:30:00Z')
+    expect(await maybeClaimOfficeAceBonus(cred(), 'REF_B', f, () => day2)).toBeDefined()
+    expect(f).toHaveBeenCalledTimes(2)
+  })
+
+  it('**失败不记日期**：网络抖动后当天仍会重试（早期实现会白丢当天额度）', async () => {
+    let fail = true
+    const { fetch: f } = fakeFetch(() => (fail ? json({}, 503) : json({
+      bonus_skus: [{ activity_id: 'bonus-daily-checkin-2026', activity_name: '每日签到有礼', points: 100 }],
+    })))
+    const at = Date.parse('2026-10-23T01:00:00Z')
+    const first = await maybeClaimOfficeAceBonus(cred(), 'REF_C', f, () => at)
+    expect(first?.kind).toBe('failed')
+    // 冷却期内不重试（避免面板与定时器连续打上游）
+    expect(await maybeClaimOfficeAceBonus(cred(), 'REF_C', f, () => at + 60_000)).toBeUndefined()
+    // 冷却结束后**真的重试**（说明失败没有被记成「今天已领」）
+    fail = false
+    const later = await maybeClaimOfficeAceBonus(cred(), 'REF_C', f, () => at + 11 * 60_000)
+    expect(later?.kind).toBe('claimed')
+  })
+
+  it('不同 ref 各自领取（共用一把锁会让第二个账号永远领不到）', async () => {
+    const { fetch: f } = fakeFetch(() => json({ bonus_skus: [] }))
+    const at = Date.parse('2026-10-23T01:00:00Z')
+    await maybeClaimOfficeAceBonus(cred(), 'REF_D1', f, () => at)
+    await maybeClaimOfficeAceBonus(cred(), 'REF_D2', f, () => at)
+    expect(f).toHaveBeenCalledTimes(2)
+  })
+})
+
+/**
+ * 手动补领（面板按钮）：`force: true` 必须跳过两道闸门。
+ *
+ * 用户点按钮就是明确要求「现在就试一次」。若被去重表静默忽略，按钮看起来
+ * 就是坏的 —— 这正是要防的形态。
+ */
+describe('officeace-credits：手动补领（force）', () => {
+  it('force 跳过「今天已领」闸门，真的重打上游', async () => {
+    const { fetch: f } = fakeFetch(() => json({ bonus_skus: [] }))
+    const at = Date.parse('2026-10-23T01:00:00Z')
+    await maybeClaimOfficeAceBonus(cred(), 'REF_F1', f, () => at)
+    expect(f).toHaveBeenCalledTimes(1)
+    // 不带 force：被去重表挡住
+    expect(await maybeClaimOfficeAceBonus(cred(), 'REF_F1', f, () => at)).toBeUndefined()
+    expect(f).toHaveBeenCalledTimes(1)
+    // 带 force：照常请求
+    const forced = await maybeClaimOfficeAceBonus(cred(), 'REF_F1', f, () => at, { force: true })
+    expect(forced?.kind).toBe('empty')
+    expect(f).toHaveBeenCalledTimes(2)
+  })
+
+  it('force 跳过失败冷却期（用户不想等 10 分钟）', async () => {
+    let fail = true
+    const { fetch: f } = fakeFetch(() => (fail ? json({}, 503) : json({
+      bonus_skus: [{ activity_id: 'bonus-daily-checkin-2026', activity_name: '每日签到有礼', points: 100 }],
+    })))
+    const at = Date.parse('2026-10-23T01:00:00Z')
+    expect((await maybeClaimOfficeAceBonus(cred(), 'REF_F2', f, () => at))?.kind).toBe('failed')
+    // 冷却期内不带 force ⇒ 跳过
+    expect(await maybeClaimOfficeAceBonus(cred(), 'REF_F2', f, () => at + 1000)).toBeUndefined()
+    // 带 force ⇒ 立刻重试
+    fail = false
+    const forced = await maybeClaimOfficeAceBonus(cred(), 'REF_F2', f, () => at + 2000, { force: true })
+    expect(forced?.kind).toBe('claimed')
+  })
+
+  it('force 领取成功后仍更新去重表（定时任务不会重复打上游）', async () => {
+    const { fetch: f } = fakeFetch(() => json({
+      bonus_skus: [{ activity_id: 'bonus-daily-checkin-2026', activity_name: '每日签到有礼', points: 100 }],
+    }))
+    const at = Date.parse('2026-10-23T01:00:00Z')
+    await maybeClaimOfficeAceBonus(cred(), 'REF_F3', f, () => at, { force: true })
+    expect(f).toHaveBeenCalledTimes(1)
+    // 随后的定时任务（不带 force）应被挡住
+    expect(await maybeClaimOfficeAceBonus(cred(), 'REF_F3', f, () => at + 60_000)).toBeUndefined()
+    expect(f).toHaveBeenCalledTimes(1)
   })
 })

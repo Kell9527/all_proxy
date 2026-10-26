@@ -28,6 +28,7 @@ import {
   isRaccoonRefreshable,
   raccoonCredentialExpiresAtMs,
   raccoonDisplayName,
+  raccoonHeaders,
   decodeJwtExpMs,
   type RaccoonCredential,
   type RaccoonModelMeta,
@@ -471,31 +472,17 @@ export class RaccoonAuth extends Service {
    *
    * ⚠️ 失败时返回**空数组**：适配器据此回退兜底表。
    * 让模型目录失败不抛错，是为了不让整个 provider 在模型选择器里报错。
+   *
+   * ⚠️ 生产路径（`wiring.ts` 的 `fetchRemoteModels`）走
+   * {@link fetchRaccoonRemoteModels} + `firstUsableRaccoonCredential`，不经过
+   * 这里的 `resolveForFetchModels`：后者用 `getAvailableAccount`，会跳过**停用**
+   * 账号，而拉目录与「能否发推理请求」无关（全部停用时目录会莫名退回兜底表）。
+   * 本方法保留给显式调用方（测试与登录后的状态展示）。
    */
   async fetchModels(pool?: AccountPool): Promise<RaccoonRemoteModel[]> {
     const credential = await this.resolveForFetchModels(pool)
     if (credential === undefined) return []
-
-    try {
-      const response = await this.fetchImpl(
-        `${this.product.apiBase}${this.product.llmApiPrefix}/model_catalog`,
-        {
-          method: 'GET',
-          headers: {
-            Accept: 'application/json',
-            Authorization: `Bearer ${credential.access_token}`,
-            'X-Org-Code': credential.office_identity ?? '',
-            'X-Raccoon-Language': 'zh',
-          },
-          signal: AbortSignal.timeout(20_000),
-        },
-      )
-      if (!response.ok) return []
-      const payload = await response.json() as unknown
-      return parseRaccoonModelCatalog(payload)
-    } catch {
-      return []
-    }
+    return fetchRaccoonRemoteModels(this.product, credential, this.fetchImpl)
   }
 
   /** 取一个可用凭据（先账号池，再默认 ref）。 */
@@ -615,6 +602,47 @@ export class RaccoonAuth extends Service {
       }
     }
     return repaired
+  }
+}
+
+/**
+ * 拉取并解析远端模型目录（`GET /api/web/llm/v2/model_catalog`）。
+ *
+ * 从 `RaccoonAuth.fetchModels` 抽出来的**纯函数**：装配层（`wiring.ts`）没有
+ * `RaccoonAuth` 实例，却必须能把这个目录注入适配器的 `fetchRemoteModels` ——
+ * 否则适配器只能播报 `raccoon-product.ts` 里那张写死的兜底表，上游新增的模型
+ * 永远看不到（与 CodeArts 的 `glm-5.3` 是同一类缺陷）。
+ *
+ * ⚠️ 请求头必须走 {@link raccoonHeaders} 而不是手写：个人账号的
+ * `office_identity` 是字面量 `'personal'`，原样发出去服务端会当组织码查库并回
+ * `HTTP 400 code=200022 org_not_found_error`（2026-10-21 实测），`raccoonHeaders`
+ * 里已有折叠成空串的规则。
+ *
+ * ⚠️ 失败返回**空数组**（不抛错）：调用方据此保持兜底表，模型目录失败不该让
+ * 整个 provider 在选择器里报错。
+ */
+export async function fetchRaccoonRemoteModels(
+  product: RaccoonProduct,
+  credential: RaccoonCredential,
+  fetcher: typeof fetch = fetch,
+): Promise<RaccoonRemoteModel[]> {
+  try {
+    const response = await fetcher(
+      `${product.apiBase}${product.llmApiPrefix}/model_catalog`,
+      {
+        method: 'GET',
+        headers: raccoonHeaders(credential, {
+          platform: product.clientPlatform,
+          version: product.clientVersion,
+        }),
+        signal: AbortSignal.timeout(20_000),
+      },
+    )
+    if (!response.ok) return []
+    const payload = await response.json() as unknown
+    return parseRaccoonModelCatalog(payload)
+  } catch {
+    return []
   }
 }
 

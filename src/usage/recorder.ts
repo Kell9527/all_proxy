@@ -82,6 +82,7 @@ export function toUsageRecord(record: RequestRecord, nowMs: number): UsageRecord
     // ⚠️ 规格明确：必须记**实际完成请求的账号**。适配器在轮换时会登记，
     // 故这里取的是登记值而不是「池里的第一个账号」。
     accountId: record.accountId ?? '',
+    reasoningEffort: record.reasoningEffort ?? '',
     promptTokens: record.inputTokens + cacheRead + cacheWrite,
     completionTokens: record.outputTokens,
     cacheReadTokens: cacheRead,

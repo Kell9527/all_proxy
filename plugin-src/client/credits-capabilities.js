@@ -155,11 +155,20 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // （`src/providers/officeace-credits.ts`），分桶为「永久 / 长期 / 临期」
   // （判据是桶的到期时间与 windowDays，无到期时间 = 永久）。
   //
-  // ⚠️ 每日 1000 福利**没有签到按钮**：果办客户端的做法是订阅页挂载即自动调
+  // ⚠️ 每日福利**没有签到按钮**：果办客户端的做法是订阅页挂载即自动调
   //    `/v1/subscription/bonus/claim`（UI 上不存在手动签到）。故本服务的实现
-  //    同样是「拉余额前自动领」（按账号每小时节流一次），`dailyCheckin` 恒
-  //    false —— 登记成签到按钮会让用户以为每天手动点才有。
-  officeace: Object.freeze({ balance: true, dailyCheckin: false }),
+  //    是**自动领取** —— 面板拉余额时顺手领一次，外加服务侧每小时的定时任务
+  //    （`claimOfficeAceDailyBonuses`）。`dailyCheckin` 恒 false —— 登记成签到
+  //    按钮会让用户以为每天手动点才有。
+  //    实测额度：`bonus-daily-checkin-2026` = **100 分**（2026-10-23）。
+  //
+  // dailyBonus：**补领当日福利**（手动兜底）。与自动领取是同一件事，区别只在
+  //    「谁来触发」：定时任务只在进程活着时跑，用户关掉服务过夜或跨天后才启动
+  //    时可能错过窗口（额度按 UTC+8 自然日作废）。按钮**强制跳过去重闸门**，
+  //    点一下立刻试一次并逐账号显示结果。
+  //    ⚠️ 它不是 `dailyCheckin`（后者语义是「每天必须手动点」，会误导用户），
+  //    也不是 `dailyKeepalive`（那个是「把已到账的积分有效期延长」，不产生新分）。
+  officeace: Object.freeze({ balance: true, dailyCheckin: false, dailyBonus: true }),
   // Accio（阿里 Accio Work）：**只有余额**，没有签到。
   //
   // 余额：三个只读端点聚合（`src/providers/accio-credits.ts` 的文件头有完整
@@ -299,6 +308,23 @@ export function supportsOnboardingTasks(provider) {
  */
 export function supportsDailyKeepalive(provider) {
   return CREDITS_CAPABILITIES[provider]?.dailyKeepalive === true;
+}
+
+/**
+ * 该 provider 是否支持「**补领当日福利**」（手动兜底）。
+ *
+ * 语义：额度已由服务端按自然日自动发放，本服务的定时任务也会自动领 ——
+ * 但定时任务只在进程活着时跑。用户关掉服务过夜、或跨天后才启动时可能错过
+ * 窗口（额度按 UTC+8 自然日作废），故给一个手动按钮立刻补一次。
+ *
+ * ⚠️ 与 {@link supportsDailyKeepalive} 的差别必须记住：那个**不产生新分**
+ * （只是把已到账的积分有效期从「当天 24:00」延长到 7 天），这个会**真的向
+ * 上游下单领分**。混用会造成「点保活以为领到了」的误解。
+ *
+ * 为 false 时面板**不得**渲染该按钮，也不得发起 `credits.dailyBonus`。
+ */
+export function supportsDailyBonus(provider) {
+  return CREDITS_CAPABILITIES[provider]?.dailyBonus === true;
 }
 
 /**

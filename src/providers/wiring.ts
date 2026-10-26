@@ -71,6 +71,26 @@ const catalogFailedAt = new Map<string, number>()
 let catalogDir: string | undefined
 let catalogLogger: ((message: string) => void) | undefined
 
+/**
+ * 「本次必须真的打上游」的 provider 集合（`refreshModelCatalog` 专用）。
+ *
+ * ## 为什么需要它（否则刷新按钮点了没反应）
+ *
+ * `fetchRemoteCatalog` 的**磁盘快照分支**会在快照新鲜时直接返回、一个字节的
+ * 网络都不发（用户诉求：拉一次存到本项目，之后读本地）。这个短路发生在
+ * `catalogMemory` 之后、网络之前，所以只删内存缓存**清不掉它** —— 首版实现
+ * 正是漏了这点，表现为「刷新按钮看似成功、模型列表纹丝不动」。
+ *
+ * ## 为什么用标记集合而不是给 8 个调用点都加参数
+ *
+ * 各适配器的 `fetchRemoteModels` 是注册时闭包捕获的（`() => fetchRemoteCatalog(
+ * 'xxx', …)`），调用链上拿不到「这次是手动刷新」这个上下文。给 8 处都加一个
+ * 透传参数需要同时改 `loadModels`/`ensureRemoteModels` 等私有方法签名，
+ * 改动面大且容易漏。这里用一个「先置标记 → 触发 → 再清除」的窗口，
+ * 与 `catalogFailedAt` 同构（同一种模块级临时状态）。
+ */
+const catalogForceRefresh = new Set<string>()
+
 /** 目录缓存有效期（内存与磁盘快照共同的「觉得还新鲜」的上限）。 */
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 /** 拉取失败后的冷却时长。 */
@@ -102,22 +122,26 @@ function saveCatalogSnapshot(provider: string, models: unknown[]): void {
  *
  * ⚠️ `action` 内部包含「从账号池取凭据」，失败也走同一冷却——没有账号时
  * 不必每次重试取号。
+ *
+ * ⚠️ 当该 provider 在 {@link catalogForceRefresh} 里时（手动刷新窗口），
+ * **跳过内存缓存与磁盘快照新鲜度**两道短路，直接发网络。
  */
 async function fetchRemoteCatalog<T>(
   provider: string,
   action: () => Promise<T[]>,
 ): Promise<T[]> {
   const now = Date.now()
+  const force = catalogForceRefresh.has(provider)
   // 1) 进程内缓存（本次运行已拉过）。
   const cached = catalogMemory.get(provider)
-  if (cached !== undefined && now - cached.at < CATALOG_TTL_MS) {
+  if (!force && cached !== undefined && now - cached.at < CATALOG_TTL_MS) {
     return cached.models as T[]
   }
 
   // 2) 磁盘快照仍然新鲜 → **直接返回，一个字节的网络都不发**
   //    （用户诉求：拉一次存到本项目，之后读本地）。
   const disk = loadCatalogSnapshot(provider)
-  if (disk !== undefined) {
+  if (!force && disk !== undefined) {
     const fetchedAt = diskFetchedAt(provider)
     if (fetchedAt !== undefined && now - fetchedAt < CATALOG_TTL_MS) {
       catalogMemory.set(provider, { at: fetchedAt, models: disk })
@@ -164,6 +188,124 @@ function diskFetchedAt(provider: string): number | undefined {
   }
 }
 
+/** 一次「刷新模型目录」的逐 provider 结果。 */
+export interface ModelCatalogRefreshEntry {
+  provider: string
+  /** 刷新后从远端拿到的模型数；失败时为 0。 */
+  count: number
+  /** 失败原因（可读）；成功时缺席。 */
+  error?: string
+  /** 是否回退到了本地缓存/兜底表（远端失败但仍给出了模型）。 */
+  fellBack?: boolean
+}
+
+export interface ModelCatalogRefreshResult {
+  /** 实际刷新的 provider 数（按注册顺序）。 */
+  refreshed: number
+  /** 刷新后各 provider 的模型总数。 */
+  totalModels: number
+  /** 成功从远端拿到目录的 provider 数。 */
+  succeeded: number
+  results: ModelCatalogRefreshEntry[]
+}
+
+/**
+ * **强制**重新拉取模型目录（管理端「刷新模型目录」按钮）。
+ *
+ * ## 为什么需要它
+ *
+ * 目录有两层缓存，且都**刻意**偏懒：模块级 `fetchRemoteCatalog` 的 TTL 是
+ * 6 小时，适配器自己那份 `remoteModels` 更是进程内永不过期。这是为了不每次
+ * 打开面板都打上游（用户诉求：拉一次存到本项目，之后读本地）。代价是上游
+ * 上架新模型后，本服务最多要 6 小时才看见 —— 用户等不了，所以要一个手动入口。
+ *
+ * ## 必须清三层，少一层就「点了没反应」
+ *
+ * 1. 模块级内存缓存 `catalogMemory`；
+ * 2. 磁盘快照的新鲜度（**不删文件**，只把内存里那份标记清掉；若删文件则刷新
+ *    失败时连「过期的快照」都没有了，退化成兜底表，反而更差）；
+ * 3. 各适配器自己的 `remoteModels`（`invalidateModelCatalog()`）。
+ *
+ * 第 3 层最容易漏：只清模块缓存后，适配器仍直接返回旧列表，
+ * `fetchRemoteCatalog` 根本不会被调用。
+ *
+ * ## 失败冷却也必须绕过
+ *
+ * `catalogFailedAt` 会让失败后的 10 分钟不再发网络请求。用户手动点按钮的语义
+ * 是「现在就试一次」—— 冷却期内静默不动等于按钮坏了（与 OfficeAce 补领同一
+ * 教训）。故这里先删掉冷却标记再拉。
+ *
+ * @param provider - 只刷这一个；省略则刷新**全部已注册** provider。
+ */
+export async function refreshModelCatalog(
+  registry: ProviderRegistry,
+  provider?: string,
+): Promise<ModelCatalogRefreshResult> {
+  const targets = provider === undefined
+    ? registry.list()
+    : registry.list().filter((entry) => entry.descriptor.id === provider)
+
+  const results: ModelCatalogRefreshEntry[] = []
+  let succeeded = 0
+  let totalModels = 0
+
+  for (const entry of targets) {
+    const id = entry.descriptor.id
+    // ① 清模块级内存缓存 + 失败冷却（绕开「10 分钟内不发网络」）。
+    catalogMemory.delete(id)
+    catalogFailedAt.delete(id)
+    // ② 清适配器自己的 remoteModels（第 3 层，漏了会「点了没反应」）。
+    entry.adapter.invalidateModelCatalog()
+    // ③ 置强制标记：让 `fetchRemoteCatalog` 也跳过**磁盘快照新鲜度**那一层。
+    //    只删内存缓存清不掉它 —— 首版正是漏了这步，表现为「刷新看似成功、
+    //    列表纹丝不动」。用 try/finally 保证异常时也清除，否则该 provider
+    //    会在此后每次读取都无脑打上游。
+    catalogForceRefresh.add(id)
+
+    // ⚠️ 判据不能用「listModels 是否抛错」：**所有适配器都在内部吞掉远端失败**
+    //    并回退兜底表（模型目录是展示信息，不该让 provider 报错）。于是远端
+    //    挂了也会走到这里、还返回一份兜底表 —— 若据此报「成功」，用户会以为
+    //    刷新有效，实际看到的还是旧数据（这正是要避免的「假装刷新」）。
+    //    真正的成功判据是**磁盘快照被重写**：只有 `fetchRemoteCatalog` 拿到
+    //    远端目录才会调 `saveCatalogSnapshot` 更新 fetchedAt。
+    //    比较「刷新前 vs 刷新后」而不是与 `Date.now()` 比，避免同毫秒边界误判。
+    const beforeFetchedAt = diskFetchedAt(id)
+    let count = 0
+    let error: string | undefined
+    try {
+      count = (await entry.adapter.listModels(id)).length
+    } catch (caught) {
+      error = caught instanceof Error ? caught.message : String(caught)
+      try {
+        count = (await entry.adapter.listModels(id)).length
+      } catch {
+        count = 0
+      }
+    } finally {
+      catalogForceRefresh.delete(id)
+    }
+
+    const afterFetchedAt = diskFetchedAt(id)
+    const remoteHit = error === undefined
+      && afterFetchedAt !== undefined
+      && (beforeFetchedAt === undefined || afterFetchedAt > beforeFetchedAt)
+    totalModels += count
+    if (remoteHit) {
+      succeeded += 1
+      results.push({ provider: id, count })
+    } else {
+      results.push({
+        provider: id,
+        count,
+        error: error ?? '远端未返回目录（沿用本地快照或内置兜底表）',
+        ...(count > 0 ? { fellBack: true } : {}),
+      })
+    }
+  }
+
+  return { refreshed: targets.length, totalModels, succeeded, results }
+}
+
 /** {@link fetchRemoteCatalog} 间接引用的账号池（registerAllProviders 时设置）。 */
 let currentPool: AccountPool | undefined
 import { CodeArtsAdapter } from './llm-adapter.js'
@@ -172,7 +314,7 @@ import { LobsteraiAdapter } from './lobsterai-adapter.js'
 import { QoderAdapter } from './qoder-adapter.js'
 import { TraeAdapter } from './trae-adapter.js'
 import { ClineAdapter } from './cline-adapter.js'
-import { LoomyAdapter } from './loomy-adapter.js'
+import { LoomyAdapter, fetchLoomyRemoteModels } from './loomy-adapter.js'
 import { RaccoonAdapter } from './raccoon-adapter.js'
 import { OfficeAceAdapter } from './officeace-adapter.js'
 import { AccioAdapter } from './accio-adapter.js'
@@ -184,6 +326,10 @@ import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import { LOOMY } from './loomy-product.js'
 import { RACCOON } from './raccoon-product.js'
+import type { RaccoonCredential } from './raccoon.js'
+import { fetchRaccoonRemoteModels } from './raccoon-auth.js'
+import type { QoderCredential } from './qoder.js'
+import { fetchQoderRemoteModels } from './qoder-catalog.js'
 import { OFFICEACE } from './officeace-product.js'
 import { ACCIO } from './accio-product.js'
 import { fetchAccioRemoteModels, parseAccioCredential } from './accio-auth.js'
@@ -205,6 +351,70 @@ async function firstUsableCodeArtsCredential(pool: AccountPool): Promise<CodeArt
   for (const entry of pool.listAccountsByProvider('codearts')) {
     const credential = await pool.resolveCredentialForAccount(entry.id) as CodeArtsCredential | undefined
     if (credential?.access_key_id && credential.secret_access_key) return credential
+  }
+  return undefined
+}
+
+/**
+ * 取 Raccoon 账号池里第一个**凭据可解析**的 access_token。
+ *
+ * 与 {@link firstUsableCodeArtsCredential} 同一套取舍（同样移植自来源
+ * `service.firstUsableCredential`）：按用户拖拽顺序短路返回，**不**按 `enabled`
+ * 与限流过滤 —— 拉目录与「能否发推理请求」无关，停用的账号照样能给出目录。
+ *
+ * ⚠️ 别改成 `getAvailableAccount`：那会返回 `null` 时的空目录被
+ * `fetchRemoteCatalog` 当成失败，进而把好目录打进 10 分钟失败冷却。
+ */
+async function firstUsableRaccoonCredential(pool: AccountPool): Promise<RaccoonCredential | undefined> {
+  for (const entry of pool.listAccountsByProvider(RACCOON.id)) {
+    const credential = await pool.resolveCredentialForAccount(entry.id) as RaccoonCredential | undefined
+    if (typeof credential?.access_token === 'string' && credential.access_token.length > 0) return credential
+  }
+  return undefined
+}
+
+/**
+ * 取 Loomy 账号池里第一个**凭据可解析**的 session。
+ *
+ * 与 {@link firstUsableRaccoonCredential} 同源取舍：按用户拖拽顺序短路返回，
+ * **不**按 `enabled` 与限流/余额过滤。⚠️ 特别注意：Loomy 的推理选号走
+ * `loomyBalanceSelector`（按余额分档），那条路径会因为「今日赠送额度用尽」
+ * 而拒绝选号 —— 但**拉目录不该受它影响**，目录与账号余额无关。
+ * 用 `getAvailableAccount` 会让锁永久积分 / 额度耗尽时的目录拉取失败，
+ * 进而把好目录打进 10 分钟失败冷却。
+ */
+async function firstUsableLoomyCredential(pool: AccountPool): Promise<LoomyCredential | undefined> {
+  for (const entry of pool.listAccountsByProvider(LOOMY.id)) {
+    const credential = await pool.resolveCredentialForAccount(entry.id) as LoomyCredential | undefined
+    if (typeof credential?.access_token === 'string' && credential.access_token.length > 0) return credential
+  }
+  return undefined
+}
+
+/**
+ * 取 Qoder 账号池里第一个**凭据可解析**（含 `uid` 与 `machine_id`）的凭据。
+ *
+ * 三条要点与 {@link firstUsableRaccoonCredential} 同源，另加一条本家特有的：
+ * **`uid` 与 `machine_id` 缺一不可** —— 目录请求要 WASM 签名，缺 `uid` 会产出
+ * 「签名无效」的请求（服务端回 `Signature invalid`），缺 `machine_id` 连
+ * `QoderContext` 都构造不出来。故这里就把不合格的账号跳过，不发注定失败的请求。
+ *
+ * ⚠️ **不按 `enabled` 过滤**：拉目录与「能否发推理请求」无关，停用账号照样
+ * 能给出目录（与 `firstUsableCodeArtsCredential` 同一取舍）。
+ * ⚠️ **不记「本次实际使用的账号」**：目录请求是周期性的，记了会把额度标记
+ * 改写到目录用的账号上（见 `QoderAdapterOptions.fetchRemoteModels` 的注释）。
+ */
+async function firstUsableQoderCredential(
+  pool: AccountPool,
+  provider: string,
+): Promise<QoderCredential | undefined> {
+  for (const entry of pool.listAccountsByProvider(provider)) {
+    const credential = await pool.resolveCredentialForAccount(entry.id) as QoderCredential | undefined
+    if (credential === undefined) continue
+    const hasToken = typeof credential.access_token === 'string' && credential.access_token.length > 0
+    const hasUid = typeof credential.uid === 'string' && credential.uid.length > 0
+    const hasMachine = typeof credential.machine_id === 'string' && credential.machine_id.length > 0
+    if (hasToken && hasUid && hasMachine) return credential
   }
   return undefined
 }
@@ -369,12 +579,21 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
   )
 
   // ── Qoder 系：同源、共用适配器与同一份 WASM，差异全在产品配置 ──
+  //
+  // ⚠️ **2026-10-20 起模型列表走远端目录**（用户报障「DeepSeek-Flash 上游已经
+  // 0×（免费）了，列表还显示 0.1」）：此前本家恒用编译期兜底表，一次远端请求
+  // 都不发，上游改价 / 改免费额度 / 上下架模型都不会反映。现在远端优先、
+  // 兜底表只作回退（见 `qoder-catalog.ts`）。
+  //
+  // 目录取号走 `firstUsableQoderCredential`（只读、不记「本次实际使用的账号」）：
+  // 目录请求是周期性的，若走 `ctx.resolveCredential`，它会在一次聊天选号之后
+  // 把那个记录改写成目录用的账号 ⇒ 额度标记落到无辜账号上。
   for (const product of [QODER, QODER_CN]) {
     registry.register(
       descriptorFor(product.id, product.displayName, product.encryptedInferBase, {
         authKind: 'qoder-wasm',
-        // 目录需要 WASM 签名，故只用内置静态表（不发网络请求）。
-        catalogSource: 'static-only',
+        // 目录需要 WASM 签名，现已接上（`qoder-catalog.ts`）。
+        catalogSource: 'remote-first',
       }),
       new QoderAdapter({
         credentialRef: `${product.id.toUpperCase()}_ACCESS_TOKEN` as never,
@@ -384,6 +603,12 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
         product,
         currentAccountId: () => currentAccountIdFor(product.id),
         readImage: ctx.readImage,
+        warn: (message) => ctx.logger.warn(message),
+        fetchRemoteModels: () => fetchRemoteCatalog(product.id, async () => {
+          const credential = await firstUsableQoderCredential(ctx.pool, product.id)
+          if (credential === undefined) return []
+          return fetchQoderRemoteModels(credential, product, { fetcher })
+        }),
       }),
     )
   }
@@ -510,10 +735,32 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       accountPool: ctx.pool,
       product: LOOMY,
       readImage: ctx.readImage,
+      // ⚠️ 这条接线**曾缺失**（2026-10-23 用户报障「loomy 模型刷新没」）：
+      // 不注入时 `loadModels()` 永远走 `loomy-product.ts` 里 2026-09-26 写死的
+      // 8 条兜底表，上游后来上架的 `spark-x2.6` / `auto` 一律看不到；点「刷新
+      // 模型目录」还会得到误导性的「远端未返回目录」—— 不是远端挂了，而是
+      // **根本没有远端请求**。与 CodeArts 漏接 `glm-5.3`、Raccoon 漏接
+      // `sn-deepseek-v4-1-flash-1017` 是同一类缺陷（第 4 次重演）。
+      //
+      // 目录是**账号无关**的 ⇒ 取第一个可解析凭据即可；⚠️ **不能**用
+      // `ctx.resolveCredential`（那条路径按余额分档选号，额度用尽 / 锁定永久
+      // 积分时会抛错，把「拉目录」连坐成失败）。
+      fetchRemoteModels: () => fetchRemoteCatalog('loomy', async () => {
+        const credential = await firstUsableLoomyCredential(ctx.pool)
+        if (credential === undefined) return []
+        return fetchLoomyRemoteModels(credential, LOOMY, fetcher)
+      }),
     }),
   )
 
   // ── Raccoon：请求级换号（积分耗尽 / 限流 / 认证失败时切下一个账号） ──
+  //
+  // ⚠️ `fetchRemoteModels` 这条接线**曾缺失**（用户报障「Raccoon 的模型列表
+  // 更新了，本项目没跟进」）：不注入时适配器只播报 `raccoon-product.ts` 里
+  // 2026-09-26 写死的 6 条兜底表，上游后来上架的 `sn-deepseek-v4-1-flash-1017`
+  // 等模型一律看不到 —— 与 CodeArts 漏接 `glm-5.3` 是同一类缺陷。
+  // 远端目录是**账号无关**的（同一份目录对所有账号下发），故取第一个可解析
+  // 凭据即可（含停用账号，见 `firstUsableRaccoonCredential`）。
   registry.register(
     descriptorFor('raccoon', RACCOON.displayName, RACCOON.apiBase, { rotatesAccounts: true }),
     new RaccoonAdapter({
@@ -522,6 +769,11 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       accountPool: ctx.pool,
       product: RACCOON,
       readImage: ctx.readImage,
+      fetchRemoteModels: () => fetchRemoteCatalog('raccoon', async () => {
+        const credential = await firstUsableRaccoonCredential(ctx.pool)
+        if (credential === undefined) return []
+        return fetchRaccoonRemoteModels(RACCOON, credential, fetcher)
+      }),
     }),
   )
 

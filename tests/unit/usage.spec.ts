@@ -38,6 +38,7 @@ function usageRecord(patch: Partial<UsageRecord> = {}): UsageRecord {
     model: 'fake/model-a',
     upstreamModel: 'model-a',
     accountId: 'account-9',
+    reasoningEffort: '',
     promptTokens: 10,
     completionTokens: 5,
     cacheReadTokens: 0,
@@ -156,6 +157,96 @@ describe('用量存储（SQLite）', () => {
     store.close()
   })
 
+  it('思考等级：入参透传落盘，未指定记空串', () => {
+    const converted = toUsageRecord(requestRecord({ reasoningEffort: 'high' }), NOW_MS)
+    expect(converted.reasoningEffort).toBe('high')
+    expect(toUsageRecord(requestRecord(), NOW_MS).reasoningEffort).toBe('')
+  })
+
+  it('思考等级：端到端从请求体采到用量库', async () => {
+    const h = await startUsageGateway(dir, 'ok')
+    try {
+      const key = h.keys.create({ name: '档位采集' })
+      const res = await post(`${h.url}/v1/chat/completions`, {
+        model: 'fake/model-a',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning_effort: 'xhigh',
+      }, { Authorization: `Bearer ${key.plaintext}` })
+      expect(res.status).toBe(200)
+      await waitFor(() => h.requests.length > 0)
+      // 内存记录（onRequest）与落盘记录都必须带上，两处口径不能分叉。
+      expect(h.requests[0]!.reasoningEffort).toBe('xhigh')
+      await waitFor(() => h.usage.query().records.length > 0)
+      expect(h.usage.query().records[0]!.reasoningEffort).toBe('xhigh')
+    } finally {
+      await stopGateway(h)
+    }
+  })
+
+  it('思考等级：模型被拦掉的请求也记下客户端原本要的档位', async () => {
+    const h = await startUsageGateway(dir, 'ok')
+    try {
+      const key = h.keys.create({ name: '拦截仍记档位' })
+      const res = await post(`${h.url}/v1/chat/completions`, {
+        model: 'ghost/nope',
+        messages: [],
+        reasoning_effort: 'max',
+      }, { Authorization: `Bearer ${key.plaintext}` })
+      expect(res.status).toBe(404)
+      await waitFor(() => h.usage.query({ outcome: 'failure' }).records.length > 0)
+      // 采集点在模型解析**之前**，故这条 404 仍带着档位。
+      expect(h.usage.query({ outcome: 'failure' }).records[0]!.reasoningEffort).toBe('max')
+    } finally {
+      await stopGateway(h)
+    }
+  })
+
+  it('思考等级：汇总给出分桶分布，且可按档位筛选（空值筛「未指定」）', async () => {
+    const store = new UsageStore(dir)
+    for (const [id, effort] of [['e-high-1', 'high'], ['e-high-2', 'high'], ['e-low', 'low'], ['e-none', '']] as const) {
+      store.record(usageRecord({ requestId: id, reasoningEffort: effort }))
+    }
+    const all = store.query()
+    expect(all.summary.reasoningEfforts).toEqual([
+      { effort: 'high', requests: 2 },
+      { effort: '', requests: 1 },
+      { effort: 'low', requests: 1 },
+    ])
+    // 空串是有效筛选值（未指定档位），不是「不过滤」。
+    const unspecified = store.query({ reasoningEffort: '' })
+    expect(unspecified.summary.total).toBe(1)
+    expect(unspecified.records[0]!.requestId).toBe('e-none')
+    expect(store.query({ reasoningEffort: 'high' }).summary.total).toBe(2)
+    store.close()
+  })
+
+  it('旧库启动时自动补 reasoning_effort 列（存量表不会被建表语句改动）', () => {
+    // 造一个「没有新列」的旧库，模拟升级前的 data/usage.db。
+    const legacy = new DatabaseSync(join(dir, 'usage.db'))
+    legacy.exec(`
+      CREATE TABLE usage_records (
+        request_id TEXT NOT NULL PRIMARY KEY, at TEXT NOT NULL, at_ms INTEGER NOT NULL,
+        key_id TEXT NOT NULL, key_name TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+        upstream_model TEXT NOT NULL, account_id TEXT NOT NULL, prompt_tokens INTEGER NOT NULL,
+        completion_tokens INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL,
+        cache_write_tokens INTEGER NOT NULL, stream INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+        first_byte_ms INTEGER, finish_reason TEXT NOT NULL, status INTEGER NOT NULL,
+        error_code TEXT NOT NULL
+      )
+    `)
+    legacy.prepare(`INSERT INTO usage_records VALUES ('old-1',?,?, 'k','n','p','p/m','m','acc',1,2,0,0,0,10,5,'stop',200,'')`)
+      .run(new Date(NOW_MS).toISOString(), NOW_MS)
+    legacy.close()
+
+    // 打开即迁移：不加列的话下面这条写入会抛错（被 record() 吞成告警）。
+    const store = new UsageStore(dir)
+    expect(store.record(usageRecord({ requestId: 'new-1', reasoningEffort: 'high' }))).toBe(true)
+    // 旧记录档位未知 → 空串，而不是被猜成某个值。
+    expect(store.query().records.find(r => r.requestId === 'old-1')?.reasoningEffort).toBe('')
+    expect(store.query().records.find(r => r.requestId === 'new-1')?.reasoningEffort).toBe('high')
+    store.close()
+  })
+
   it('8.5 表结构里没有任何正文列（从结构上保证不记正文）', () => {
     const store = new UsageStore(dir)
     store.record(usageRecord({ requestId: 'req-cols' }))
@@ -170,8 +261,8 @@ describe('用量存储（SQLite）', () => {
     expect([...columns].sort()).toEqual([
       'account_id', 'at', 'at_ms', 'cache_read_tokens', 'cache_write_tokens',
       'completion_tokens', 'duration_ms', 'error_code', 'finish_reason', 'first_byte_ms',
-      'key_id', 'key_name', 'model', 'prompt_tokens', 'provider', 'request_id',
-      'status', 'stream', 'upstream_model',
+      'key_id', 'key_name', 'model', 'prompt_tokens', 'provider', 'reasoning_effort',
+      'request_id', 'status', 'stream', 'upstream_model',
     ].sort())
   })
 

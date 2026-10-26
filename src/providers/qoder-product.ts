@@ -88,6 +88,21 @@ export interface QoderFallbackModel {
   promotion?: QoderModelPromotion
   /** 可用思考档位（远端 `thinking_config.enabled.efforts` 的键）。 */
   efforts?: readonly string[]
+  /**
+   * 默认档位（远端档位对象的 `is_default`/`isDefault`，缺省时取顶层
+   * `default_effort`/`defaultEffort`）。
+   *
+   * ⚠️ 只有远端目录会产出它（兜底表不声明默认档）—— 故消费方必须容忍缺失。
+   */
+  defaultEffort?: string
+  /**
+   * 能否**关闭**思考（远端 `thinking_config.disabled` 存在，或顶层
+   * `supports_disabled`/`supportsDisabled` 为真）。
+   *
+   * ⚠️ 与 {@link efforts} **相互独立**：实测 `gfmodel` 有档位但不能关闭，
+   * 而 `qmodel` 没有档位但能关闭。故不能由「有没有档位」反推本字段。
+   */
+  supportsDisable?: boolean
 }
 
 /** 目录 `promotion` 字段（错峰折扣）。 */

@@ -6,6 +6,7 @@ import {
   CREDITS_CAPABILITIES,
   checkinProviders,
   supportsCreditBalance,
+  supportsDailyBonus,
   supportsDailyCheckin,
   supportsDailyKeepalive,
   supportsOnboardingTasks,
@@ -186,10 +187,23 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('accio')).toBe(false)
   })
 
-  it('OfficeAce 支持余额但不支持签到（拉余额时自动领当日福利）', () => {
-    expect(CREDITS_CAPABILITIES.officeace).toEqual({ balance: true, dailyCheckin: false })
+  it('OfficeAce 支持余额但不支持签到（定时任务自动领，另给手动补领按钮）', () => {
+    expect(CREDITS_CAPABILITIES.officeace).toEqual({ balance: true, dailyCheckin: false, dailyBonus: true })
     expect(supportsCreditBalance('officeace')).toBe(true)
+    // ⚠️ 仍为 false：绑成签到按钮会让用户以为「每天必须手动点」，
+    // 实际服务端每小时自动领一次。
     expect(supportsDailyCheckin('officeace')).toBe(false)
+    // 手动兜底：定时任务只在进程活着时跑，关掉服务过夜会错过当天窗口。
+    expect(supportsDailyBonus('officeace')).toBe(true)
+    // 与「每日积分保活」（把已到账积分延长有效期）是不同能力，不可混用。
+    expect(supportsDailyKeepalive('officeace')).toBe(false)
+  })
+
+  it('补领能力只对 OfficeAce 开放（其余渠道没有「按自然日发放」的福利）', () => {
+    expect(supportsDailyBonus('raccoon')).toBe(false)
+    expect(supportsDailyBonus('accio')).toBe(false)
+    expect(supportsDailyBonus('loomy')).toBe(false)
+    expect(supportsDailyBonus('unknown-provider')).toBe(false)
   })
 
   it('SenseNova 仍无任何积分能力（OpenAI 兼容按 token 计费，无 balance 端点）', () => {

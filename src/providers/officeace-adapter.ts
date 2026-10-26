@@ -30,6 +30,23 @@ import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
 import { basicAuthorization, isExpiring, type OfficeAceCredential } from './officeace-auth.js'
 
 /**
+ * 上游认可的思考档位白名单。
+ *
+ * ⚠️ 来源是上游**自己的报错文案**（2026-10-23 实测，`reasoning_effort` 传非法值）：
+ * > `reasoning_effort 参数值非法，可选值为：none、minimal、low、medium、high、xhigh、max`
+ * > （`ModelArts.81001`）
+ *
+ * 它证明两件事：① 上游**真的消费**这个参数；② 非法值直接 **400**。
+ * 故透传前必须过白名单，超出范围时**静默丢弃** —— 档位不是请求的必要条件。
+ *
+ * 注意它**不含 `ultra`**（sensenova 有），两个同为商汤/华为系但能力表不同，
+ * 不要互相照抄。
+ */
+export const OFFICEACE_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+  'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+])
+
+/**
  * 推理/探测该用哪个 host —— **必须优先用凭据里按账号下发的 `maasBaseUrl`**。
  *
  * ## ⚠️⚠️ 阻断级真实缺陷（2026-10-13 真机实测）
@@ -293,6 +310,11 @@ export class OfficeAceAdapter extends LlmAdapter {
       ...wireTools !== undefined && wireTools.length > 0 ? { tools: wireTools } : {},
       ...maxTokens === undefined ? {} : { max_tokens: maxTokens },
       ...options.temperature === undefined ? {} : { temperature: options.temperature },
+      // 思考等级：只发上游认的档位（见 {@link OFFICEACE_REASONING_EFFORTS}
+      // 的实测依据）。白名单外静默丢弃，避免变成一条 400。
+      ...OFFICEACE_REASONING_EFFORTS.has(options.reasoningEffort ?? '')
+        ? { reasoning_effort: options.reasoningEffort }
+        : {},
     })
 
     try {

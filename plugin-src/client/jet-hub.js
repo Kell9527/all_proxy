@@ -4,6 +4,7 @@ import {
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsDailyKeepalive,
+  supportsDailyBonus,
   supportsOnboardingTasks,
   supportsRateLimit,
   supportsPermanentLock,
@@ -736,6 +737,16 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
    */
   const [bulkBusy, setBulkBusy] = React.useState(false);
   /**
+   * 「刷新模型目录」是否正在提交，以及上一次刷新的结果提示。
+   *
+   * 为什么要这个按钮：目录有两层缓存，都刻意偏懒 —— 模块级 `fetchRemoteCatalog`
+   * 的 TTL 是 6 小时，适配器自己那份 `remoteModels` 更是进程内永不过期。这是为了
+   * 不每次开面板都打上游。代价是上游上架新模型后，本服务最多要等 6 小时才看见。
+   * 用户等不了，故给一个手动入口（后端 `POST /api/models/refresh-catalog`）。
+   */
+  const [refreshBusy, setRefreshBusy] = React.useState(false);
+  const [refreshNotice, setRefreshNotice] = React.useState(null);
+  /**
    * 搜索词与状态筛选。
    *
    * Cline 的远端目录实测约 478 条，搜索与筛选确实有用。这两个状态只影响
@@ -863,6 +874,52 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     }
   };
 
+  /**
+   * 刷新模型目录：强制重拉远端模型列表（绕过 6 小时 TTL 与失败冷却）。
+   *
+   * ⚠️ **结果必须如实呈现**。后端返回里 `succeeded` 才是「真的从远端拉到了」：
+   * 所有适配器都会在内部吞掉远端失败并回退兜底表，所以「列表没变」既可能是
+   * 「上游本来就没新增」，也可能是「远端挂了、你看到的是旧快照」。合并成一句
+   * 「刷新成功」会让用户对着旧列表以为已经是最新 —— 那正是这个功能要消灭的
+   * 不确定性。
+   */
+  const refreshCatalog = async () => {
+    if (refreshBusy) return;
+    setRefreshBusy(true);
+    setRefreshNotice(null);
+    try {
+      const res = await rpcCall('model.refreshCatalog', { provider });
+      const entry = (res.results || [])[0];
+      const before = all.length;
+      // 无论成败都重新读一次列表：成功时能看到新模型，失败时也保证界面与
+      // 后端当前状态一致（避免显示「刷新后」的错觉）。
+      await load();
+      if (!mounted.current) return;
+      if (entry?.error) {
+        setRefreshNotice({
+          tone: entry.fellBack ? 'warn' : 'error',
+          text: entry.fellBack
+            ? `远端未返回目录，仍显示本地缓存（${entry.count} 个模型）`
+            : `目录刷新失败：${entry.error}`,
+        });
+      } else {
+        const after = entry?.count ?? before;
+        setRefreshNotice({
+          tone: 'ok',
+          text: after === before
+            ? `已从远端重新拉取，模型数未变（${after} 个）`
+            : `已更新：${before} → ${after} 个模型`,
+        });
+      }
+    } catch (caught) {
+      console.error('[jet-hub] refresh model catalog failed:', caught);
+      if (!mounted.current) return;
+      setRefreshNotice({ tone: 'error', text: caught?.message || '刷新模型目录失败' });
+    } finally {
+      if (mounted.current) setRefreshBusy(false);
+    }
+  };
+
   const dialog = React.createElement('div', {
     // `--top`：顶部锚定。列表长度随搜索变化，若垂直居中会让弹窗整体上下跳动
     //（见 jet-hub-styles.js 中该修饰类的说明）。
@@ -933,6 +990,13 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
         ? React.createElement('div', { className: 'dim-jh-modelBulkBar' },
             React.createElement('button', {
               className: 'dim-jh-btn',
+              title: '从上游重新拉取模型目录。正常情况下目录缓存 6 小时；'
+                + '若上游刚上架/下架了模型想立刻看到，点此强制刷新。',
+              disabled: refreshBusy,
+              onClick: () => void refreshCatalog(),
+            }, refreshBusy ? '刷新中…' : '刷新模型目录'),
+            React.createElement('button', {
+              className: 'dim-jh-btn',
               title: '打开该 Provider 的全部模型开关（含此前被关闭的）。',
               disabled: bulk.openAllDisabled,
               onClick: () => void setAllDisabled(false),
@@ -943,6 +1007,15 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
               disabled: bulk.closeAllDisabled,
               onClick: () => void setAllDisabled(true),
             }, bulkBusy ? '处理中…' : '关闭全部'))
+        : null,
+      // 刷新结果：成功/回退/失败三种语气。**不能合并成一句「刷新成功」** ——
+      // 适配器会吞掉远端失败并回退兜底表，用户需要知道看到的是新数据还是旧快照。
+      refreshNotice
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': refreshNotice.tone,
+            role: refreshNotice.tone === 'error' ? 'alert' : 'status',
+          }, React.createElement('div', null, refreshNotice.text))
         : null,
       toggleError
         ? React.createElement('div', {
@@ -1343,6 +1416,13 @@ function ProviderPanel({ provider, rpcCall }) {
   const [keepaliveBusy, setKeepaliveBusy] = React.useState(false);
   const [keepaliveNotice, setKeepaliveNotice] = React.useState(null);
 
+  // 补领当日福利（仅 OfficeAce）：与自动领取同一件事，区别只在**谁来触发**。
+  // 定时任务只在服务进程活着时跑；用户关掉服务过夜、或跨天后才启动时可能错过
+  // 窗口（额度按 UTC+8 自然日作废）。这个按钮强制跳过去重闸门，点一下立刻试。
+  const canDailyBonus = supportsDailyBonus(provider);
+  const [dailyBonusBusy, setDailyBonusBusy] = React.useState(false);
+  const [dailyBonusNotice, setDailyBonusNotice] = React.useState(null);
+
   /**
    * 「锁定永久积分」（全局开关，持久化在宿主侧；Loomy 与 OfficeAce 各自独立）。
    *
@@ -1510,6 +1590,68 @@ function ProviderPanel({ provider, rpcCall }) {
       setKeepaliveNotice({ tone: 'error', text: caught?.message || '每日积分保活失败' });
     } finally {
       if (mounted.current) setKeepaliveBusy(false);
+    }
+  };
+
+  /**
+   * 补领当日福利（仅 OfficeAce）—— 定时任务的手动兜底。
+   *
+   * 服务端每小时自动领一次（`claimOfficeAceDailyBonuses`），但定时任务只在
+   * **进程活着**时跑：用户关掉服务过夜、或跨天后才启动时，当天的额度可能已经
+   * 错过窗口（按 UTC+8 自然日作废）。这个按钮让用户立刻补一次。
+   *
+   * ⚠️ 后端用 `force: true` 跳过去重闸门 —— 否则「今天定时任务已经试过」
+   * 会让按钮点了毫无反应，用户以为坏了。上游对重复领取幂等（回 200 + 空桶），
+   * 故强制重试是安全的。
+   *
+   * ⚠️ **结果必须逐账号如实呈现**：三种结果的含义完全不同，合并成一句
+   * 「补领完成」会让用户误判 ——
+   *   - `claimed`（真领到分）是唯一的好结果；
+   *   - `already-claimed` 表示今天早已领过（多半是定时任务或面板抢先领了）；
+   *   - `failed` 才需要用户关注（凭据坏了 / 上游异常），且下一轮定时任务会重试。
+   */
+  const claimDailyBonus = async () => {
+    if (!canDailyBonus) return;
+    setDailyBonusBusy(true);
+    setDailyBonusNotice(null);
+    try {
+      const res = await rpcCall('credits.dailyBonus', { provider });
+      const { summary, results } = res;
+      const parts = [];
+      if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号补领成功，共 +${summary.totalPoints} 分`);
+      if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天早已领过`);
+      if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
+      if (summary.skipped > 0) parts.push(`${summary.skipped} 个跳过（停用 / 凭据不可用）`);
+      const details = [];
+      for (const item of results || []) {
+        const name = item.nickname || item.accountId;
+        if (item.kind === 'claimed') {
+          const acts = (item.activities || []).join('、');
+          details.push(`${name}：补领成功 +${item.points} 分${acts ? `（${acts}）` : ''}`);
+        } else if (item.kind === 'already-claimed') {
+          details.push(`${name}：今天已经领过，无需重复领取`);
+        } else if (item.kind === 'failed') {
+          details.push(`${name}：补领失败 — ${item.error || '未知原因'}（下次定时任务会再试）`);
+        } else {
+          details.push(`${name}：跳过 — ${item.error || '未参与'}`);
+        }
+      }
+      // 色调：只有「领到分」是 ok；全都没领到（早已领过也算正常）用 ok，
+      // 有失败才 warn —— 失败意味着当天额度可能真的丢了。
+      const needsAttention = summary.failed > 0;
+      setDailyBonusNotice({
+        tone: needsAttention ? 'warn' : 'ok',
+        text: parts.length > 0 ? parts.join('，') : '没有可补领的账号',
+        details,
+      });
+      // 领完刷新余额：用户点了按钮就该看到数字变化（否则会怀疑没生效）。
+      if (canLoadCredits) await loadCredits();
+    } catch (caught) {
+      console.error('[jet-hub] claim daily bonus failed:', caught);
+      if (!mounted.current) return;
+      setDailyBonusNotice({ tone: 'error', text: caught?.message || '补领当日福利失败' });
+    } finally {
+      if (mounted.current) setDailyBonusBusy(false);
     }
   };
 
@@ -2078,6 +2220,19 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void keepaliveDailyPoints(),
             }, keepaliveBusy ? '保活中…' : '保活今日积分')
           : null,
+        // 补领当日福利（仅 OfficeAce）：定时任务的手动兜底。
+        // 服务端每小时自动领一次，但定时任务只在进程活着时跑 —— 关掉服务过夜、
+        // 或跨天后才启动时可能错过窗口（额度按 UTC+8 自然日作废）。
+        canDailyBonus
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '本服务的定时任务每小时会自动领取当日福利，'
+                + '但额度按 UTC+8 自然日作废（当天 23:59:59 过期）。'
+                + '若当天还没领到（例如整夜关机、刚启动服务），点此立刻补领一次。',
+              disabled: dailyBonusBusy || accounts.length === 0,
+              onClick: () => void claimDailyBonus(),
+            }, dailyBonusBusy ? '补领中…' : '补领今日福利')
+          : null,
         // 「重测 / 重置」只对**会返回限流错误**的 provider 有意义。
         // ⚠️ Loomy 不会限流（积分耗尽时静默降级为扣永久积分），故对它
         // 隐藏这两个按钮 —— 重测永远测不出限流、重置也没有标记可清，
@@ -2206,6 +2361,22 @@ function ProviderPanel({ provider, rpcCall }) {
         (keepaliveNotice.details || []).length > 0
           ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
               keepaliveNotice.details.map((line, index) =>
+                React.createElement('li', { key: index }, line)))
+          : null)
+      : null,
+    // 补领当日福利结果（仅 OfficeAce）。三类结果语义完全不同，必须逐账号区分：
+    // 「真的领到分」是唯一好结果；「今天早已领过」是正常态（定时任务或面板
+    // 抢先领了）；「失败」才需要关注 —— 当天额度可能真的丢了。
+    dailyBonusNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': dailyBonusNotice.tone,
+          role: dailyBonusNotice.tone === 'error' ? 'alert' : 'status',
+        },
+        React.createElement('div', null, dailyBonusNotice.text),
+        (dailyBonusNotice.details || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              dailyBonusNotice.details.map((line, index) =>
                 React.createElement('li', { key: index }, line)))
           : null)
       : null,

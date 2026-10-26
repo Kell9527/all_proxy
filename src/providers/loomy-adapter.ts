@@ -26,6 +26,8 @@ import { settingsNamespaceFor } from './settings-compat.js'
 import {
   isLoomyChatModel,
   isLoomyExpired,
+  LOOMY_REQUEST_TIMEOUT_MS,
+  loomyBusinessHeaders,
   loomyChatHeaders,
   loomyDisplayName,
   splitLoomyRate,
@@ -46,6 +48,19 @@ import { recordCurrentAccount } from './current-account.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `LOOMY.id`）。 */
 export const PROVIDER = 'loomy'
+
+/**
+ * 上游认可的思考档位白名单。
+ *
+ * ⚠️ 来源是上游自己的报错文案（2026-10-23 经 EasyCLIProxyAPI 实测）：
+ * > `level "…" not supported, valid levels: low, medium, high, max, xhigh`
+ *
+ * 注意它**不含 `minimal` / `none` / `ultra`** —— 与同属商汤系的 sensenova
+ * 能力表不同，不要互相照抄。
+ */
+export const LOOMY_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+  'low', 'medium', 'high', 'max', 'xhigh',
+])
 
 /** 远端模型条目（已归一）。 */
 export interface LoomyRemoteModel {
@@ -98,6 +113,41 @@ export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
       supportsThinking: capabilities.reasoning === true,
     })
   }
+  return models
+}
+
+/**
+ * 从上游拉取真实模型目录（`GET {apiBase}/models`）。
+ *
+ * ## 为什么这一支必须存在（用户报障「loomy 模型没刷新」）
+ *
+ * 此前 Loomy **从未接过远端目录**：`wiring.ts` 注册适配器时没传
+ * `fetchRemoteModels`，于是 `loadModels()` 永远走 `fallbackModels` ——
+ * 那张表是 2026-09-26 的快照，上游后来上架的 `spark-x2.6` / `auto` 一律看不到。
+ * 点「刷新模型目录」还会得到一句误导性的「远端未返回目录，仍显示本地缓存」：
+ * 不是远端挂了，而是**根本没有远端请求**。
+ *
+ * ⚠️ **请求头只发 `token`**（`loomyBusinessHeaders`）：`/models` 不认
+ * `Authorization: Bearer`，带上会被判「缺少 token」。
+ * ⚠️ 目录是**账号无关**的（同一份目录对所有账号下发），故取第一个可解析凭据
+ * 即可，不必按账号各拉一次。
+ *
+ * @returns 归一后的模型列表；上游异常时抛错（由 `fetchRemoteCatalog` 转成
+ *   失败冷却并回退快照/兜底表）。
+ */
+export async function fetchLoomyRemoteModels(
+  credential: LoomyCredential,
+  product: LoomyProduct,
+  fetcher: typeof fetch = fetch,
+): Promise<LoomyRemoteModel[]> {
+  const response = await fetcher(`${product.apiBase}/models`, {
+    method: 'GET',
+    headers: loomyBusinessHeaders(credential.access_token),
+    signal: AbortSignal.timeout(LOOMY_REQUEST_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`loomy 远端目录 HTTP ${response.status}`)
+  const models = parseLoomyRemoteModels(await response.json() as unknown)
+  if (models.length === 0) throw new Error('loomy 远端目录为空，使用兜底表')
   return models
 }
 
@@ -154,6 +204,14 @@ export class LoomyAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, LoomyFallbackModel>
   /** 远端模型缓存（含展示名与能力）；未拉取时为 undefined。 */
   private remoteModels: LoomyRemoteModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
 
   constructor(private readonly options: LoomyAdapterOptions) {
     super()
@@ -331,6 +389,21 @@ export class LoomyAdapter extends LlmAdapter {
       ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
+      // 思考等级：只发上游认的五档。
+      //
+      // ⚠️ 判据来自上游自己的报错文案（2026-10-23 经 EasyCLIProxyAPI 实测，
+      // 传非法值时中间层把上游原文透出）：
+      // > `level "…" not supported, valid levels: low, medium, high, max, xhigh`
+      // 即上游**真的消费**这个参数，且非法值是硬失败（故必须过白名单）。
+      //
+      // ⚠️ `xhigh` 归一成 `max`：参考实现 `loomy-gateway.js` 明确这么做
+      // （「思考强度归一化：xhigh 视为 max，去掉 xhigh 档，与 max 等价」）。
+      // 透传前不归一会让同一档位在两条链路上行为不一致。
+      ...LOOMY_REASONING_EFFORTS.has(options.reasoningEffort ?? '')
+        ? {
+            reasoning_effort: options.reasoningEffort === 'xhigh' ? 'max' : options.reasoningEffort,
+          }
+        : {},
       ...options.tools !== undefined && options.tools.length > 0
         ? {
             tools: options.tools.map((tool) => ({

@@ -147,6 +147,15 @@ export interface RequestRecord {
   finishReason?: string
   /** 实际完成该请求的账号 id（轮换后可能与池默认账号不同）。 */
   accountId?: string
+  /**
+   * 调用方指定的思考等级（`reasoning_effort`）；未指定时省略。
+   *
+   * ⚠️ 这是**入参快照**，不是「上游实际生效的档位」。两者会分叉的两种情况
+   * 都已确认存在：① 部分适配器丢弃该参数（AGENTS.md 有 provider 透传表）；
+   * ② 模型自身声明了 `defaultEffort` 时，客户端不传也会有思考。故它回答的是
+   * 「客户端要什么」，不是「上游做了什么」。
+   */
+  reasoningEffort?: string
 }
 
 /** 请求体上限（字节）。防止超大 body 打满内存。 */
@@ -363,6 +372,14 @@ export function createGatewayServer(options: GatewayOptions): Server {
     const usage = newUsageAccumulator()
     /** 请求阶段日志（与用量记录共享 requestId）。 */
     const log = options.requestLog?.forRequest(requestId)
+    /**
+     * 调用方指定的思考等级。
+     *
+     * 用 `let` 且**先声明再赋值**（而不是在下面 `const`）：解析请求体失败时
+     * `report()` 已经在它赋值之前被调用，闭包若引用后面的 `const` 会撞进
+     * 暂时性死区 —— 也就是「记录一次 400 反而变成 500」（与 `target` 同款坑）。
+     */
+    let reasoningEffort: string | undefined
 
     /**
      * 上报一次请求。
@@ -383,6 +400,10 @@ export function createGatewayServer(options: GatewayOptions): Server {
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
         durationMs: Date.now() - startedAt,
+        // 档位由本函数统一兜底，而不是每个 report() 调用点各写一遍 ——
+        // 后者只要漏一处，那条分支的记录就会显示成「未指定」，而这种缺失
+        // 在数据里与真实情况长得一模一样，事后无法分辨。
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
         ...record,
       }
       try {
@@ -404,7 +425,22 @@ export function createGatewayServer(options: GatewayOptions): Server {
     const body = parsed.value
     const rawModel = String(body['model'] ?? '')
     const stream = body['stream'] === true
-    log?.info('received', 'chat 请求', { caller: caller.id, model: rawModel, stream })
+    // 思考等级：在**解析模型之前**取，这样连「模型不存在 / 被开关拦掉」的
+    // 请求也能记下客户端原本要什么档位（排查「关了模型后客户端还在发什么」时有用）。
+    //
+    // ⚠️ 只认 OpenAI 形状的顶层 `reasoning_effort`。Anthropic 协议的档位在
+    // `thinking.budget_tokens` 里，而翻译层当前不读它（见
+    // `anthropic-protocol.ts` 的 `translateAnthropicRequest`），故那条路径
+    // 恒记空串 —— 记成空串是**如实反映**「本服务没有消费这个参数」，不是漏采。
+    reasoningEffort = typeof body['reasoning_effort'] === 'string'
+      ? body['reasoning_effort']
+      : undefined
+    log?.info('received', 'chat 请求', {
+      caller: caller.id,
+      model: rawModel,
+      stream,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    })
 
     // 模型解析（授权范围 + 三层开关硬拦截）：失败时**不发起任何上游请求**。
     const target = resolver.resolve(body['model'], caller.scope)

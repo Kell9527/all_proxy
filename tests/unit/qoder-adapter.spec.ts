@@ -79,10 +79,13 @@ async function collectWith(
 }
 
 describe('QoderAdapter 模型目录', () => {
-  it('listModels 返回兜底表（本插件不发远端请求）', async () => {
+  it('未接线远端时 listModels 用兜底表（安全默认）', async () => {
     const models = await makeAdapter().listModels('qoder')
-    expect(models.length).toBe(QODER.fallbackModels.length)
+    // ⚠️ 断言必须**内容锚定**而不是 `toBe(fallbackModels.length)`：
+    // 后者在兜底表被清空时是 `0 === 0` 的同义反复（审计实测 9 passed）。
+    expect(models.length).toBeGreaterThan(0)
     expect(models.some((m) => m.id === 'auto')).toBe(true)
+    expect(models.some((m) => m.id === 'dmodel')).toBe(true)
     expect(models.every((m) => m.provider === 'qoder')).toBe(true)
   })
 
@@ -181,8 +184,104 @@ describe('QoderAdapter 模型目录', () => {
   })
 })
 
-describe('QoderAdapter resolveModel', () => {
-  it('已知模型带 contextWindow 与展示名', async () => {
+/**
+ * 远端目录接线（2026-10-20 用户报障「上游 DeepSeek-Flash 已 0×，列表还显示 0.1」）。
+ *
+ * 守四件事：
+ * 1. 远端优先（倍率/免费标记跟随上游）；
+ * 2. 失败/空结果**静默回退兜底表**（菜单不能变空）；
+ * 3. 20 分钟 TTL 内不重复拉；
+ * 4. **能力/元数据判据取「远端 ∪ 静态表」** —— 目录按账号下发，一个只拿到
+ *    少数模型的账号不能让静态表里已知的模型被判成「未知」（图片被硬拒）。
+ */
+describe('QoderAdapter 远端模型目录', () => {
+  /** 上游响应里的 `dfmodel`（免费）与一条兜底表没有的模型。 */
+  const remoteModel = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
+    id, name, contextWindow: 1_000_000, supportsImage: true, isFree: true, priceFactor: 0, ...extra,
+  })
+
+  it('远端优先：倍率与免费标记跟随上游', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [remoteModel('dfmodel', 'DeepSeek-Flash')],
+    })
+    const models = await adapter.listModels('qoder')
+    expect(models.map((m) => m.id)).toEqual(['dfmodel'])
+    // 兜底表里 dfmodel 的价格是 0.1；远端已免费 ⇒ 展示名必须是「免费」。
+    expect(models[0]?.name).toContain('免费')
+  })
+
+  it('远端失败时静默回退兜底表，并留一条 warn 日志', async () => {
+    const warnings: string[] = []
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => { throw new Error('目录接口挂了') },
+      warn: (message) => { warnings.push(message) },
+    })
+    const models = await adapter.listModels('qoder')
+    expect(models.length).toBeGreaterThan(0)
+    expect(models.some((m) => m.id === 'dmodel')).toBe(true)
+    // 回退是静默的，没有日志就没有任何证据（只剩「倍率不更新」这种无信息症状）。
+    expect(warnings.join('\n')).toContain('目录接口挂了')
+  })
+
+  it('远端返回空数组同样回退兜底表（不把菜单变空）', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => [] })
+    const models = await adapter.listModels('qoder')
+    expect(models.some((m) => m.id === 'dmodel')).toBe(true)
+  })
+
+  it('TTL 内不重复拉远端（并发/连续调用只发一次）', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return [remoteModel('dfmodel', 'DeepSeek-Flash')]
+      },
+    })
+    await adapter.listModels('qoder')
+    await adapter.listModels('qoder')
+    await adapter.resolveModel('qoder', 'dfmodel')
+    expect(calls).toBe(1)
+  })
+
+  it('`refresh()` 强制重拉（无视 TTL）', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => {
+        calls += 1
+        return [remoteModel('dfmodel', 'DeepSeek-Flash')]
+      },
+    })
+    await adapter.listModels('qoder')
+    expect(calls).toBe(1)
+    await adapter.refresh()
+    expect(calls).toBe(2)
+  })
+
+  it('⚠️ 能力判据取并集：远端只有少数模型时，静态表已知的模型仍保留图片能力', async () => {
+    // 目录按账号下发 —— 一个免费额度号上游只给 2 条。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [remoteModel('dfmodel', 'DeepSeek-Flash')],
+    })
+    // 先让远端目录落地。
+    await adapter.listModels('qoder')
+    // `dmodel` 不在远端目录里，但静态表有它且 supportsImage=true。
+    const resolved = await adapter.resolveModel('qoder', 'dmodel')
+    expect(resolved.name).toBe('DeepSeek-V4-Pro')
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
+  })
+
+  it('远端独有的模型能被 resolveModel 认识（冷缓存也要先拉目录）', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [remoteModel('fast', 'Fast', { isFree: undefined, priceFactor: 0.8 })],
+    })
+    // 不先调 listModels：resolveModel 自己必须先拉目录，否则名字会退化成裸 id。
+    const resolved = await adapter.resolveModel('qoder', 'fast')
+    expect(resolved.name).toBe('Fast')
+  })
+})
+
+describe('QoderAdapter resolveModel', () => {  it('已知模型带 contextWindow 与展示名', async () => {
     // dmodel = DeepSeek-V4-Pro，实测 max_input_tokens=1000000
     const resolved = await makeAdapter().resolveModel('qoder', 'dmodel')
     expect(resolved.name).toBe('DeepSeek-V4-Pro')

@@ -155,6 +155,11 @@ export function createRpcBridge() {
           modelId: payload.modelId,
           disabled: payload.disabled === true,
         }, signal)
+      case 'model.refreshCatalog':
+        // 「刷新模型目录」：强制重拉远端列表（绕过 6 小时 TTL 与失败冷却）。
+        // provider 省略 = 刷新全部已注册渠道。
+        return post('/api/models/refresh-catalog',
+          payload.provider === undefined ? {} : { provider: payload.provider }, signal)
       case 'provider.list': {
         // 供应商总开关弹窗的状态源：每项带 enabled / 账号数。
         // ⚠️ 零网络：只读账号池与注册表的内存状态，不触发任何 provider 的
@@ -204,6 +209,10 @@ export function createRpcBridge() {
       case 'credits.dailyKeepalive':
         // 每日积分保活（仅 raccoon）：模拟「当日登录」把每日积分有效期延长到 7 天。
         return post('/api/credits/daily-keepalive', { provider: payload.provider }, signal)
+      case 'credits.dailyBonus':
+        // 补领当日福利（仅 officeace）：定时任务的手动兜底。后端强制跳过去重
+        // 闸门（`force: true`），故点一下会真的向上游试一次并返回逐账号结果。
+        return post('/api/credits/daily-bonus', { provider: payload.provider }, signal)
       default:
         throw new Error(`未知管理方法: ${method}`)
     }

@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '../../src/providers/credential-ref.js'
-import { LoomyAdapter, parseLoomyRemoteModels } from '../../src/providers/loomy-adapter.js'
+import { LoomyAdapter, fetchLoomyRemoteModels, parseLoomyRemoteModels } from '../../src/providers/loomy-adapter.js'
 import { currentAccountIdFor } from '../../src/providers/current-account.js'
 import type { LoomyCredential } from '../../src/providers/loomy.js'
+import { LOOMY } from '../../src/providers/loomy-product.js'
 
 const CRED: LoomyCredential = {
   access_token: 'S'.repeat(32), userid: 'u1', phone: '13011112222',
@@ -392,5 +393,79 @@ describe('LoomyAdapter 请求级换号', () => {
         messages: [{ role: 'user', content: 'hi' }],
       } as never)) { /* 必然抛错 */ }
     })()).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+  })
+})
+
+/**
+ * `fetchLoomyRemoteModels` —— Loomy 的远端目录拉取（2026-10-23 新接线）。
+ *
+ * ## 它补的是什么缺陷
+ *
+ * 此前 Loomy **从未接过远端目录**：`wiring.ts` 注册适配器时没传
+ * `fetchRemoteModels`，`loadModels()` 永远走 `loomy-product.ts` 里
+ * 2026-09-26 写死的 8 条兜底表。上游后来上架的 `spark-x2.6` / `auto`
+ * 一律看不到，而点「刷新模型目录」还会得到**误导性**的
+ * 「远端未返回目录，仍显示本地缓存」—— 不是远端挂了，而是根本没有远端请求。
+ *
+ * 与 CodeArts 漏接 `glm-5.3`、Raccoon 漏接 `sn-deepseek-v4-1-flash-1017`
+ * 是同一类缺陷（这是第 4 次重演），故用测试锁死接线本身。
+ */
+describe('fetchLoomyRemoteModels', () => {
+  it('打到 {apiBase}/models 且**只发 token 头**（不能带 Authorization）', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = []
+    const fetcher = vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url, init })
+      return new Response(JSON.stringify({ data: [remoteEntry()] }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const models = await fetchLoomyRemoteModels(CRED, LOOMY, fetcher)
+    expect(models.map((m) => m.id)).toEqual(['MiniMax-M3'])
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe(`${LOOMY.apiBase}/models`)
+    const headers = calls[0]!.init.headers as Record<string, string>
+    // `/models` 只认小写 token 头；带 Authorization 会被判「缺少 token」。
+    expect(headers['token']).toBe(CRED.access_token)
+    expect(headers['Authorization']).toBeUndefined()
+  })
+
+  it('非 2xx 抛错（交由 fetchRemoteCatalog 转成失败冷却 + 回退快照）', async () => {
+    const fetcher = (async () => new Response('', { status: 401 })) as unknown as typeof fetch
+    await expect(fetchLoomyRemoteModels(CRED, LOOMY, fetcher)).rejects.toThrow(/HTTP 401/)
+  })
+
+  it('远端返回空目录时抛错（不把空表当成功，否则会把兜底表覆盖成空）', async () => {
+    const fetcher = (async () => new Response(JSON.stringify({ data: [] }), { status: 200 })) as unknown as typeof fetch
+    await expect(fetchLoomyRemoteModels(CRED, LOOMY, fetcher)).rejects.toThrow(/为空/)
+  })
+
+  it('只保留 type=chat（生图等多模态条目不算对话模型）', async () => {
+    const fetcher = (async () => new Response(JSON.stringify({
+      data: [
+        remoteEntry({ id: 'chat-model', type: 'chat' }),
+        remoteEntry({ id: 'image-model', type: 'image' }),
+      ],
+    }), { status: 200 })) as unknown as typeof fetch
+    const models = await fetchLoomyRemoteModels(CRED, LOOMY, fetcher)
+    expect(models.map((m) => m.id)).toEqual(['chat-model'])
+  })
+
+  it('适配器接上 fetchRemoteModels 后播报远端目录（含兜底表没有的新模型）', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'spark-x2.6', name: 'Spark-X2.6 · x0.0', contextWindow: 1_048_576, supportsImage: false, supportsThinking: true },
+        { id: 'auto', name: '自动 · 均衡', contextWindow: 0, supportsImage: false, supportsThinking: false },
+      ],
+    })
+    const listed = await adapter.listModels('loomy')
+    expect(listed.map((m) => m.id)).toEqual(['spark-x2.6', 'auto'])
+  })
+
+  it('远端失败时仍回退兜底表（目录读不到不该让 provider 报错）', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => { throw new Error('network down') },
+    })
+    const listed = await adapter.listModels('loomy')
+    expect(listed.length).toBeGreaterThan(0)
   })
 })

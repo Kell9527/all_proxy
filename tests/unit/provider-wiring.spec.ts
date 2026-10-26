@@ -69,9 +69,13 @@ describe('13 个 provider 的装配', () => {
     expect(registry.get('raccoon')?.descriptor.authKind).toBe('bearer')
   })
 
-  it('Qoder 系两站都用静态目录（远端需要签名，不发请求）', () => {
-    expect(registry.get('qoder')?.descriptor.catalogSource).toBe('static-only')
-    expect(registry.get('qodercn')?.descriptor.catalogSource).toBe('static-only')
+  it('Qoder 系两站都走远端目录（WASM 签名已接上）', () => {
+    // ⚠️ 2026-10-20 前是 `static-only`：目录端点需要 WASM 签名，本项目当时
+    // 没实现 `prepareRequest` ⇒ 恒用编译期兜底表。后果是上游改价 / 改免费额度
+    // 一律不反映（用户报障「DeepSeek-Flash 上游已 0×，列表还显示 0.1」）。
+    // 现已在 `qoder-catalog.ts` 接上签名远端目录，兜底表降为回退。
+    expect(registry.get('qoder')?.descriptor.catalogSource).toBe('remote-first')
+    expect(registry.get('qodercn')?.descriptor.catalogSource).toBe('remote-first')
   })
 
   it('CodeArts 如实登记为不支持图片', () => {

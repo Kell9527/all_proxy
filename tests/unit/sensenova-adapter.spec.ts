@@ -193,6 +193,59 @@ describe('SensenovaAdapter 模型目录', () => {
     expect(listed.map((m) => m.id)).not.toContain('kimi-k3')
     expect(adapter.listAllModels().map((m) => m.id)).toContain('kimi-k3')
   })
+
+  /**
+   * 远端 `name` 对 SenseNova 是**纯回显**（实测 `{"id":"deepseek-v4-flash",
+   * "name":"deepseek-v4-flash"}`），不是给人看的展示名。
+   *
+   * 不加补名，接上远端目录后面板会从 `DeepSeek-V4-Flash` 退化成裸 id
+   * `deepseek-v4-flash` —— 接入远端目录时最容易忽略的体验回退。
+   */
+  it('远端 name 等于 id（纯回显）时，用兜底表的美化名', async () => {
+    const adapter = makeAdapter({
+      models: [
+        { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', contextWindow: 1_048_576, maxTokens: 65_536, supportsImage: false },
+        { id: 'kimi-k3', name: 'kimi-k3', contextWindow: 1_048_576, maxTokens: 65_536, supportsImage: false },
+      ],
+    })
+    const listed = await adapter.listModels('sensenova')
+    expect(listed.find((m) => m.id === 'deepseek-v4-flash')?.name).toBe('DeepSeek-V4-Flash')
+    expect(listed.find((m) => m.id === 'kimi-k3')?.name).toBe('Kimi-K3')
+    // resolveModel 同源（会话记录里的名字不能与列表不一致）
+    expect((await adapter.resolveModel('sensenova', 'deepseek-v4-flash')).name).toBe('DeepSeek-V4-Flash')
+    expect(adapter.listAllModels().find((m) => m.id === 'kimi-k3')?.name).toBe('Kimi-K3')
+  })
+
+  it('远端给出**不同**的 name 时以远端为准（上游将来改名要能反映）', async () => {
+    const adapter = makeAdapter({
+      models: [
+        { id: 'kimi-k3', name: 'Kimi K3 (官方名)', contextWindow: 1_048_576, maxTokens: 65_536, supportsImage: false },
+      ],
+    })
+    const listed = await adapter.listModels('sensenova')
+    expect(listed[0]!.name).toBe('Kimi K3 (官方名)')
+  })
+
+  it('远端新增模型（兜底表没有）保留裸 id 作名字（没有更好的信息）', async () => {
+    const adapter = makeAdapter({
+      models: [
+        { id: 'brand-new-model', name: 'brand-new-model', contextWindow: 1_000, maxTokens: 100, supportsImage: false },
+      ],
+    })
+    const listed = await adapter.listModels('sensenova')
+    expect(listed[0]!.name).toBe('brand-new-model')
+  })
+
+  it('远端目录已含 deepseek-v4.1-flash（上游新增模型能透出）', async () => {
+    const adapter = makeAdapter({
+      models: [
+        { id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash', contextWindow: 1_048_576, maxTokens: 65_536, supportsImage: false },
+      ],
+    })
+    const listed = await adapter.listModels('sensenova')
+    expect(listed.map((m) => m.id)).toContain('deepseek-v4.1-flash')
+    expect(listed[0]!.name).toBe('DeepSeek-V4.1-Flash')
+  })
 })
 
 describe('SensenovaAdapter 请求级换号（用户核心诉求）', () => {

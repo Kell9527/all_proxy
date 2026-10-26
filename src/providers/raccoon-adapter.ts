@@ -43,6 +43,18 @@ import type { AccountPool } from '../pool/account-pool.js'
 /** 本适配器注册的 provider 路由名（等价于 `RACCOON.id`）。 */
 export const PROVIDER = 'raccoon'
 
+/**
+ * 上游认可的思考档位白名单 —— **只有三档**。
+ *
+ * ⚠️ 来源是上游自己的报错文案（2026-10-23 实测，`reasoning_effort` 传非法值）：
+ * > `reasoning_effort must be one of low, high, or max.`
+ *
+ * 这与 ZCode 里该 provider 的模型只显示 3 个档位完全一致 —— 是上游能力表如此，
+ * 不是界面缺陷。`medium` / `xhigh` 等其他档位在这里**不存在**，透传时必须丢弃
+ * （上游对非法值返回 400）。
+ */
+export const RACCOON_REASONING_EFFORTS: ReadonlySet<string> = new Set(['low', 'high', 'max'])
+
 /** 远端模型条目（已归一）。 */
 export interface RaccoonRemoteModel {
   id: string
@@ -101,6 +113,14 @@ export class RaccoonAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, RaccoonFallbackModel>
   /** 远端模型缓存；未拉取时为 undefined。 */
   private remoteModels: RaccoonRemoteModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
 
   constructor(private readonly options: RaccoonAdapterOptions) {
     super()
@@ -252,6 +272,19 @@ export class RaccoonAdapter extends LlmAdapter {
       ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
+      // 思考等级：只发上游认的三档。
+      //
+      // ⚠️ 白名单只有 `low` / `high` / `max`，来源是上游**自己的报错文案**
+      // （2026-10-23 实测，传非法值时）：
+      // > `reasoning_effort must be one of low, high, or max.`
+      // 三档之外（如 `medium` / `xhigh` / `minimal`）必须**静默丢弃**：
+      // 上游对非法值是 400 硬失败，不为一个可选参数把请求打死。
+      //
+      // ⚠️ 这也解释了为什么 ZCode 里 loomy/raccoon 这类模型只显示 3 个档位
+      // （low / high / max）—— 与上游能力表一致，不是界面缺陷。
+      ...RACCOON_REASONING_EFFORTS.has(options.reasoningEffort ?? '')
+        ? { reasoning_effort: options.reasoningEffort }
+        : {},
       // ⚠️ tools 必须真的下发到请求体**顶层**：Qoder/TRAE 都因漏发而让模型
       // 在正文里臆造 XML 工具调用。
       ...options.tools !== undefined && options.tools.length > 0

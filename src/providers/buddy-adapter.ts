@@ -660,6 +660,14 @@ export class BuddyAdapter extends LlmAdapter {
   private readonly sessionId: string
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: BuddyRemoteModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */

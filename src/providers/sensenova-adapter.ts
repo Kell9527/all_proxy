@@ -68,6 +68,21 @@ import type { AccountPool } from '../pool/account-pool.js'
 /** 本适配器注册的 provider 路由名（等价于 `SENSENOVA.id`）。 */
 export const PROVIDER = 'sensenova'
 
+/**
+ * 上游认可的思考档位白名单。
+ *
+ * ⚠️ 来源是上游**自己的报错文案**（2026-10-23 实测，`reasoning_effort` 传非法值）：
+ * > `field ReasoningEffort invalid, should be one of:
+ * >  none, minimal, low, medium, high, xhigh, max, ultra`
+ *
+ * 它证明两件事：① 上游**真的消费**这个参数（不是忽略）；② 非法值直接 **400**。
+ * 故透传前必须过白名单 —— 超出范围时**静默丢弃**，不能照发：档位不是请求的
+ * 必要条件，为用户选了个上游不认识的档位而整条请求失败是明确的优先级倒置。
+ */
+export const SENSENOVA_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+  'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+])
+
 /** 兜底表条目转远端形状。 */
 function fallbackToRemote(model: SensenovaFallbackModel): SensenovaRemoteModel {
   return {
@@ -111,6 +126,14 @@ export class SensenovaAdapter extends LlmAdapter {
   /** 远端模型缓存；未拉取时为 undefined。 */
   private remoteModels: SensenovaRemoteModel[] | undefined
 
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
+
   constructor(private readonly options: SensenovaAdapterOptions) {
     super()
     this.product = options.product ?? SENSENOVA
@@ -135,15 +158,25 @@ export class SensenovaAdapter extends LlmAdapter {
     return source.map((model) => ({ id: model.id, name: model.name }))
   }
 
-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+  /**
+   * 取（并缓存）远端模型目录；失败时回退兜底表。
+   *
+   * ⚠️ **远端 `name` 对 SenseNova 是无用的回显**：实测 `GET /v1/models` 返回
+   * `{"id":"deepseek-v4-flash","name":"deepseek-v4-flash"}` —— `name` 逐字等于
+   * `id`，不是给人看的展示名。若直接用，模型选择器会显示 `deepseek-v4.1-flash`
+   * 这种裸 id，而兜底表里明明写着 `DeepSeek-V4.1-Flash`。
+   * 故这里做一层**补名**：远端 `name` 与 `id` 相同时，改用兜底表的美化名；
+   * 兜底表也没有该模型（上游新增）时才退回裸 id（此时确实没有更好的信息）。
+   * 远端若给出**不同的** `name`（将来上游改了），以远端为准。
+   */
   private async loadModels(): Promise<SensenovaRemoteModel[]> {
     if (this.remoteModels !== undefined) return this.remoteModels
     if (this.options.fetchRemoteModels !== undefined) {
       try {
         const fetched = await this.options.fetchRemoteModels()
         if (fetched.length > 0) {
-          this.remoteModels = fetched
-          return fetched
+          this.remoteModels = fetched.map((model) => this.enrichDisplayName(model))
+          return this.remoteModels
         }
       } catch {
         // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
@@ -152,6 +185,14 @@ export class SensenovaAdapter extends LlmAdapter {
     const fallback = this.product.fallbackModels.map(fallbackToRemote)
     this.remoteModels = fallback
     return fallback
+  }
+
+  /** 远端 `name === id`（纯回显）时，用兜底表的美化名覆盖（见 {@link loadModels}）。 */
+  private enrichDisplayName(model: SensenovaRemoteModel): SensenovaRemoteModel {
+    if (model.name !== model.id) return model
+    const fallback = this.fallbackIndex.get(model.id)
+    if (fallback === undefined) return model
+    return { ...model, name: fallback.name }
   }
 
   private inputModalitiesFor(model: SensenovaRemoteModel | undefined): readonly ('text' | 'image')[] {
@@ -249,6 +290,11 @@ export class SensenovaAdapter extends LlmAdapter {
       ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
+      // 思考等级：只发上游认的档位（见 {@link SENSENOVA_REASONING_EFFORTS}
+      // 的实测依据）。白名单外的值静默丢弃，避免变成一条 400。
+      ...SENSENOVA_REASONING_EFFORTS.has(options.reasoningEffort ?? '')
+        ? { reasoning_effort: options.reasoningEffort }
+        : {},
       // ⚠️ tools 必须真的下发到请求体**顶层**：Qoder/TRAE 都因漏发而让模型
       // 在正文里臆造 XML 工具调用。
       ...options.tools !== undefined && options.tools.length > 0

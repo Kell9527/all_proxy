@@ -30,7 +30,7 @@ import { randomUUID } from 'node:crypto'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
-import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
+import { describeWasmFailure, QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import {
@@ -368,6 +368,30 @@ export interface QoderAdapterOptions {
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
   /**
+   * 拉取**远端模型目录**（由 `wiring.ts` 注入 `QoderAuth.fetchModels(pool)`）。
+   *
+   * ## ⚠️ 为什么是「注入一个取数函数」而不是适配器自己解析凭据
+   *
+   * 适配器手上的取凭据入口是 `resolveCredential`，而它**有副作用**：选中账号
+   * 时接线层会记录「本次实际使用的账号」（供额度报错时标记）。目录请求是
+   * **周期性**的（每次列表 + 后台刷新），若走同一条路，它会在一次聊天请求选号
+   * 之后把那个记录**改写成目录用的账号** ⇒ 额度标记落到无辜账号上。
+   *
+   * 故与其余 provider 同形：由 auth 服务做**只读**取号 + 拉取，适配器只拿结果。
+   *
+   * 省略时**不发远端请求**（恒用兜底表）—— 纯测试/未接线场景的安全默认。
+   */
+  fetchRemoteModels?: () => Promise<readonly QoderFallbackModel[]>
+  /**
+   * 目录读取失败的告警出口（缺省静默）。
+   *
+   * ⚠️ 与「失败即回退兜底表」配套：回退是**静默**的，没有这条日志就没有
+   * 任何证据表明上游目录取不到（只剩「倍率不更新」这种无信息的症状）。
+   */
+  warn?: (message: string) => void
+  /** 注入的时钟（测试用；缺省 `Date.now`）。 */
+  now?: () => number
+  /**
    * 当前生效账号的 id（额度受限时用于**标记该账号**）。
    *
    * ⚠️ 做成**回调**而不是构造期常量：账号会在 `refreshAll` / 限流切换 /
@@ -390,6 +414,27 @@ export class QoderAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
   private readonly fallbackIndex: ReadonlyMap<string, QoderFallbackModel>
+  /**
+   * **远端**模型目录缓存（成功拉取后保留到 TTL 过期）。
+   *
+   * ⚠️ 2026-10-20 前本家**恒用编译期兜底表**（一次远端请求都不发），
+   * 上游改价/改免费额度/上下架模型都不会反映 —— 用户报障
+   * 「DeepSeek-Flash 上游已经 0×（免费）了，插件还显示 0.1」。
+   * 现在远端优先、兜底表只作回退（见 `qoder-catalog.ts`）。
+   */
+  private remoteModels: QoderFallbackModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/providers/llm-adapter.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
+  /** 上次**成功**读到远端目录的时刻（0 = 从未成功过）。 */
+  private catalogAt = 0
+  /** 目录拉取的**并发去重**（同一时刻只发一次上游请求）。 */
+  private catalogInFlight: Promise<void> | undefined
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
@@ -436,25 +481,53 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型接受的输入模态。
+   * 当前**目录条目**：远端优先，未落地时回退编译期兜底表。
    *
-   * 按**模型**判定（兜底表的 `supportsImage`），不是按 provider 一刀切。
-   * 未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
-   * 也不要报一个服务端不认的模态（请求会失败）。
-   *
-   * ⚠️ 兜底表是本地估计值，不是远端权威数据 —— 见 `qoder-product.ts` 的说明。
+   * ⚠️ 回退不是「优化」而是**必需**：纯插件用户（或上游目录接口故障时）
+   * 若目录为空，模型列表会把该 provider 判成「没有模型」而整个隐藏。
    */
-  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    return this.fallbackIndex.get(model)?.supportsImage === true ? ['text', 'image'] : ['text']
+  private catalogSource(): readonly QoderFallbackModel[] {
+    return this.remoteModels ?? this.product.fallbackModels
   }
 
   /**
-   * 模型目录。
+   * 按 id 取条目，供**能力/元数据**判据使用：**远端优先，未命中回退兜底表**。
    *
-   * **不发任何网络请求**：Qoder 的模型列表端点需要 WASM 签名
-   * （`qoder_auth_wasm`），本插件不实现，故恒用产品兜底表。
-   * 见设计文档 §2.6 与 `qoder-product.ts` 的 `fallbackModels` 说明。
+   * ## ⚠️⚠️ 为什么是「两份目录的并集」，而不是只用远端
+   *
+   * **远端目录是「按账号」下发的**（实测一个免费额度号上游只给 2 条）。
+   * 若只查远端，静态表里其它模型会被判成「未知」⇒ `inputModalitiesFor`
+   * 报 `['text']` ⇒ `stream()` 会**硬拒图片**，同时 name 退化成裸 id、
+   * `context` 消失、请求体的 display_name / max_input_tokens 一并退化。
+   *
+   * | 场景 | 只查远端 | 并集（现行） |
+   * |---|---|---|
+   * | 远端大目录里的模型 | ✅ | ✅ 远端优先 |
+   * | 远端只剩 2 条（免费号）时用 `dmodel` | ❌ 硬拒图片 + 元数据退化 | ✅ 回退静态表 |
+   * | 只在远端有的 `fast` | ✅ | ✅ 远端命中 |
+   *
+   * ⚠️ **菜单（`listModels`）仍以远端为准** —— 这条并集只作用于
+   * 「能力/元数据判据」，不改变「有哪些模型可选」：让**能力**判据取并集，
+   * 让**可选项**保持单一来源。
    */
+  private catalogModel(id: string): QoderFallbackModel | undefined {
+    return this.catalogSource().find((model) => model.id === id) ?? this.fallbackIndex.get(id)
+  }
+
+  /**
+   * 模型接受的输入模态。
+   *
+   * 按**模型**判定（目录条目的 `supportsImage`），不是按 provider 一刀切。
+   * 未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
+   * 也不要报一个服务端不认的模态（请求会失败）。
+   *
+   * ⚠️ 判据取自 `catalogModel()`（**远端 ∪ 静态表**）—— 只取远端会让
+   * 「按账号收缩的目录」把静态表里已知的模型判成未知。
+   */
+  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
+    return this.catalogModel(model)?.supportsImage === true ? ['text', 'image'] : ['text']
+  }
+
   /**
    * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率/免费标记）。
    *
@@ -463,7 +536,7 @@ export class QoderAdapter extends LlmAdapter {
    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
    */
   listAllModels(): readonly { id: string; name: string }[] {
-    return this.product.fallbackModels.map((model) => ({ id: model.id, name: qoderDisplayName(model) }))
+    return this.catalogSource().map((model) => ({ id: model.id, name: qoderDisplayName(model) }))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -472,9 +545,11 @@ export class QoderAdapter extends LlmAdapter {
     // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
     // 界面上反而多出一条 provider 报错）。
     if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
+    // 远端优先：拉不到时 `ensureRemoteModels` 静默保持兜底表。
+    await this.ensureRemoteModels()
     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
-    const source = this.product.fallbackModels
+    const source = this.catalogSource()
     const listed = disabled === undefined || disabled.size === 0
       ? source
       : source.filter((model) => !disabled.has(model.id))
@@ -489,17 +564,87 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    const entry = this.fallbackIndex.get(model)
+    // ⚠️ **必须先把远端目录拉到位再取条目**（TTL 闸门内是 no-op，零额外请求）：
+    // 冷缓存下 `catalogSource()` 还是静态表，此时远端独有的模型（如 `fast`）
+    // 会退化成裸 id。
+    await this.ensureRemoteModels()
+    const entry = this.catalogModel(model)
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
       name: entry?.name ?? model,
       inputModalities: this.inputModalitiesFor(model),
     }
-    // 上下文窗口：兜底表是**本地估计值**。未知模型不编造 context
-    // （宁可让 DSH 用默认值，也不要报一个假的窗口大小）。
-    if (entry !== undefined) resolved.context = { contextWindow: entry.contextWindow }
+    // 上下文窗口：未知模型不编造 context（宁可让调用方用默认值，
+    // 也不要报一个假的窗口大小）。
+    if (entry !== undefined && entry.contextWindow > 0) {
+      resolved.context = { contextWindow: entry.contextWindow }
+    }
     return resolved
+  }
+
+  /** 目录缓存的 TTL：20 分钟（与来源 `isCatalogFreshFor` 的 A 类口径一致）。 */
+  private static readonly CATALOG_TTL_MS = 20 * 60 * 1000
+
+  private nowMs(): number {
+    return this.options.now?.() ?? Date.now()
+  }
+
+  /**
+   * 懒加载远端模型目录（TTL 内不重复拉；并发去重）。
+   *
+   * 三条口径：
+   * 1. **只在成功时**记 `catalogAt` —— 失败也记会让一次网络抖动把 TTL 上界刷掉，
+   *    下一轮要再等满 20 分钟才发现上游没恢复；
+   * 2. 空结果视为失败（保持兜底表，不把菜单清空）；
+   * 3. 失败**静默**回退，但留一条 warn 日志（否则「倍率不更新」无任何证据）。
+   */
+  private async ensureRemoteModels(): Promise<void> {
+    if (this.remoteModels !== undefined
+      && this.nowMs() - this.catalogAt < QoderAdapter.CATALOG_TTL_MS) {
+      return
+    }
+    // 并发去重：同一时刻只发一次上游请求（列表 + 解析元信息会并发调用）。
+    if (this.catalogInFlight !== undefined) {
+      await this.catalogInFlight
+      return
+    }
+    this.catalogInFlight = this.loadRemoteModelsOnce()
+    try {
+      await this.catalogInFlight
+    } finally {
+      this.catalogInFlight = undefined
+    }
+  }
+
+  /** 真发一次远端目录请求（失败返回空数组并留日志）。 */
+  private async loadRemoteModelsOnce(): Promise<void> {
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote === undefined) return
+    try {
+      const models = await fetchRemote()
+      if (models.length === 0) return
+      this.remoteModels = [...models]
+      this.catalogAt = this.nowMs()
+    } catch (error) {
+      this.options.warn?.(
+        `[${this.product.id}] 模型目录读取失败，退用内置兜底表：`
+        + (error instanceof Error ? error.message : String(error)),
+      )
+    }
+  }
+
+  /**
+   * 后台目录刷新入口。
+   *
+   * ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**续期）**不是同一件事**，
+   * 两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    // 先清时刻，保证「无视新鲜度，强制拉一次」。
+    this.catalogAt = 0
+    this.remoteModels = undefined
+    await this.ensureRemoteModels()
   }
 
   /**
@@ -599,46 +744,72 @@ export class QoderAdapter extends LlmAdapter {
     // （用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
     const tools = buildQoderTools(options.tools)
 
-    const fallback = this.fallbackIndex.get(options.model)
+    // ⚠️ 远端优先（并集回退）：目录是**按账号**下发的，只查远端会让
+    // 「当前账号的小目录」把静态表里已知的模型判成未知 ⇒ 图片被硬拒、
+    // 元数据退化。见 `catalogModel()` 的注释。
+    const fallback = this.catalogModel(options.model)
 
     /** 用给定凭据构造一次加密请求（首次与 401 重试共用，避免两处漂移）。 */
     const buildRequest = async (c: QoderCredential): Promise<QoderInferRequest> => {
-      const client = await QoderEncryptedInfer.create({
-        user: {
-          uid: c.uid!,
-          securityOauthToken: c.security_oauth_token ?? c.access_token,
-        },
-        machineId: c.machine_id,
-        metadata: { ...this.product.clientMetadata },
-        host: this.product.encryptedInferBase,
-      })
-      return client.prepareInfer({
-        modelKey: options.model,
-        userText,
-        ...(systemText !== undefined ? { systemText } : {}),
-        isReasoning: fallback?.supportsThinking ?? false,
-        history,
-        // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
-        // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
-        tools,
-        ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
-        ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
-        ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
-        // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
-        ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),
-        ...(fallback?.contextWindow !== undefined ? { maxInputTokens: fallback.contextWindow } : {}),
-        // ⚠️ **`business` 必填**，否则服务端把请求路由到错误的后端节点。
-        //
-        // 实测（2026-09-20）：不带 `business` 时 `qfmodel`（Qwen3.8-Flash）
-        // 恒落到故障节点 `oa_qwen-plus-2025-04-28` 并返回
-        // `[FAIL]node:... msg:Execution failed`；补上 `business` 后立即正常
-        // （其余模型如 `qmodel_38max` 恰好不受影响，故早期排查易误判为
-        // 「该模型服务端故障」）。`agent` / `sec_scan` 等取值都能通。
-        //
-        // 源码依据：`MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`
-        // —— 服务端按 `business.type` 选路由池，缺字段会走异常分支。
-        business: { type: 'agent' },
-      })
+      // 🔴 `client` 持有 wasm `QoderContext`，**本次构造用完必须释放**：
+      // 不释放则进程级共享的 wasm 堆只增不减，长会话最终以裸
+      // `RuntimeError: unreachable` 暴毙。用 `try/finally` 而非顺序调用：
+      // `create` / `prepareInfer` 抛错时同样要释放，否则**异常路径**反倒
+      // 成了泄漏最多的那条路。
+      let client: QoderEncryptedInfer | undefined
+      try {
+        client = await QoderEncryptedInfer.create({
+          user: {
+            uid: c.uid!,
+            securityOauthToken: c.security_oauth_token ?? c.access_token,
+          },
+          machineId: c.machine_id,
+          metadata: { ...this.product.clientMetadata },
+          host: this.product.encryptedInferBase,
+        })
+        return client.prepareInfer({
+          modelKey: options.model,
+          userText,
+          ...(systemText !== undefined ? { systemText } : {}),
+          isReasoning: fallback?.supportsThinking ?? false,
+          history,
+          // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
+          // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
+          tools,
+          ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+          ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+          ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
+          // 官方 `model_config` 的 display_name / max_input_tokens 必须带上。
+          ...(fallback?.name !== undefined ? { displayName: fallback.name } : {}),
+          ...(fallback?.contextWindow !== undefined ? { maxInputTokens: fallback.contextWindow } : {}),
+          // ⚠️ **`business` 必填**，否则服务端把请求路由到错误的后端节点。
+          //
+          // 实测（2026-09-20）：不带 `business` 时 `qfmodel`（Qwen3.8-Flash）
+          // 恒落到故障节点 `oa_qwen-plus-2025-04-28` 并返回
+          // `[FAIL]node:... msg:Execution failed`；补上 `business` 后立即正常
+          // （其余模型如 `qmodel_38max` 恰好不受影响，故早期排查易误判为
+          // 「该模型服务端故障」）。`agent` / `sec_scan` 等取值都能通。
+          //
+          // 源码依据：`MPi(A) { return A === 'sec_scan' ? 'security' : 'default' }`
+          // —— 服务端按 `business.type` 选路由池，缺字段会走异常分支。
+          business: { type: 'agent' },
+        })
+      } catch (error) {
+        // wasm trap（裸 `unreachable`）在 glue 层已被改写；这里再兜一次，
+        // 保证任何情况下都不会有裸 `unreachable` 冒到 UI。
+        throw describeWasmFailure(error)
+      } finally {
+        // ⚠️⚠️ **释放失败绝不能顶替 `try` 块里的原始错误**：JS 的 `finally`
+        // 里 `throw` 会无条件覆盖 `try` 的 `throw`，而 `dispose()` →
+        // `freePointer()` 在**堆耗尽时确实会抛** —— 恰在本修复要治理的场景下。
+        // 那会把上游的 401 / AUTH 改写成「WASM 堆耗尽」，同时丢掉可重试性判据。
+        // ⇒ 释放是**清理动作**，它失败不该改变本次请求的结论。
+        try {
+          client?.dispose()
+        } catch {
+          // 刻意静默：本类没有 logger 通道，不为一条清理失败的日志新开通道。
+        }
+      }
     }
 
     // 3. 发送（⚠️ 头必须原样透传：Authorization 是 WASM 生成的

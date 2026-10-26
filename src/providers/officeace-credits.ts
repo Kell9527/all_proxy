@@ -63,6 +63,12 @@ export interface OfficeAceSubscriptionSummary {
   }>
 }
 
+/** 签名请求的结果：`ok` 表示上游回 2xx，`text` 是响应正文（失败时为空串）。 */
+interface SignedResponse {
+  ok: boolean
+  text: string
+}
+
 /**
  * V11 签名的请求 —— **GET 与 POST 共用**。
  *
@@ -83,7 +89,7 @@ export interface OfficeAceSubscriptionSummary {
  * 漂移（那正是当初 GET 反复 401 的成因）。
  *
  * @param body - 请求体文本；`undefined`（无 body）时按空串计哈希。
- * @returns 响应正文；非 2xx 或异常返回空串（调用方按「读不到」降级）。
+ * @returns 是否 2xx 与响应正文；非 2xx 或异常时 `ok:false`（调用方按「读不到」降级）。
  */
 async function signAndRequest(
   url: string,
@@ -91,7 +97,7 @@ async function signAndRequest(
   method: 'GET' | 'POST',
   body?: string,
   fetcher: typeof fetch = fetch,
-): Promise<string> {
+): Promise<SignedResponse> {
   const region = 'cn-southwest-2'
   const service = 'apic'
   const pad = (n: number): string => (n >= 10 ? String(n) : `0${n}`)
@@ -154,10 +160,10 @@ async function signAndRequest(
       ...body === undefined ? {} : { body },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
-    return r.ok ? await r.text() : ''
+    return r.ok ? { ok: true, text: await r.text() } : { ok: false, text: '' }
   } catch {
     // 网络异常按「读不到」降级（与来源的非 2xx 处理同）。
-    return ''
+    return { ok: false, text: '' }
   }
 }
 
@@ -188,8 +194,8 @@ export async function fetchOfficeAceCloudSubscription(
     undefined,
     fetcher,
   )
-  if (body.length === 0) return undefined
-  return parseOfficeAceSubscription(body)
+  if (!body.ok || body.text.length === 0) return undefined
+  return parseOfficeAceSubscription(body.text)
 }
 
 /** 解析 `/v1/subscription` 响应（抽出来供单测直接喂 JSON 文本）。 */
@@ -252,102 +258,162 @@ export function parseOfficeAceSubscription(body: string): OfficeAceSubscriptionS
 }
 
 /**
+ * 一次领取的结果。
+ *
+ * ⚠️ **必须区分 `claimed` 与 `empty`**：上游对「今天已经领过」回的是
+ * `HTTP 200 {"bonus_skus":[]}`（2026-10-23 实测），与「活动不存在」完全同形。
+ * 合并成「领到 0 分」会让调用方无法判断该不该重试 —— 定时任务按天去重、
+ * 手动刷新按结果提示，两者都需要这个区分。
+ */
+export interface OfficeAceBonusClaimResult {
+  /** `claimed` 本次真的领到；`empty` 上游回 200 但没有新桶（多为今天已领）；`failed` 请求失败。 */
+  kind: 'claimed' | 'empty' | 'failed'
+  /** 本次新领到的活动桶（`kind==='claimed'` 时至少一个）。 */
+  claimed: Array<{ activityId: string; activityName: string; points: number }>
+}
+
+/**
  * 自动领取每日福利（**签到**）——`POST /v1/subscription/bonus/claim`。
  *
  * ## 为什么需要它（以及为什么必须是**自动**的）
  *
- * OfficeAce 的签到实际上是「每日送 1000 积分」的活动桶（`bonus_skus` 里的
- * `bonus-bonus-daily-checkin-2026`）。果办客户端的做法是**订阅页一挂载就自动
+ * OfficeAce 的签到实际上是「每日送积分」的活动桶（`bonus_skus` 里的
+ * `bonus-daily-checkin-2026`）。果办客户端的做法是**订阅页一挂载就自动
  * 调这个端点**（源码 `SubscriptionStateProvider`：用「年+月+日+时」做去重键，
  * 每小时最多领一次）—— **UI 上没有签到按钮**，不存在「手动签到」这回事。
  *
- * 故插件侧也必须是自动的：拉余额之前顺手领一次。
- *
- * ⚠️ **积分当日作废**（实测）：`expired_time` 是当天 23:59:59。当天不领就
- * 永久失去那 1000 分 —— 这正是自动领取的价值所在。
+ * ⚠️ **积分当日作废**（2026-10-23 实测）：`expired_time` 是
+ *    `2026-10-23T15:59:59.000Z`，折合北京时间当日 23:59:59 —— 即 UTC+8 自然日
+ *    结束时作废。当天不领就永久失去那一份，这正是自动领取的价值所在。
  *
  * ⚠️ **POST 必须带 `Content-Type`**（规则 1 的另一面）：实测不带会得到
  *    HTTP 500 `OfficeAce.11020001 内部服务器错误`；带了才是 200。
  *    body 为空即可 —— 该端点不需要入参（果办也是 `void 0`）。
  *
- * @returns 领取到的活动桶；失败返回空数组（**不抛错**：签到失败不该阻断余额展示）。
+ * @returns 领取结果；**不抛错**（签到失败不该阻断余额展示，由调用方决定提示）。
  */
 export async function claimOfficeAceDailyBonus(
   credential: OfficeAceCredential,
   fetcher: typeof fetch = fetch,
-): Promise<Array<{ activityId: string; activityName: string; points: number }>> {
+): Promise<OfficeAceBonusClaimResult> {
   if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
-    return []
+    return { kind: 'failed', claimed: [] }
   }
+  const body = await signAndRequest(
+    `${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`,
+    credential,
+    'POST',
+    undefined,
+    fetcher,
+  )
+  if (!body.ok) return { kind: 'failed', claimed: [] }
   try {
-    const body = await signAndRequest(
-      `${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}/v1/subscription/bonus/claim`,
-      credential,
-      'POST',
-      undefined,
-      fetcher,
-    )
-    if (body.length === 0) return []
-    const j = JSON.parse(body) as {
+    const j = JSON.parse(body.text) as {
       bonus_skus?: Array<{
         activity_id?: unknown
         activity_name?: unknown
         points?: unknown
       }>
     }
-    return (j.bonus_skus ?? []).map((s) => ({
+    const claimed = (j.bonus_skus ?? []).map((s) => ({
       activityId: String(s.activity_id ?? ''),
       activityName: typeof s.activity_name === 'string' ? s.activity_name : '活动奖励',
       points: Number(s.points) || 0,
     }))
+    return claimed.length === 0 ? { kind: 'empty', claimed } : { kind: 'claimed', claimed }
   } catch {
-    // ⚠️ 签到失败**绝不阻断**余额查询。
-    return []
+    // 2xx 但不是 JSON：算失败（重试有意义），不算「今天已领」。
+    return { kind: 'failed', claimed: [] }
   }
 }
 
 /**
- * 「够了就不要再领」的节流：同一 ref **每小时最多领一次**（与果办客户端同款
- * 去重键：年+月+日+时）。
+ * 领取去重的日期键：**UTC+8 自然日**（`yyyy-mm-dd`）。
  *
- * ⚠️ 不去重的后果：余额每次刷新都打一次 claim ⇒ 面板每开一次就多发一个
- *    请求，且服务端若对重复领取返回异常，日志会被刷屏。
- * ⚠️ 按 ref 而非全局：多账号下每个账号**各自**都要领，共用一把锁会让
- *    第二个账号永远领不到（它的签到分当日作废）。
- *
- * 进程内 Map（不落盘）：重启后第一次查询会补领一次，与「客户端每次启动都领」
- * 的语义一致，且幂等（服务端对重复领取返回已有桶）。
+ * 上游的到期时间是 `...T15:59:59Z` 折合北京时间当日 23:59:59，即额度按
+ * **UTC+8 自然日**作废，故去重也必须用同一个日界。⚠️ 不能取本机时区 ——
+ * 用户出差或改系统时区会算出错的日界，导致「刚过本机 0 点就以为新的一天」
+ * 而在同一 UTC+8 自然日里重复领取（或反之，整天不领）。
  */
-const lastBonusClaimAt = new Map<string, string>()
+export function officeAceDayKey(now: Date = new Date()): string {
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
+}
 
-/** 节流后的自动领取（`ref` 用账号的 credentialRef，缺省时用 'default'）。 */
+/** 失败后的重试冷却：避免网络抖动时定时任务与面板路径连续打上游。 */
+const BONUS_RETRY_COOLDOWN_MS = 10 * 60 * 1000
+
+interface BonusClaimState {
+  /** 已**成功**领取（或确认当天早已领过）的 UTC+8 日期键；未成功时不写。 */
+  settledDay?: string
+  /** 最近一次尝试的时刻（毫秒，含失败）。 */
+  lastAttemptAt: number
+}
+
+/**
+ * 「今天领过就别再领」的去重表。
+ *
+ * ⚠️ **按 ref 而非全局**：多账号下每个账号**各自**都要领，共用一把锁会让
+ *    第二个账号永远领不到（它的签到分当日作废）。
+ * ⚠️ **成功才记日期**：早期实现「先标记再请求」，一次网络抖动就把当天记成
+ *    「已领」，该账号当天剩下的时间再也不会重试 ⇒ 白丢当天额度。现在失败不
+ *    记日期，只记尝试时刻用于短冷却。
+ * ⚠️ **按自然日而非小时**：额度当日作废，同日重复领取毫无收益；而按小时节流
+ *    跨天后仍会等满一小时才补领（进程常在早晨就已被定时任务唤醒）。
+ *
+ * 进程内 Map（不落盘）：重启后第一次会补领一次，与「客户端每次启动都领」的
+ * 语义一致，且上游对重复领取幂等（回 200 + 空桶）。
+ */
+const bonusClaimState = new Map<string, BonusClaimState>()
+
+/**
+ * 节流后的自动领取（`ref` 用账号的 credentialRef，缺省时用 'default'）。
+ *
+ * @param options.force - **手动补领**时置 true：跳过「今天已领」与失败冷却两道闸门。
+ *   用户点按钮就是明确要求「现在就试一次」，被去重表静默忽略会让人以为按钮坏了。
+ *   仍会照常更新去重表（成功后定时任务不再重复打上游）。
+ * @returns 本次的实际结果；被节流跳过时返回 `undefined`（不可与「失败」混淆）。
+ */
 export async function maybeClaimOfficeAceBonus(
   credential: OfficeAceCredential,
   ref: string,
   fetcher: typeof fetch = fetch,
-): Promise<void> {
-  const now = new Date()
-  const hourKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${now.getHours()}`
-  if (lastBonusClaimAt.get(ref) === hourKey) return
-  lastBonusClaimAt.set(ref, hourKey)
-  try {
-    await claimOfficeAceDailyBonus(credential, fetcher)
-  } catch {
-    // 领取失败不影响余额查询（claimOfficeAceDailyBonus 本身已吞错，双保险）。
+  now: () => number = Date.now,
+  options: { force?: boolean } = {},
+): Promise<OfficeAceBonusClaimResult | undefined> {
+  const at = now()
+  const dayKey = officeAceDayKey(new Date(at))
+  const state = bonusClaimState.get(ref)
+  if (options.force !== true && state !== undefined) {
+    // 今天已成功领过（或上游确认今天早已领过）⇒ 不重复打上游。
+    if (state.settledDay === dayKey) return undefined
+    // 刚失败过 ⇒ 冷却期内不重试（面板与定时器会同时打这一枪）。
+    if (at - state.lastAttemptAt < BONUS_RETRY_COOLDOWN_MS) return undefined
   }
+
+  bonusClaimState.set(ref, { ...state, lastAttemptAt: at })
+  const result = await claimOfficeAceDailyBonus(credential, fetcher)
+  if (result.kind !== 'failed') {
+    // `claimed` 与 `empty`（今天早已领过）都意味着「今天不用再试」。
+    bonusClaimState.set(ref, { settledDay: dayKey, lastAttemptAt: at })
+  }
+  return result
 }
 
-/** 测试辅助：清空领取节流表（避免跨用例串小时键）。 */
+/** 测试辅助：清空领取去重表（避免跨用例串日期键）。 */
 export function resetOfficeAceBonusClaimThrottle(): void {
-  lastBonusClaimAt.clear()
+  bonusClaimState.clear()
 }
 
 /**
  * 查一个账号的 OfficeAce 余额（**带原因**）。
  *
  * 顺序（与来源一致，**不能反**）：先自动领当日福利，再云侧直读 ——
- * 签到会把当日 1000 分打进 `bonus_skus`，先查就永远少显示那一份，
+ * 签到会把当日的福利分打进 `bonus_skus`，先查就永远少显示那一份，
  * 用户会以为没领到。
+ *
+ * ⚠️ 这里的领取只是**面板路径上的顺带补领**，不是唯一入口：服务侧还有
+ * `claimOfficeAceDailyBonuses`（`src/refresh/runtime-helpers.ts`）在启动时与
+ * 每小时兜底。两处共用同一份去重表（按 ref + UTC+8 自然日），故不会重复打上游。
  *
  * 三条失败路径全部 `balance: null` + 原因，没有一条退化成 0：
  * 1. 凭据缺 STS 访问键（账号未完成登录 / 迁移条目）⇒ 提示重新登录；
@@ -363,7 +429,7 @@ export async function fetchOfficeAceBalanceDetailed(
     return { balance: null, error: 'OfficeAce 凭据缺少华为云访问键（请重新登录以补全）' }
   }
 
-  // ① 自动领当日福利（节流：每小时最多一次）
+  // ① 自动领当日福利（去重：按 ref + UTC+8 自然日；失败不记日期）
   await maybeClaimOfficeAceBonus(credential, ref, fetcher)
 
   // ② 云侧直读

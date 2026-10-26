@@ -765,6 +765,18 @@ export class CodeArtsAdapter extends LlmAdapter {
   private remoteModels: Array<{ id: string; name: string }> | undefined
 
   /**
+   * 丢弃已缓存的远端模型目录，下次 `listModels` / `resolveModel` 重新拉取。
+   *
+   * 供管理端「刷新模型目录」按钮调用（见 `wiring.ts` 的 `refreshModelCatalog`）。
+   * ⚠️ 必须覆盖**两层**缓存才会生效：模块级的 `fetchRemoteCatalog`（内存 +
+   * 磁盘快照）与本类这份 `remoteModels`。只清前者的话，适配器仍拿自己那份旧
+   * 目录返回，按钮看起来「点了没反应」。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
+
+  /**
    * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
    * （如直接进入会话），此时同样触发远端拉取。
    */

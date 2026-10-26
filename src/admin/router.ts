@@ -34,6 +34,7 @@ import type { RefreshCoordinator } from '../pool/refresh-coordinator.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import type { Logger } from '../pool/store.js'
 import { sensenovaNicknameFromKey } from '../providers/sensenova.js'
+import { refreshModelCatalog } from '../providers/wiring.js'
 import { AdminAuth, extractAdminSecret } from './auth.js'
 import { ApiKeyStore } from '../auth/api-keys.js'
 import type { UsageStore } from '../usage/store.js'
@@ -43,6 +44,7 @@ import { listAllModelsForAdmin } from '../gateway/model-resolver.js'
 import { retestAccount, retestAllAccounts, type ProbePool } from '../providers/account-probe.js'
 import { exportBackup, importBackup, type BackupPool as BackupPoolLike, type BackupCredentials as BackupCredentialsLike } from '../providers/backup.js'
 import { claimAll as claimAllCredits, claimOnboarding, fetchBalances, keepAliveDailyPoints } from './credits-endpoint.js'
+import { claimOfficeAceDailyBonuses } from '../refresh/runtime-helpers.js'
 import { maskCredentialPath, parseCredentialRef, validateFileRefInput } from '../pool/credential-ref-kind.js'
 import { AccountPhoneResolver } from './account-phone.js'
 
@@ -634,6 +636,29 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       return true
     }
 
+    // 「刷新模型目录」：强制重拉远端模型列表（绕过 6 小时 TTL 与失败冷却）。
+    //
+    // ⚠️ 存在理由：目录的两层缓存都刻意偏懒（模块级 6 小时 TTL + 适配器进程内
+    // 永久缓存），为的是不每次开面板都打上游。代价是上游上架新模型后本服务最多
+    // 要等 6 小时才看见。用户等不了，故给一个手动入口。
+    //
+    // ⚠️ 不是写操作（不改变任何持久状态，只是重拉展示数据），但会向上游发请求，
+    // 故仍走 runWrite 留痕，便于排查「为什么某次上游调用发生在那个时刻」。
+    if (path === '/api/models/refresh-catalog' && method === 'POST') {
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const rawProvider = body.value['provider']
+      const provider = typeof rawProvider === 'string' && rawProvider.length > 0 ? rawProvider : undefined
+      // 指定了 provider 就必须是已注册的 id：拼错不该静默刷新全部。
+      if (provider !== undefined && !registry.has(provider)) {
+        sendJson(res, 400, { error: { code: 'invalid_request_error', message: `未知的 provider: ${provider}` } })
+        return true
+      }
+      await runWrite('model-refresh-catalog', provider ?? 'all', () =>
+        refreshModelCatalog(registry, provider))
+      return true
+    }
+
     if (path === '/api/models/bulk' && method === 'POST') {
       const body = await readBody(req)
       if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
@@ -751,6 +776,45 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
       await runWrite('credits-daily-keepalive', provider, () =>
         keepAliveDailyPoints(provider, { pool, credentials, fetcher: options.fetcher, warn: (m) => logger.warn(m), ...(options.refreshCoordinator === undefined ? {} : { coordinator: options.refreshCoordinator }) }))
+      return true
+    }
+
+    // 补领当日福利（仅 officeace）：服务端每小时定时领取，本入口是**手动兜底**。
+    //
+    // ⚠️ 为什么需要手动（用户要求「加个手动，防止定时任务没领到」）：定时任务
+    // 只在进程活着时跑。用户关掉服务过夜、或跨天后才启动时，「今天该领的那份」
+    // 可能已经错过窗口（额度按 UTC+8 自然日作废）。面板点一下能立刻看到结果，
+    // 不必等下一个整点。
+    //
+    // ⚠️ 用 `force: true`：手动的语义就是「现在就试一次」，被去重表静默忽略
+    // 会让人以为按钮坏了。领取后仍会更新去重表，故定时任务不会重复打上游。
+    //
+    // ⚠️ 这是**写操作**（真向华为云下单领分），故走 runWrite 留痕。
+    if (path === '/api/credits/daily-bonus' && method === 'POST') {
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const provider = typeof body.value['provider'] === 'string' ? body.value['provider'] : ''
+      if (provider !== 'officeace') {
+        sendJson(res, 400, {
+          error: { code: 'credits_unsupported', message: `provider ${provider || '(空)'} 不支持补领当日福利（目前仅 officeace）` },
+        })
+        return true
+      }
+      await runWrite('credits-daily-bonus', provider, async () => {
+        const result = await claimOfficeAceDailyBonuses({
+          pool,
+          credentials,
+          logger,
+          force: true,
+          fetcher: options.fetcher,
+          ...(options.refreshCoordinator === undefined ? {} : { coordinator: options.refreshCoordinator }),
+        })
+        // 响应形状对齐 `keepAliveDailyPoints`：`{ summary, results }`。
+        // 前端按这个形状解构；把 sweep 结果原样吐出会让 summary 变 undefined，
+        // 面板只能显示一句「undefined」——形状漂移是这类端点最常见的坑。
+        const { results, ...summary } = result
+        return { summary, results }
+      })
       return true
     }
 
@@ -903,6 +967,11 @@ function usageQueryFromUrl(url: URL): UsageQuery {
   if (provider !== null && provider.trim().length > 0) query.provider = provider.trim()
   const model = url.searchParams.get('model')
   if (model !== null && model.trim().length > 0) query.model = model.trim()
+  // ⚠️ 档位用 `has()` 判存在而不判非空：`?reasoningEffort=`（空值）是
+  // 「筛出未指定档位的请求」这一**有效查询**，与「不带该参数」语义不同。
+  if (url.searchParams.has('reasoningEffort')) {
+    query.reasoningEffort = url.searchParams.get('reasoningEffort') ?? ''
+  }
   const outcome = url.searchParams.get('outcome')
   if (outcome === 'success' || outcome === 'failure') query.outcome = outcome
   const limit = positiveInt(Number(url.searchParams.get('limit') ?? NaN))

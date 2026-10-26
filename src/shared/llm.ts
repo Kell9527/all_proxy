@@ -364,6 +364,20 @@ export abstract class LlmAdapter {
   }
 
   /**
+   * 丢弃已缓存的远端模型目录，下次 `listModels` / `resolveModel` 重新拉取。
+   *
+   * 供管理端「刷新模型目录」按钮调用（见 `wiring.ts` 的 `refreshModelCatalog`）。
+   *
+   * ⚠️ **必须覆盖两处缓存才会生效**：模块级的 `fetchRemoteCatalog`
+   * （内存 + 磁盘快照，TTL 6 小时）与适配器自己那份 `remoteModels`（进程内，
+   * 首次拉取后永不过期）。只清前者的话，适配器仍拿自己那份旧目录返回，
+   * 按钮会「点了没反应」—— 这是接这个功能最容易漏的一点。
+   *
+   * 默认空实现：不缓存远端目录的适配器无需关心（基类不能假定子类字段）。
+   */
+  invalidateModelCatalog(): void {}
+
+  /**
    * 解析某个精确模型的全部可用元数据。
    * @param provider - 本适配器拥有的路由名。
    * @param model - 精确模型 id。

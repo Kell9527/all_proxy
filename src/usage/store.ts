@@ -50,6 +50,15 @@ export interface UsageRecord {
   upstreamModel: string
   /** 实际完成请求的账号 id；未知时为空串。 */
   accountId: string
+  /**
+   * 调用方请求的思考等级（`reasoning_effort`）；未指定时为空串。
+   *
+   * ⚠️ 记的是**网关收到的入参**，不是「上游实际生效的档位」：部分适配器
+   * 整段丢弃该参数（见 AGENTS.md 的 provider 透传表），另有模型会在客户端
+   * 未指定时回落到自己声明的 `defaultEffort`。空串的正确读法是「本次请求
+   * 没有指定」，不能读成「没有思考」。
+   */
+  reasoningEffort: string
   /** 总输入 token（**含**缓存读与缓存写，与响应里的 `prompt_tokens` 同口径）。 */
   promptTokens: number
   /** 输出 token。 */
@@ -81,6 +90,13 @@ export interface UsageQuery {
   keyId?: string
   provider?: string
   model?: string
+  /**
+   * 思考等级筛选。
+   *
+   * 传空串表示**筛出「未指定档位」的那些请求**（旧记录与不传该参数的客户端），
+   * 这与「不筛选」是两回事，故不能用「空串等于不过滤」的惯例。
+   */
+  reasoningEffort?: string
   /** 只取成功（`status < 400`）或只取失败。省略为全部。 */
   outcome?: 'success' | 'failure'
   /** 每页条数（1–500，默认 50）。 */
@@ -101,6 +117,14 @@ export interface UsageSummary {
   avgFirstByteMs: number | null
   /** 平均总耗时（毫秒）。 */
   avgDurationMs: number | null
+  /**
+   * 按思考等级分桶的请求数（降序）。
+   *
+   * `effort` 为空串的那一桶代表「调用方未指定档位」。它几乎总会出现 ——
+   * 客户端不传 `reasoning_effort`、走 Anthropic 协议、以及本列上线前的历史
+   * 记录都落在这里，故**不要**把它当成异常数据。
+   */
+  reasoningEfforts: Array<{ effort: string; requests: number }>
 }
 
 /** 查询结果。 */
@@ -169,6 +193,7 @@ export class UsageStore {
         model             TEXT    NOT NULL,
         upstream_model    TEXT    NOT NULL,
         account_id        TEXT    NOT NULL,
+        reasoning_effort  TEXT    NOT NULL DEFAULT '',
         prompt_tokens     INTEGER NOT NULL,
         completion_tokens INTEGER NOT NULL,
         cache_read_tokens INTEGER NOT NULL,
@@ -186,6 +211,31 @@ export class UsageStore {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_key ON usage_records (key_id, at_ms)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_records (provider, at_ms)')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records (provider, model, at_ms)')
+    this.addMissingColumns()
+  }
+
+  /**
+   * 给**已存在的**旧库补新列。
+   *
+   * ⚠️ `CREATE TABLE IF NOT EXISTS` 建表语句里加列对存量库**毫无作用** ——
+   * 表已存在时整条语句被跳过，写入方随后 INSERT 一个不存在的列会直接抛错
+   * （而 `record()` 会把它吞成一条告警，表现是「用量页从此一条新记录都没有」，
+   * 极难归因）。故每次启动都按 `PRAGMA table_info` 比对，缺什么补什么。
+   */
+  private addMissingColumns(): void {
+    const existing = new Set(
+      (this.db.prepare('PRAGMA table_info(usage_records)').all() as Array<{ name?: unknown }>)
+        .map(column => String(column.name ?? '')),
+    )
+    /** 后加的列：`[列名, 列定义]`。顺序即补列顺序，新增时追加到末尾。 */
+    const added: Array<readonly [string, string]> = [
+      // 2026-10-23：思考等级。旧记录的档位未知，故默认空串而不是猜一个值。
+      ['reasoning_effort', "TEXT NOT NULL DEFAULT ''"],
+    ]
+    for (const [name, definition] of added) {
+      if (existing.has(name)) continue
+      this.db.exec(`ALTER TABLE usage_records ADD COLUMN ${name} ${definition}`)
+    }
   }
 
   /**
@@ -212,9 +262,9 @@ export class UsageStore {
     const statement = this.db.prepare(`
       INSERT OR REPLACE INTO usage_records (
         request_id, at, at_ms, key_id, key_name, provider, model, upstream_model,
-        account_id, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+        account_id, reasoning_effort, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
         stream, duration_ms, first_byte_ms, finish_reason, status, error_code
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     statement.run(
       record.requestId,
@@ -226,6 +276,7 @@ export class UsageStore {
       record.model,
       record.upstreamModel,
       record.accountId,
+      record.reasoningEffort,
       Math.max(0, Math.floor(record.promptTokens)),
       Math.max(0, Math.floor(record.completionTokens)),
       Math.max(0, Math.floor(record.cacheReadTokens)),
@@ -285,6 +336,14 @@ export class UsageStore {
       FROM usage_records ${where.sql}
     `).get(...where.params) as Record<string, unknown> | undefined
 
+    // 档位分桶：与主查询共用同一套 WHERE，故它描述的是「本次筛选结果」的分布。
+    const effortRows = this.db.prepare(`
+      SELECT reasoning_effort AS effort, COUNT(*) AS requests
+      FROM usage_records ${where.sql}
+      GROUP BY reasoning_effort
+      ORDER BY requests DESC, reasoning_effort ASC
+    `).all(...where.params) as Array<Record<string, unknown>>
+
     const rows = this.db.prepare(`
       SELECT * FROM usage_records ${where.sql}
       ORDER BY at_ms DESC, request_id DESC
@@ -303,6 +362,10 @@ export class UsageStore {
         cacheReadTokens: num(summaryRow?.['cache_read_tokens']),
         avgFirstByteMs: nullableNum(summaryRow?.['avg_first_byte_ms']),
         avgDurationMs: nullableNum(summaryRow?.['avg_duration_ms']),
+        reasoningEfforts: effortRows.map(row => ({
+          effort: String(row['effort'] ?? ''),
+          requests: num(row['requests']),
+        })),
       },
       matched: total,
       limit,
@@ -396,6 +459,8 @@ function buildWhere(query: UsageQuery): { sql: string; params: Array<string | nu
   if (query.keyId !== undefined && query.keyId.length > 0) { clauses.push('key_id = ?'); params.push(query.keyId) }
   if (query.provider !== undefined && query.provider.length > 0) { clauses.push('provider = ?'); params.push(query.provider) }
   if (query.model !== undefined && query.model.length > 0) { clauses.push('model = ?'); params.push(query.model) }
+  // ⚠️ 与其他维度不同：**空串是有效取值**（代表「未指定档位」），故只判 undefined。
+  if (query.reasoningEffort !== undefined) { clauses.push('reasoning_effort = ?'); params.push(query.reasoningEffort) }
   if (query.outcome === 'success') clauses.push('status < 400')
   if (query.outcome === 'failure') clauses.push('status >= 400')
   return { sql: clauses.length === 0 ? '' : `WHERE ${clauses.join(' AND ')}`, params }
@@ -421,6 +486,8 @@ function rowToRecord(row: Record<string, unknown>): UsageRecord {
     model: String(row['model'] ?? ''),
     upstreamModel: String(row['upstream_model'] ?? ''),
     accountId: String(row['account_id'] ?? ''),
+    // 旧库补列后该值为空串（写入时 DEFAULT ''），故不需要另设兜底。
+    reasoningEffort: String(row['reasoning_effort'] ?? ''),
     promptTokens: num(row['prompt_tokens']),
     completionTokens: num(row['completion_tokens']),
     cacheReadTokens: num(row['cache_read_tokens']),

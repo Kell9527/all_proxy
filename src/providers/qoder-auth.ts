@@ -27,7 +27,8 @@ import {
   qoderRefreshBody,
   type QoderCredential,
 } from './qoder.js'
-import { QODER, type QoderProduct } from './qoder-product.js'
+import { QODER, type QoderFallbackModel, type QoderProduct } from './qoder-product.js'
+import { fetchQoderRemoteModels } from './qoder-catalog.js'
 import {
   runQoderLoginFlow,
   startQoderLoginFlow,
@@ -440,6 +441,54 @@ export class QoderAuth extends Service {
         }
         // 单账号失败不中断循环
       }
+    }
+  }
+
+  /**
+   * 拉取**远端模型目录**（`/api/v2/model/list?Encode=1`）。
+   *
+   * ## 为什么由 auth 服务做，而不是让适配器自己解析凭据
+   *
+   * 适配器手上的取凭据入口是 `resolveCredential`，而它**有副作用**：
+   * 选中账号时接线层会记录「本次实际使用的账号」（供额度报错时标记）。
+   * 目录请求是**周期性**的（每次列模型 + 后台刷新），若走同一条路，
+   * 它会在一次聊天请求选号之后把那个记录**改写成目录用的账号**
+   * ⇒ 额度标记可能落到**无辜账号**上。
+   *
+   * 故照其余 provider 的形态：目录取数只做**池的只读读取**，不写任何账；
+   * 池空时回退本实例的默认 ref。
+   *
+   * ## 语义
+   *
+   * - 失败 / 未登录 / 形状不符一律返回 **`[]`**，由调用方回退编译期兜底表；
+   * - 「没有凭据」**不打日志**（未登录用户每次列模型都会走到这里）；
+   * - 真正的失败（HTTP 非 2xx / 网络异常 / WASM trap）必须留痕 ——
+   *   否则「倍率不更新」这个症状没有任何可查的证据。
+   */
+  async fetchModels(pool?: AccountPool): Promise<QoderFallbackModel[]> {
+    let credential: QoderCredential | undefined
+    if (pool !== undefined) {
+      try {
+        const available = await pool.getAvailableAccount(this.product.id, '')
+        if (available !== null && available !== undefined) {
+          credential = available.credential as unknown as QoderCredential
+        }
+      } catch {
+        // 池读失败不致命：落到默认 ref。
+      }
+    }
+    credential ??= await this.resolveStoredCredential()
+    if (credential === undefined) return []
+    try {
+      return await fetchQoderRemoteModels(credential, this.product, {
+        ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+      })
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        `[${this.product.id}] 远端模型目录读取失败，模型列表将退用内置兜底表：`
+        + (error instanceof Error ? error.message : String(error)),
+      )
+      return []
     }
   }
 

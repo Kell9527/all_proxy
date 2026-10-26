@@ -55,6 +55,33 @@
    给的延迟等待后重试，两者语义完全不同。
 5. **Qoder 的额度受限要自算「UTC+8 当日 24:00」**，不能用「1 小时后」兜底——额度按自然日结算。
    时区必须写死 UTC+8，不取本机时区（用户出差/改系统时区会算出错的解禁时刻）。
+5b. **Qoder 的模型目录走远端**（2026-10-20 移植来源 `8b41403` + 审计修复 `8901a4d`）：
+   `GET {encryptedInferBase}/api/v2/model/list?Encode=1`，WASM 补 `/algo` 前缀、
+   `Bearer COSY.<签名>`、无 body，响应 `{场景:[模型]}` 取 `chat`。
+   改造前本家**恒用编译期兜底表**（国际版快照 2026-09-21 / CN 2026-09-27），
+   上游改价 / 改免费额度 / 上下架一律不反映（用户报障「DeepSeek-Flash 上游已 0×，
+   列表还显示 0.1」）。七个必守点：
+   - **`Encode=1` 不保证响应加密**：两站实测都回明文，故解密必须走
+     `decryptServerResponseOrRaw`（「失败即明文」是协议的一部分，不是容错洁癖）。
+     它与 `decryptModelCatalog` 是**两把不同的锁**（那个解本地 `catalog-v6`、
+     第二参是 machineId），混用会得 `AES-GCM decrypt failed`。
+   - **档位白名单只有 6 个值、不含 `minimal`**（官方 `k3`）。中文名表保留它只为
+     别显示成裸 id，**不要**据此加回白名单 —— 上游会静默丢弃。
+   - **`efforts` 三形态都认**（数组 / 逗号或空格字符串 / 对象），且**不要排序**：
+     对象键序就是官方 IDE 的渲染序（Issue IKLIDV）。
+   - **`available_reasoning_effort` 是一个 `thinking_config` 形状的对象**，必须包一层
+     `{thinking_config: …}` 再解析；且按官方 `??` 短路语义，**只在条目自身既无档位
+     也无 `disabled` 时**才读它。
+   - **`supportsDisable` 与 `efforts` 相互独立**：实测 `gfmodel` 有档位但不能关闭，
+     `qmodel` 没有档位但能关闭。别由「有没有档位」反推。
+   - **能力/元数据判据取「远端 ∪ 静态表」，菜单（`listModels`）仍远端独占**：
+     目录是**按账号**下发的（一个免费额度号上游只给 2 条），若能力判据也只查远端，
+     静态表里已知的模型会被判成「未知」⇒ **硬拒图片**、name 退化成裸 id。
+     这是第一个提交的真缺陷，审计复现后修掉（见 `catalogModel()` 的表）。
+   - **`isFree` 必须真的透出到 `LlmModelInfo`**：前端「免费额度」分组只认
+     `model.isFree === true`，解析层产出了但装配层漏写，端到端仍只到「名字带 · 免费」。
+   客户端版本闸门：`fast` 只在 `cli ≥ 1.1.70` / `app ≥ 1.1.66` 下发，本项目是
+   `cli + COSY_VERSION 1.1.49` ⇒ 天然拿不到，**刻意不抬版本**（会连带改推理签名身份）。
 6. **上游错误体的嵌套深度不可假设**。用「先按某字段判门禁、再解析」的写法，一旦真实结构
    比预期深一层就静默失效；应让解析函数自己递归判定。
 7. **`tools` 必须真的下发到请求体顶层**，且工具历史要保留 `tool_calls` / `tool_call_id`。
@@ -145,6 +172,35 @@ UTC+8 当日 24:00）。
   一个「看起来对却 401」的账号，而日志不能打印 key 明文，等于无头案；
   ③ 建号**不校验 key 有效性**（后端只写凭据与索引，不打上游），故弹窗常驻一句
   提示把验证手段指到面板既有的「重测」。
+**SenseNova 的模型目录走远端 + 兜底表，且远端 `name` 是纯回显**（2026-10-23
+  用户提「这个模型列表更新了，刷新一下」时发现）：目录经 `fetchRemoteCatalog`
+  三级缓存（内存 → `data/catalogs/sensenova.json` → 兜底表，TTL **6 小时**，
+  失败冷却 10 分钟），上游 `GET /v1/models` 现为 **7 条**（6 个文本输出 +
+  `sensenova-u1.5-lite` 出图模型，后者被 `parseSensenovaModels` 按
+  `output_modalities` 正确滤掉）。三个必守点：
+  ① **远端 `name` 逐字等于 `id`**（实测 `{"id":"deepseek-v4-flash","name":
+  "deepseek-v4-flash"}`），不是展示名 ⇒ `loadModels` 里有一层 `enrichDisplayName`
+  补名：远端的 name 与 id 相同时改用兜底表的美化名，兜底表也没有（上游新增）
+  才留裸 id，远端给出**不同** name 时以远端为准。漏了这层，模型选择器会从
+  `DeepSeek-V4-Flash` 退化成裸 id —— 接入远端目录时最容易忽略的体验回退。
+  ② **目录是全 key 共享的**（2026-10-23 实测 8 把 key 返回同一组 7 条），
+  故不存在「某个号看到的不一样」；面板少显示模型先查 `state.json` 的
+  `disabledModels.sensenova`（关闭的模型仍可被 `listAllModels` 列出，
+  但不出现在 `listModels`）。
+  ③ **手动刷新入口**（2026-10-23 用户要求「加一个「刷新模型目录」按钮」）：
+  面板「模型列表」弹窗内的「刷新模型目录」按钮 →
+  `POST /api/models/refresh-catalog` → `refreshModelCatalog`
+  （`src/providers/wiring.ts`）。**必须清三层缓存**，少一层就「点了没反应」：
+  ① `catalogMemory`（模块级内存）；② **磁盘快照的新鲜度**（`catalogForceRefresh`
+  标记，让 `fetchRemoteCatalog` 跳过「快照新鲜就直接返回、一个字节的网络都不发」
+  那条短路 —— 首版正是漏了这层，表现为「刷新看似成功、列表纹丝不动」）；
+  ③ **各适配器自己的 `remoteModels`**（`invalidateModelCatalog()`，10 个适配器
+  全部覆盖 + 基类 `src/shared/llm.ts` 默认空实现）。另外**失败冷却必须绕过**
+  （`catalogFailedAt`），否则「上一次失败后 10 分钟内点按钮」会静默不动。
+  ⚠️ **成功判据不能是「listModels 是否抛错」**：所有适配器都在内部吞掉远端
+  失败并回退兜底表，远端挂了也会正常返回一份旧目录。真正的判据是**磁盘快照被
+  重写**（比较刷新前后的 `fetchedAt`）；据此区分 `succeeded` / `error` /
+  `fellBack`，让用户知道看到的是新数据还是旧快照。
 
 **第 12、13 个 provider —— OfficeAce（华为云 ModelArts MaaS）与 Accio（阿里 Accio Work）**
 （2026-10-14 从来源 HEAD 移植，均超出移植基线 `3611a62`，故不走 `port-providers.mjs`）：
@@ -160,10 +216,35 @@ UTC+8 当日 24:00）。
   API / 订阅磁盘缓存（多账号下本地 cookie 无法按 ref 区分账号，缓存则是第二个数据源）。
   **积分**（2026-10-14 补齐，用户报障「本地仅显示登录状态，无其它显示」）：V11-HMAC-SHA256
   签名云侧直读 `GET {defaultBaseUrl}/v1/subscription`（`officeace-credits.ts`，三条签名
-  规则见文件头），拉余额前**自动领当日福利**（`bonus/claim`，按 ref 每小时节流 ——
-  当日 1000 分不领就当天作废，且 UI 上没有手动签到这回事）；分桶「永久/长期/临期」
-  由前端按 `expiredTime` 与 `windowDays` 算。「锁定永久积分」已泛化为 per-provider
+  规则见文件头），**每日福利**走 `POST /v1/subscription/bonus/claim`（实测活动
+  `bonus-daily-checkin-2026` = **100 分/天**，`expired_time` 折合 UTC+8 当日 23:59:59
+  作废；UI 上没有手动签到这回事）；分桶「永久/长期/临期」由前端按 `expiredTime` 与
+  `windowDays` 算。「锁定永久积分」已泛化为 per-provider
   （`pool.setPermanentLocked` + `PATCH /api/permanent-lock`）。
+  **每日福利必须由定时器领，不能只在拉余额时领**（2026-10-23 修正）：原实现的唯一
+  调用点是管理端拉积分余额，于是「用户不开面板」= 当天额度白作废（用户报障
+  「刚刚我在客户端打开了，然后登录领了 100 分」—— 是**打开面板那个动作**领的，
+  不是服务自己领的）。现由 `claimOfficeAceDailyBonuses`
+  （`src/refresh/runtime-helpers.ts`）在**启动时 + 每小时**兜底，去重按 **UTC+8
+  自然日**（`officeAceDayKey`，不取本机时区）。三条纪律：① 只领 `enabled` 账号
+  （与续期相反 —— 续期不看 `enabled` 是因为 refresh_token 会一路放到失效，而这里
+  只是少一份当天额度，越界给用户弃用的账号发写请求更糟）；② **失败不记日期**
+  （早期「先标记再请求」的实现，一次网络抖动就把当天记成已领，该账号整天不再
+  重试）；③ 领取前按需续期（STS 寿命约 2 小时，走 `refreshAccountOnce` 与定时
+  续期共用同一单飞协调器）。
+  **手动补领**（2026-10-23 用户要求「加个手动，防止定时任务没领到」）：
+  `POST /api/credits/daily-bonus` → `claimOfficeAceDailyBonuses({ force: true })`，
+  面板按钮「补领今日福利」（`supportsDailyBonus` 能力位，只有 officeace 为 true）。
+  为什么需要它：定时任务只在**进程活着**时跑，用户关掉服务过夜、或跨天后才启动
+  时会错过当天窗口（额度按 UTC+8 自然日作废）。三条纪律：① 手动必须 **`force`**
+  跳过去重闸门 —— 否则「今天定时任务已经试过」会让按钮点了毫无反应，看起来就是
+  坏的；② 领取后**仍更新去重表**，故定时任务不会因此重复打上游（上游对重复领取
+  幂等：回 HTTP 200 + 空桶）；③ 响应形状是 `{summary, results}`，与
+  `keepAliveDailyPoints` 对齐 —— 直接把 sweep 结果吐出会让前端 `summary`
+  变 undefined（已由 `credits-daily-bonus-api.spec.ts` 锁死）。
+  ⚠️ 它是**第三类**积分操作，三个能力位不可混用：`balance`（查余额）、
+  `dailyCheckin`（OfficeAce 恒 false，每天必须手动点的语义会误导）、
+  `dailyKeepalive`（raccoon 专用，把已到账积分延长有效期，**不产生新分**）。
   **新建账号不自动开窗**（2026-10-14 用户报障「每次都会自动登录同一个账号」）：
   华为云授权页是 **SSO 页面**，浏览器里已登录的账号被**静默复用**（授权瞬间完成，
   用户看不到选账号的界面），自动 `window.open` 等于替用户决定用哪个账号。来源的解法
@@ -245,10 +326,13 @@ UTC+8 当日 24:00）。
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
 `login-window-policy` / `officeace-dedupe` / `officeace-login` / `account-phone` /
 `static-key-entry` / `officeace-expiry-rank` / `officeace-expiry-selector` /
-`officeace-consume-order`）。
-当前 **144 个文件 3375 条用例**（2026-10-15 实测；其中
-`buddy-oauth.spec.ts` 有 1 条**时间相关的既有用例**失败 —— 其促销 fixture 的
-`validUntil` 为 `2026-10-11`，已过期，与本项目改动无关）。
+`officeace-consume-order` / `qoder-catalog` / `raccoon-remote-catalog` /
+`reasoning-effort-passthrough`）。
+当前 **152 个文件 3500 条用例**（2026-10-23 实测；其中
+`buddy-oauth.spec.ts` 1 条 + `officeace-expiry-selector.spec.ts` 3 条是
+**时间相关的既有用例**失败 —— fixture 的到期时间锚在 2026-10-15，已过期，
+与本项目改动无关，`git stash` 后在改动前的基线上复现同样 4 条；
+`gateway-auth.spec.ts` 1 条偶发，单独跑通过）。
 
 **未移植的测试**（来源里依赖 DSH 服务容器或断言 DSH 源码结构，本项目无对应物）：
 `plugin.spec` / `jet-hub-rpc.spec` / `jet-hub-store.spec` / `backup.spec` /
@@ -361,6 +445,11 @@ npm run dev          # 开发态（tsx watch）
   需要原生编译的依赖，用量库用 Node 内置 `node:sqlite`。
 - **Qoder WASM**：`qoder-auth-wasm.wasm`（约 298 KB）必须与编译产物同目录，
   由构建脚本复制；启动时自检存在性。
+  ⚠️ **`QoderEncryptedInfer` 每次用完必须 `dispose()`**（推理与目录请求都是）。
+  它持有 wasm `QoderContext`，进程级共享的堆只增不减，长会话最终以裸
+  `RuntimeError: unreachable` 暴毙。目录请求是**周期性**的，漏释放比推理路径
+  累积更快。释放失败**不得**顶替 `try` 里的原始错误（`finally` 里 `throw` 会
+  无条件覆盖，把上游 401 改写成「WASM 堆耗尽」并丢掉可重试性判据）。
 
 ## 数据与安全
 
@@ -369,9 +458,90 @@ npm run dev          # 开发态（tsx watch）
 - 管理端默认只监听 `127.0.0.1`；改为对外监听时必须强制设置管理凭据。
 - 导入 DSH 数据是**只读**的：永不写回 `.credentials.yaml` 或 `jet-hub/state.json`。
 
+## 思考等级的观测口径（2026-10-23 补）
+
+用户问「最近请求都用什么思考等级」时**查不到** —— 网关从请求体读了
+`reasoning_effort` 却只传给适配器，既不落库也不进日志，`usage_records`
+19 列里没有这一项。现已补采（列 `reasoning_effort`，`UsageRecord` /
+`RequestRecord` 同名可选字段，面板「思考等级分布」+ 最近请求表格新增一列）。
+
+四条必守点：
+
+1. **记的是入参，不是上游实际生效的档位**。两者会分叉：① 部分适配器整段丢弃该
+   参数（`sensenova` / `loomy` / `raccoon` / `officeace` / `accio` /
+   `llm-adapter` 对 `reasoningEffort` 的引用数是 0，只有 `buddy` / `trae` /
+   `cline` / `qoder` 真的下发）；② 模型自身声明 `defaultEffort` 时客户端不传
+   也会有思考。故列名与文案都写「请求的等级」，**不要**改称「实际档位」。
+2. **空串 = 未指定，不是「没有思考」**。客户端不传、走 Anthropic 协议（翻译层
+   `translateAnthropicRequest` 不读 `thinking`，故该路径恒空串）、以及本列上线前
+   的 7847 条历史记录都落在这一桶。面板因此把空串显示成 `--` 而不是 `none`。
+3. **采集点在网关、由 `report()` 统一兜底**，不在每个 `report()` 调用点各写一遍
+   —— 漏一处就会出现「某条分支显示未指定」，而这种缺失在数据里与真实情况长得
+   一模一样，事后无法分辨。为此 `reasoningEffort` 用 `let` **先声明再赋值**：
+   解析请求体失败的分支里 `report()` 在赋值前就被调用，用 `const` 会撞 TDZ
+   （与 `target` 同款坑，见 `report()` 的注释）。采集位置在模型解析**之前**，
+   故被开关拦掉的 404 也带着档位。
+4. **旧库必须显式补列**：`CREATE TABLE IF NOT EXISTS` 对存量表毫无作用，加列语句
+   整条被跳过，随后 `INSERT` 会因列不存在抛错并被 `record()` 吞成一条告警 ——
+   表现是「用量页从此一条新记录都没有」，极难归因。故 `UsageStore.addMissingColumns()`
+   每次启动按 `PRAGMA table_info` 比对补齐（新增列时追加到它的 `added` 表里）。
+   实测在真实库（7847 条）副本上迁移：19 → 20 列、历史零丢失、写入与筛选正常。
+
+筛选用 `?reasoningEffort=`，且**空值是有效查询**（筛「未指定」那批），故
+`usageQueryFromUrl` 用 `has()` 判存在而不是判非空。
+
+### 思考等级的上游透传：四个适配器、四张不同的能力表（2026-10-23 补）
+
+同一批改动里给 `loomy` / `sensenova` / `raccoon` / `officeace` 补上了
+`reasoning_effort` 透传（此前**整段丢弃**：`grep reasoningEffort` 零命中，
+表现为「用户选了 max、实际按默认档跑」，而用量库记的是入参所以看不出来）。
+`accio` **刻意不动**（用户明确要求）。
+
+⚠️ **四家的合法取值各不相同，且非法值一律 400（不是忽略）** —— 白名单是硬需求，
+不是洁癖。判据全部来自各上游**自己的报错文案**（2026-10-23 实测，传 `bogus_xyz`）：
+
+| provider | 合法档位 | 上游原文 |
+|---|---|---|
+| `sensenova` | none, minimal, low, medium, high, xhigh, max, **ultra** | `field ReasoningEffort invalid, should be one of: …` |
+| `officeace` | none, minimal, low, medium, high, xhigh, max（**无 ultra**） | `ModelArts.81001 … 可选值为：none、minimal、low、medium、high、xhigh、max` |
+| `raccoon` | **仅 low / high / max** | `reasoning_effort must be one of low, high, or max.` |
+| `loomy` | low, medium, high, max, xhigh（无 minimal / none / ultra） | `level "…" not supported, valid levels: low, medium, high, max, xhigh` |
+
+三条纪律：
+
+1. **白名单外的值静默丢弃**，不照发。档位不是请求的必要条件 —— 为它把整条请求
+   打成 400 是明确的优先级倒置。四条实现都是 `SET.has(… ) ? {…} : {}` 的形状。
+2. **`loomy` 的 `xhigh` 归一成 `max`**（参考实现 `loomy-gateway.js` 原文：
+   「思考强度归一化：xhigh 视为 max」）。透传前不归一会让同一档位在
+   「走参考网关」与「走本服务」两条链路上行为不一致。
+3. **不要在这几家之间互相照抄档位表**：`sensenova` 有 `ultra` 而 `officeace`
+   没有，两者同属商汤/华为系；`loomy` 与 `raccoon` 都只有三到五档。照抄会让
+   合法档位被静默丢掉、或非法档位被发出去。
+
+⚠️ **这与 ZCode 里「只显示 3 个档位」是同一件事的两面**：`raccoon` 那类模型
+在客户端只出现 low/high/max，正是上游能力表如此（不是界面缺陷）。给 8317
+这类中间层的模型声明 `thinking.levels` 时，**声明的也必须落在该上游的白名单内**——
+声明了上游不认的档位（如给 raccoon 加 `medium`），网关会按自己的默认表夹取，
+最终仍与预期不符。
+
+
+
 ## 已知限制
 
 - **Loomy 没有 refresh 端点**：token 过期只能重新登录（故主路径用手机号验证码，成本低）。
+- **Loomy 的远端模型目录也曾漏接线**（2026-10-23 用户报障「loomy 模型刷新没，
+  提示远端未返回目录，仍显示本地缓存（3 个模型）」）：`wiring.ts` 注册时**从未**
+  传 `fetchRemoteModels`，`loadModels()` 永远走 `loomy-product.ts` 里 2026-09-26
+  写死的 8 条兜底表 —— 上游后来上架的 `spark-x2.6` / `auto` 一律看不到。点「刷新
+  模型目录」得到的「远端未返回目录」是**误导性文案**：不是远端挂了，而是根本没有
+  远端请求。现已接上 `fetchLoomyRemoteModels`（`GET {apiBase}/models`）。三条必守点：
+  ① **只发小写 `token` 头**（`loomyBusinessHeaders`），带 `Authorization: Bearer`
+  会被判「缺少 token」；② 目录取号走 `firstUsableLoomyCredential`，**不能**用
+  `ctx.resolveCredential` —— 后者按余额分档选号，今日额度用尽或锁定永久积分时会
+  抛错，把「拉目录」连坐成失败；③ 上游实际 10 条 chat（含 `auto` 自动路由），
+  比兜底表多 2 条。⚠️ 这是同一个缺陷的**第 4 次重演**（CodeArts 漏 `glm-5.3`、
+  Raccoon 漏 `sn-deepseek-v4-1-flash-1017`、SenseNova 漏 `deepseek-v4.1-flash`）：
+  新增 provider 时必须同时确认 `fetchRemoteModels` 接线，否则兜底表会永久冻结。
 - **`codearts` / `trae` 的 refresh token 一次性轮换**：从 DSH 导入后，建议只让一边刷新，
   否则两边会互相作废。
 - **Raccoon 每日 300 积分的「当日登录」触发端点已确证为 `GET /api/web/office/v3/setting_info`**
@@ -403,6 +573,21 @@ npm run dev          # 开发态（tsx watch）
   共享凭据文件里写的 `office_identity` 是字面量 `'personal'`，原样发出去会让
   `/points/v1/balance` 回 `HTTP 400 code=200022 org_not_found_error`。个人账号必须
   折叠成空串（`raccoonHeaders` 里的 `orgCodeOf`）。
+  ⚠️ **拉模型目录也吃这条**（2026-10-21 实测 `model_catalog` 同错）：`fetchModels`
+  早期自己手写了请求头、没复用 `raccoonHeaders`，个人账号因此拿不到目录而静默
+  回退兜底表。现统一走 `fetchRaccoonRemoteModels`（内部调 `raccoonHeaders`）。
+- **Raccoon 的模型目录必须由 `wiring.ts` 注入 `fetchRemoteModels`**（2026-10-21
+  用户报障「这个模型列表更新了，看看为什么没有跟进」）：不注入时适配器只播报
+  `raccoon-product.ts` 里 2026-09-26 写死的 6 条兜底表，上游后来上架的
+  `sn-deepseek-v4-1-flash-1017` 等一律看不到 —— 与 CodeArts 漏接 `glm-5.3`
+  是同一类缺陷（`ee33dd2`）。
+  三个必守点：① 账号无关 ⇒ 用 `firstUsableRaccoonCredential`（`listAccountsByProvider`
+  顺序、**不按 `enabled`/限流过滤**，`getAvailableAccount` 会让全停用时目录退回兜底表）；
+  ② 走 `fetchRemoteCatalog('raccoon', …)` 的三级缓存（内存 → `data/catalogs/raccoon.json`
+  → 兜底表），别绕过缓存直连；③ 该解析函数是 `raccoon-auth.ts` 导出的纯函数 ——
+  装配层没有 `RaccoonAuth` 实例，**不要**为接目录去 new 一个 service（会带出定时器）。
+  回归用例：`tests/unit/raccoon-remote-catalog.spec.ts`
+  （注意其每个用例都要 `vi.resetModules()`，因为目录缓存是模块级单例）。
 - **Raccoon 账号的「重测」也必须分派适配器**：`account-probe.ts` 的分派表已两次因
   「新增 provider 没同步」出缺陷（workbuddy、trae），raccoon 是第三个会写
   `modelRateLimits` 的 provider，漏分支会让它落到 CodeArts 的华为 HMAC 签名分支。

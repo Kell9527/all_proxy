@@ -454,6 +454,18 @@ function UsagePanel() {
         stat('平均首字节', summary.avgFirstByteMs === null ? '--' : `${Math.round(summary.avgFirstByteMs)} ms`),
       ),
     ),
+    // ── 思考等级分布 ──
+    // ⚠️ 「未指定」几乎总会出现：客户端不传 `reasoning_effort`、走 Anthropic
+    // 协议、以及本列上线前的历史记录都落在这里，故它是常态而非异常。
+    summary !== null && Array.isArray(summary.reasoningEfforts) && summary.reasoningEfforts.length > 0
+      && React.createElement('section', { style: sectionStyle },
+        React.createElement('h3', { style: headingStyle }, '思考等级分布'),
+        React.createElement('div', { style: { display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 13 } },
+          summary.reasoningEfforts.map(item => stat(item.effort || '未指定', item.requests)),
+        ),
+        React.createElement('p', { style: { margin: '10px 0 0', fontSize: 12, color: 'var(--dsw-alias-label-secondary, #646a73)' } },
+          '记录的是客户端请求里带的 reasoning_effort，不代表上游实际生效的档位'),
+      ),
     // ── provider 状态总览 ──
     health !== null && React.createElement('section', { style: sectionStyle },
       React.createElement('h3', { style: headingStyle }, 'Provider 状态'),
@@ -472,13 +484,15 @@ function UsagePanel() {
       React.createElement('h3', { style: headingStyle }, `最近请求（${records.length}）`),
       React.createElement('table', { style: tableStyle },
         React.createElement('thead', null, React.createElement('tr', null,
-          ['时间', 'Key', 'Provider', '模型', '账号', 'tokens', '耗时', '首字节', '状态'].map(h => React.createElement('th', { key: h, style: cellStyle }, h)))),
+          ['时间', 'Key', 'Provider', '模型', '账号', '思考等级', 'tokens', '耗时', '首字节', '状态'].map(h => React.createElement('th', { key: h, style: cellStyle }, h)))),
         React.createElement('tbody', null, records.map(r => React.createElement('tr', { key: r.requestId },
           React.createElement('td', { style: cellStyle }, new Date(r.at).toLocaleTimeString()),
           React.createElement('td', { style: cellStyle }, r.keyName),
           React.createElement('td', { style: cellStyle }, r.provider),
           React.createElement('td', { style: cellStyle }, r.model),
           React.createElement('td', { style: cellStyle }, r.accountId || '--'),
+          // 空串表示客户端没指定档位（不是「没有思考」）。
+          React.createElement('td', { style: cellStyle }, r.reasoningEffort || '--'),
           React.createElement('td', { style: cellStyle }, `${r.promptTokens}/${r.completionTokens}`),
           React.createElement('td', { style: cellStyle }, `${r.durationMs} ms`),
           React.createElement('td', { style: cellStyle }, r.firstByteMs === null ? '--' : `${r.firstByteMs} ms`),

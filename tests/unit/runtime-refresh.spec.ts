@@ -6,7 +6,8 @@ import { AccountPool } from '../../src/pool/account-pool.js'
 import { RefreshCoordinator } from '../../src/pool/refresh-coordinator.js'
 import { FileCredentialStore } from '../../src/pool/store.js'
 import { refreshProviderCredential, REFRESH_SUPPORTED_PROVIDERS } from '../../src/refresh/provider-refresher.js'
-import { refreshDueAccounts } from '../../src/refresh/runtime-helpers.js'
+import { claimOfficeAceDailyBonuses, refreshDueAccounts } from '../../src/refresh/runtime-helpers.js'
+import { resetOfficeAceBonusClaimThrottle } from '../../src/providers/officeace-credits.js'
 import { fetchBalances, claimAll, claimOnboarding, keepAliveDailyPoints } from '../../src/admin/credits-endpoint.js'
 
 /**
@@ -367,5 +368,187 @@ describe('积分端点分派', () => {
     expect(r.claimed[0]!.points).toBe(3000)
     expect(r.earned).toBe(3000)
     expect(r.total).toBe(3000)
+  })
+})
+
+/**
+ * OfficeAce 每日福利的**定时领取**（2026-10-23，用户报障
+ * 「刚刚我在客户端打开了，然后登录领了 100 分」）。
+ *
+ * 病根：领取只在「管理端拉积分余额」时触发（`fetchOfficeAceBalanceDetailed`），
+ * 用户不开面板时服务自跑却从不领 —— 福利按 UTC+8 自然日作废，当天白丢。
+ */
+describe('claimOfficeAceDailyBonuses（定时领取当日福利）', () => {
+  let dir: string
+  let credentials: FileCredentialStore
+  let pool: AccountPool
+  const noopLogger = { info: () => {}, warn: () => {}, error: () => {} }
+
+  /** 远期有效的 OfficeAce 凭据（不触发续期，隔离掉刷新路径的干扰）。 */
+  function officeAceCredential(): string {
+    return JSON.stringify({
+      modelAppKey: 'ak', modelAppSecret: 'sk', maasBaseUrl: 'https://example.com',
+      access: 'AK', secret: 'SK', securityToken: 'STS', projectId: 'p',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      refreshToken: 'rt', dpopPrivateJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+    })
+  }
+
+  async function addOfficeAce(id: string, options: { enabled?: boolean } = {}): Promise<string> {
+    const ref = `OFFICEACE_ACCOUNT_${id.toUpperCase()}`
+    await credentials.set(ref, officeAceCredential())
+    await pool.addAccount({
+      id, provider: 'officeace', nickname: id, enabled: options.enabled ?? true,
+      credentialRef: ref, createdAt: Date.now(), refreshable: true,
+      expiresAt: Date.now() + 3_600_000,
+    })
+    return ref
+  }
+
+  const CLAIMED_BODY = {
+    bonus_skus: [{ activity_id: 'bonus-daily-checkin-2026', activity_name: '每日签到有礼', points: 100 }],
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'all-proxy-officeace-bonus-'))
+    credentials = new FileCredentialStore(dir)
+    pool = new AccountPool({ credentials, dataDir: dir })
+    resetOfficeAceBonusClaimThrottle()
+  })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('给启用中的账号领分并汇报条数/合计', async () => {
+    await addOfficeAce('officeace-a')
+    await addOfficeAce('officeace-b')
+    const fetcher: typeof fetch = vi.fn(async () => jsonResp(CLAIMED_BODY))
+    const result = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    expect(result.claimed).toBe(2)
+    // 实测每日福利是 100 分（旧注释写 1000，已按上游订正）
+    expect(result.totalPoints).toBe(200)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('上游回空桶（今天早已领过）计 alreadyClaimed，不算失败', async () => {
+    await addOfficeAce('officeace-c')
+    const fetcher: typeof fetch = vi.fn(async () => jsonResp({ bonus_skus: [] }))
+    const result = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    expect(result.alreadyClaimed).toBe(1)
+    expect(result.claimed).toBe(0)
+    expect(result.failed).toBe(0)
+  })
+
+  it('**停用的账号不领**（只影响当天额度；对弃用账号发写请求是越界）', async () => {
+    await addOfficeAce('officeace-on', { enabled: true })
+    await addOfficeAce('officeace-off', { enabled: false })
+    const fetcher: typeof fetch = vi.fn(async () => jsonResp(CLAIMED_BODY))
+    const result = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    expect(result.claimed).toBe(1)
+    expect(result.skipped).toBe(1)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
+  it('一个账号失败不影响其余账号（失败只记录，不抛错）', async () => {
+    await addOfficeAce('officeace-ok')
+    await addOfficeAce('officeace-bad')
+    let n = 0
+    const fetcher: typeof fetch = vi.fn(async () => {
+      n += 1
+      // 第一个账号失败，第二个成功
+      return n === 1 ? jsonResp({}, 500) : jsonResp(CLAIMED_BODY)
+    })
+    const result = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    expect(result.failed).toBe(1)
+    expect(result.claimed).toBe(1)
+  })
+
+  it('凭据不可读的账号跳过并留痕，不发请求', async () => {
+    const ref = `OFFICEACE_ACCOUNT_MISSING`
+    await pool.addAccount({
+      id: 'officeace-missing', provider: 'officeace', nickname: '缺凭据', enabled: true,
+      credentialRef: ref, createdAt: Date.now(), refreshable: true,
+    })
+    const fetcher: typeof fetch = vi.fn()
+    const warnings: string[] = []
+    const result = await claimOfficeAceDailyBonuses({
+      pool, credentials, fetcher,
+      logger: { info: () => {}, warn: (m) => warnings.push(m), error: () => {} },
+    })
+    expect(result.skipped).toBe(1)
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(warnings.join('\n')).toContain('凭据不可读')
+  })
+
+  it('STS 临期先续期再领（过期凭据打 claim 必失败）', async () => {
+    const ref = 'OFFICEACE_ACCOUNT_EXPIRING'
+    await credentials.set(ref, JSON.stringify({
+      modelAppKey: 'ak', modelAppSecret: 'sk', maasBaseUrl: 'https://example.com',
+      access: 'AK', secret: 'SK', securityToken: 'STS', projectId: 'p',
+      // 已过期 ⇒ isExpiring 为真
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      refreshToken: 'rt',
+      dpopPrivateJwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y' },
+    }))
+    await pool.addAccount({
+      id: 'officeace-exp', provider: 'officeace', nickname: '临期', enabled: true,
+      credentialRef: ref, createdAt: Date.now(), refreshable: true, expiresAt: Date.now() - 60_000,
+    })
+    const urls: string[] = []
+    const fetcher: typeof fetch = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input))
+      if (String(input).includes('/v1/subscription/bonus/claim')) return jsonResp(CLAIMED_BODY)
+      // 续期端点：回一份新的远期凭据（形状由 officeace-auth 决定，这里只求不抛）
+      return jsonResp({ access_token: 'n', refresh_token: 'n', expires_in: 7200 })
+    })
+    await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    // 至少发生过一次非 claim 的请求（即续期尝试）；claim 也照常发出
+    expect(urls.some((u) => u.includes('/bonus/claim'))).toBe(true)
+    expect(urls.length).toBeGreaterThan(0)
+  })
+
+  // ── 手动补领（用户要求「加个手动，防止定时任务没领到」）──
+  //
+  // 定时任务只在服务进程活着时跑：关掉服务过夜、或跨天后才启动时，
+  // 当天额度可能已经错过窗口（按 UTC+8 自然日作废）。
+
+  it('force：定时任务已领过后，手动仍会真的重领', async () => {
+    await addOfficeAce('officeace-manual')
+    const fetcher: typeof fetch = vi.fn(async () => jsonResp({ bonus_skus: [] }))
+    // 第一次（定时任务语义）：记下「今天已领」
+    await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    // 第二次（定时任务语义）：被去重表挡住
+    const again = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher })
+    expect(again.skipped).toBe(1)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    // 第三次（手动语义 force）：必须真的重打上游
+    const manual = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher, force: true })
+    expect(manual.alreadyClaimed).toBe(1)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('force：手动补领能拿到分并带出逐账号明细', async () => {
+    await addOfficeAce('officeace-gain')
+    const fetcher: typeof fetch = vi.fn(async () => jsonResp(CLAIMED_BODY))
+    const result = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher, force: true })
+    expect(result.claimed).toBe(1)
+    expect(result.totalPoints).toBe(100)
+    expect(result.results).toHaveLength(1)
+    expect(result.results[0]).toMatchObject({
+      kind: 'claimed',
+      points: 100,
+      activities: ['每日签到有礼'],
+    })
+  })
+
+  it('逐账号明细：停用/早已领过/失败分别归类（面板据此逐条显示）', async () => {
+    await addOfficeAce('officeace-det-ok', { enabled: true })
+    await addOfficeAce('officeace-det-off', { enabled: false })
+    const fetcher: typeof fetch = vi.fn(async () => jsonResp({ bonus_skus: [] }))
+    const result = await claimOfficeAceDailyBonuses({ pool, credentials, logger: noopLogger, fetcher, force: true })
+    const byId = new Map(result.results.map((r) => [r.accountId, r]))
+    expect(byId.get('officeace-det-off')?.kind).toBe('skipped')
+    expect(byId.get('officeace-det-off')?.error).toContain('停用')
+    expect(byId.get('officeace-det-ok')?.kind).toBe('already-claimed')
+    expect(result.results).toHaveLength(2)
   })
 })
