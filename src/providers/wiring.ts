@@ -597,7 +597,10 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       }),
       new QoderAdapter({
         credentialRef: `${product.id.toUpperCase()}_ACCESS_TOKEN` as never,
-        resolveCredential: () => ctx.resolveCredential(product.id) as never,
+        // ⚠️ 必须透传 modelId：空串会让模型级限流过滤整体短路，刚用完额度的
+        // 账号下次仍被选中 ⇒ 每个请求都先打一次必然失败的账号再换号
+        //（与 trae 的同名接线同因，见 `qoder-adapter.ts` 的选项注释）。
+        resolveCredential: (modelId?: string) => ctx.resolveCredential(product.id, modelId) as never,
         refresh: () => ctx.refresh(product.id),
         accountPool: ctx.pool,
         product,

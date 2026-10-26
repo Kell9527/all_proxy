@@ -1238,5 +1238,35 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       expect(marked.getUTCMilliseconds()).toBe(0)
       expect(marked.getUTCHours()).toBe(0)
     })
+
+    /**
+     * 回归：**选号必须带上 `options.model`**。
+     *
+     * 真实缺陷（2026-10-26 实测）：`wiring.ts` 的接线是
+     * `resolveCredential: () => ctx.resolveCredential(product.id)` —— 没有
+     * modelId。而 `AccountPool.getAvailableAccount` 对空串**整体短路**限流过滤
+     * （`if (modelId.length === 0) return true`），于是「额度已用尽的账号」
+     * 在每个新请求里仍被优先选中：每次请求都先打一次必然失败的账号再换号，
+     * 换号形同虚设（用户体感是「用完额度不会自动换号」）。
+     *
+     * 本用例锁死「适配器把 model 传下去」这一环：`resolveCredential` 收到的
+     * 实参必须等于本次请求的模型。
+     */
+    it('resolveCredential 必须收到本次请求的 model（否则限流过滤被短路）', async () => {
+      const seen: Array<string | undefined> = []
+      const fetchImpl = vi.fn(async () => envelopeResponse([textFrame('ok'), finishFrame])) as unknown as typeof fetch
+
+      await collectWith(makeAdapter({
+        fetchImpl,
+        resolveCredential: async (modelId?: string) => {
+          seen.push(modelId)
+          return cred
+        },
+      }), { model: 'dfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      expect(seen.length, '应至少调用一次').toBeGreaterThan(0)
+      // ⚠️ 空串 / undefined 都会让池的限流过滤短路，必须是模型 id 本身。
+      expect(seen[0], 'resolveCredential 收到的 model 不能为空').toBe('dfmodel')
+    })
   })
 })

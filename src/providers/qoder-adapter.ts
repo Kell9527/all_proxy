@@ -336,8 +336,17 @@ function resolveChunkTimeoutMs(): number {
 export interface QoderAdapterOptions {
   /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
   credentialRef: CredentialRef
-  /** 从凭据存储解析凭据。 */
-  resolveCredential: () => Promise<QoderCredential | undefined>
+  /**
+   * 从凭据存储解析凭据。
+   *
+   * ⚠️ **`modelId` 必须透传给选号器**：空串会让 `AccountPool.getAvailableAccount`
+   * 的**模型级限流过滤整体短路**（`if (modelId.length === 0) return true`），
+   * 于是刚被标记额度用尽的账号下次仍会被选中 —— 表现为「每个请求都先打一次
+   * 必然失败的账号再换号」，换号形同虚设（真实缺陷，2026-10-26 实测复现：
+   * 标记 A 的 dfmodel 受限后，传空串仍返回 A，传 'dfmodel' 才正确返回 B）。
+   * 与 `TraeAdapterOptions.resolveCredential` 的同名约束同源。
+   */
+  resolveCredential: (modelId?: string) => Promise<QoderCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
@@ -696,10 +705,13 @@ export class QoderAdapter extends LlmAdapter {
     }
 
     // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential()
+    //
+    // ⚠️ 必须传 `options.model`：选号器靠它过滤「该模型已额度用尽」的账号。
+    // 传空串会让过滤整体短路，刚用完额度的账号下次仍被选中（见选项注释）。
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isQoderExpired(credential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('qoder: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -894,7 +906,7 @@ export class QoderAdapter extends LlmAdapter {
         if (!authRefreshed) {
           authRefreshed = true
           await this.options.refresh()
-          const refreshed = await this.options.resolveCredential()
+          const refreshed = await this.options.resolveCredential(options.model)
           if (refreshed === undefined || refreshed.access_token.length === 0) {
             throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
           }
