@@ -119,6 +119,48 @@
       `provider` 必须作为第三参数传入。将来若新增直发 `/v2/chat/completions` 的代码，
       必须同样调用 `applyTencentConversationHeaders()` 与指纹改写。
 
+13. **`resolveCredential` 必须透传 `modelId`，否则「额度用尽自动换号」形同虚设**
+    （2026-10-26 用户报障「用完一个账号的额度，是不是不会自动调度到下一个」）：
+    `AccountPool.getAvailableAccount(provider, modelId)` 对**空串**会**整体短路**
+    模型级限流过滤 ——
+
+    ```ts
+    // src/pool/account-pool.ts
+    // 空 modelId（未知目标模型）：无可比对的键，保持候选不变。
+    if (modelId.length === 0) return true
+    ```
+
+    ⇒ 适配器若用 `resolveCredential()`（不传参）取号，`wiring.ts` 就只能
+    `ctx.resolveCredential(provider)`（同样不传 model），于是**刚被标记「该模型额度
+    已用尽」的账号在每个新请求里仍被优先选中**。表现：当次请求靠适配器内的换号
+    逻辑（`switchAccountOnQuota` / `tried` 排除集）确实切到了下一个账号并成功，
+    但**下一个请求又从受限账号开始** —— 每个请求都多打一次必然失败的请求。
+    用户体感是「用完额度不会自动换号，得手动把账号拖下去」，而拖拽只是碰巧避开，
+    不是机制在起作用。
+
+    **判据与修复**：凡是适配器会调 `accountPool.updateModelRateLimit(...)` 写
+    「账号+模型」限流标记的 provider，`resolveCredential` 就**必须**接受并透传
+    `modelId`。三处一起改，少一处就漏：
+    ① 适配器选项签名 `resolveCredential: (modelId?: string) => ...`；
+    ② 适配器**所有**调用点传 `options.model`（首次取号 / 过期续期后重取 /
+    认证失败刷新后重取 —— 第三处最容易漏，它在重试循环深处）；
+    ③ `wiring.ts` 接线 `(modelId?: string) => ctx.resolveCredential(id, modelId)`。
+
+    **2026-10-26 实测**（临时目录复制真实账号数据，`qodercn` 三账号）：
+    把账号 A 的 `dfmodel` 标记为受限后，
+    `getAvailableAccount('qodercn', '')` → 仍返回 **A**（错），
+    `getAvailableAccount('qodercn', 'dfmodel')` → 正确返回 **B**。
+    修复后 `qoder`（CN + 国际版）已合规，回归用例
+    `qoder-adapter.spec.ts` 的「resolveCredential 必须收到本次请求的 model」
+    锁死这一环（已反向验证：回退调用点后该用例立即失败）。
+
+    ⚠️ **当前仍未修的 5 个**（本次刻意不动，遇到再改）：`buddy` / `workbuddy`
+    （共用 `buddy-adapter.ts`）/ `cline` / `lobsterai` / `raccoon` / `sensenova`
+    —— 它们**都写** `modelRateLimit`，但 `resolveCredential` 签名是
+    `() => Promise<...>`（不接受参数），调用点也全部无参。
+    已合规的只有 **`qoder` / `qodercn` / `trae` / `loomy`**。
+    修某个 provider 时按上面①②③三处一起改，并补一条同类回归用例。
+
 ### 已移植文件清单（基线 `3611a62`）
 
 移植方式是**只改 import 行**（`@deepseek-ai/*` → 本地等价物），实现逐字保留。
@@ -528,6 +570,13 @@ npm run dev          # 开发态（tsx watch）
 
 ## 已知限制
 
+- **`buddy` / `workbuddy` / `cline` / `lobsterai` / `raccoon` / `sensenova` 的
+  「额度用尽后不自动跳过」**（2026-10-26 发现，刻意未修）：这些 provider 都会写
+  `modelRateLimits`，但 `resolveCredential` 不接受 `modelId`、调用点也无参，
+  导致 `getAvailableAccount(provider, '')` 短路限流过滤 ⇒ 额度已用尽的账号
+  在每个新请求里仍被优先选中，每个请求都白打一次再换号。`qoder` / `qodercn`
+  已于 2026-10-26 修复。**症状**：日志里同一账号的额度错误反复出现；
+  **修法**见「移植时**必须保持**的来源约定」第 13 条（三处一起改）。
 - **Loomy 没有 refresh 端点**：token 过期只能重新登录（故主路径用手机号验证码，成本低）。
 - **Loomy 的远端模型目录也曾漏接线**（2026-10-23 用户报障「loomy 模型刷新没，
   提示远端未返回目录，仍显示本地缓存（3 个模型）」）：`wiring.ts` 注册时**从未**
