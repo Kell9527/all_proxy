@@ -110,22 +110,35 @@ function isQuotaExceededError(error: unknown): boolean {
 export const PROVIDER = 'qoder'
 
 /**
- * 排队总时长上限的**默认值**（毫秒）。
+ * **单个账号**排队等待的上限（毫秒），默认 **1 分钟**。
  *
- * 2026-10-27 从 30 分钟调成 **5 分钟**：实测一次 `qodercn/dfmodel` 请求
- * （`req-55f749e3136f3afd`）在 30 分钟预算下，本地 16:32:30 发起、17:02:33
- * 才以「排队等待超时」结束 —— 用户体感就是「卡死」，而交互式使用等不起
- * 半小时。5 分钟仍足以跨过服务端要求的短排队（单次等待封顶
- * `QUEUE_MAX_DELAY_MS = 10 秒`），又不至于让 UI 长期无响应。
+ * ## 语义（2026-10-27 用户要求）
+ *
+ * > 排队超过 1 分钟就自动切账号，全部都要超过 1 分钟就直接报错
+ *
+ * ⚠️ 这是**每账号**预算，不是整请求预算 —— 换号后**重新计时**。故一次请求
+ * 的总耗时上限是「账号数 × 1 分钟」，而不是某个固定值。
+ *
+ * 为什么不再「等满预算再失败」（原实现）：Qoder 的免费模型（`isFree`，如
+ * `dfmodel` / `qfmodel`）免费池最挤，队列常常长时间不动。原实现死等同一个
+ * 账号，实测一次 `qodercn/dfmodel` 请求挂了 **30 分钟**才失败
+ * （`req-55f749e3136f3afd`，本地 16:32:30 → 17:02:33），用户体感即「卡死」。
+ * 而多账号池的价值恰恰在于**换一个号重排**——队列常与账号相关，换个账号
+ * 往往立刻就能跑。
+ *
+ * 1 分钟的取值理由：单次等待已封顶 `QUEUE_MAX_DELAY_MS = 10 秒`，1 分钟够
+ * 跨过数轮「等 2 秒就通」的瞬时排队（见 `REAL_TRANSIENT` 用例），又不会让
+ * 用户在单个账号上干等太久。
  */
-export const DEFAULT_QUEUE_TIMEOUT_MS = 5 * 60_000
+export const DEFAULT_QUEUE_TIMEOUT_MS = 60_000
 
 /**
- * 排队总时长上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
+ * 单账号排队上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
  *
  * ⚠️ **不能用 `parseInt(…) || 默认值`**：`0` 是**合法**配置（表示「不等，立即
- * 判超时」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||` 静默换成默认值
- * —— 那会让这个开关在「想关掉排队等待」时**恰好失效**。故显式判 `undefined`。
+ * 判超时 → 立刻换号」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||`
+ * 静默换成默认值 —— 那会让这个开关在「想关掉排队等待」时**恰好失效**。
+ * 故显式判 `undefined`。
  */
 export function resolveQueueTimeoutMs(): number {
   const raw = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
@@ -468,8 +481,8 @@ export class QoderAdapter extends LlmAdapter {
   /**
    * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
    *
-   * ⚠️ **必须响应 `signal`**：排队等待最长可达 30 分钟，用户中途取消会话时
-   * 不能让 generator 卡在 `setTimeout` 里 —— 那会表现为「点了停止但没反应」。
+   * ⚠️ **必须响应 `signal`**：排队等待是**每账号 1 分钟**、多账号可累加，用户中途
+   * 取消会话时不能让 generator 卡在 `setTimeout` 里 —— 那会表现为「点了停止但没反应」。
    */
   private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (this.options.sleep !== undefined) {
@@ -850,7 +863,12 @@ export class QoderAdapter extends LlmAdapter {
     // 失败 → 排队时白白续期一次，再落到 harness 的 5 次通用退避（500/1000/2000/
     // 4000/8000 ≈ 共 15.5 秒）—— 而服务端明确要求等 30 秒，于是**永远等不到**；
     // 中国版那条「等 2 秒就能成功」的瞬时排队也因走错路径而反复失败。
-    const queueDeadline = Date.now() + resolveQueueTimeoutMs()
+    // ⚠️ **排队预算是「每账号」的**（2026-10-27 用户要求），故用 `let` 而不是
+    // 一次算好的 `const`：换号时在下面**重新计时**。
+    //
+    // 语义：单账号排队累计超过 `resolveQueueTimeoutMs()`（默认 1 分钟）⇒ 换下一个
+    // 账号重排；所有账号都排不上 ⇒ 报错。故一次请求的总上限是「账号数 × 预算」。
+    let queueDeadline = Date.now() + resolveQueueTimeoutMs()
     let queueAttempts = 0
     let authRefreshed = false
     let duplicateRetried = false
@@ -893,8 +911,19 @@ export class QoderAdapter extends LlmAdapter {
         const queueInfo = parseQoderQueueError(errorText)
 
         if (queueInfo !== undefined) {
-          await this.waitForQueue(queueInfo, ++queueAttempts, queueDeadline, options)
-          continue
+          const { waited } = await this.waitForQueue(queueInfo, ++queueAttempts, queueDeadline, options)
+          if (waited) continue
+          // 本账号排队预算耗尽 ⇒ 换号重排（不标记限流，理由见 switchAccountOnQueue）。
+          const switched = await this.switchAccountOnQueue(options, triedAccounts, activeAccountId)
+          if (switched !== undefined) {
+            credential = switched.credential
+            activeAccountId = switched.accountId
+            authRefreshed = false // 新账号可再续期一次
+            queueAttempts = 0
+            queueDeadline = Date.now() + resolveQueueTimeoutMs() // 新账号重新计时
+            continue
+          }
+          throw new LlmError('qoder: 排队等待超时（所有账号均排队）', 'QUEUE', { status: response.status })
         }
 
         // ⚠️ **额度受限也要切账号**（用户要求，2026-09-27）。
@@ -958,13 +987,26 @@ export class QoderAdapter extends LlmAdapter {
           step = await iterator.next()
         } catch (error) {
           if (error instanceof ModelQueuedError) {
-            await this.waitForQueue(
+            const { waited } = await this.waitForQueue(
               queueInfoOf(error),
               ++queueAttempts,
               queueDeadline,
               options,
             )
-            queued = true
+            if (waited) {
+              queued = true
+              break
+            }
+            // 本账号排队预算耗尽 ⇒ 换号重排（与 HTTP 层同一套判据，不标记限流）。
+            const switched = await this.switchAccountOnQueue(options, triedAccounts, activeAccountId)
+            if (switched === undefined) {
+              throw new LlmError('qoder: 排队等待超时（所有账号均排队）', 'QUEUE')
+            }
+            credential = switched.credential
+            activeAccountId = switched.accountId
+            queueAttempts = 0
+            queueDeadline = Date.now() + resolveQueueTimeoutMs() // 新账号重新计时
+            queued = true // 复用「回到循环顶部重发」的语义
             break
           }
           // ⚠️ **额度受限（110）要标记 + 切账号**（用户要求，2026-09-27）。
@@ -1053,29 +1095,31 @@ export class QoderAdapter extends LlmAdapter {
    * 排队等待（HTTP 层与 SSE 层**共用**）。
    *
    * 两处形态必须走同一套判据，否则会再次出现「只修了一条路径」的缺陷。
+   *
+   * @returns `waited: true` = 已按服务端延迟等过，调用方应重发同一账号；
+   *   `waited: false` = **本账号排队预算已耗尽**，调用方应**换个账号**重排
+   *   （见 `switchAccountOnQueue`），换不到再报错。
+   *
+   * ⚠️ **不在这里抛超时错**：预算耗尽只意味着「这个账号排不上」，而池里
+   * 可能还有别的账号能立刻排上（队列常与账号相关）。抛错就等于放弃了换号，
+   * 正是 2026-10-27 用户报障「排队半小时」的成因。
    */
   private async waitForQueue(
     queueInfo: QoderQueueInfo | undefined,
     attempts: number,
     deadline: number,
     options: GenerateOptions,
-  ): Promise<void> {
+  ): Promise<{ waited: boolean }> {
     // ⚠️ **先判时间、再判次数**：时间上限是硬约束（用户可调），次数上限只是
     // 防御性兜底。反过来写会让「180 次空转」在绝大多数情况下先生效，
     // 使 `DSH_QODER_QUEUE_TIMEOUT_MS` **形同虚设**（写用例时实测到了）。
     //
-    // ⚠️ 用 `>=` 而不是 `>`：上限为 **0** 是合法配置（「不等，立即判超时」），
-    // 而同一毫秒内 `Date.now() > now + 0` 为 **false**，会让它**先等一次**才
-    // 超时 —— 那与「0 = 不等待」的语义不符（单测专门守这一点）。
-    if (Date.now() >= deadline) {
-      throw new LlmError('qoder: 排队等待超时', 'QUEUE')
-    }
-    if (attempts > QUEUE_MAX_ATTEMPTS) {
-      throw new LlmError(
-        `qoder: 排队重试超过上限（${QUEUE_MAX_ATTEMPTS} 次）`,
-        'QUEUE',
-      )
-    }    if (options.signal?.aborted === true) {
+    // ⚠️ 用 `>=` 而不是 `>`：上限为 **0** 是合法配置（「不等，立即判超时 →
+    // 立刻换号」），而同一毫秒内 `Date.now() > now + 0` 为 **false**，会让它
+    // **先等一次**才超时 —— 那与「0 = 不等待」的语义不符（单测专门守这一点）。
+    if (Date.now() >= deadline) return { waited: false }
+    if (attempts > QUEUE_MAX_ATTEMPTS) return { waited: false }
+    if (options.signal?.aborted === true) {
       throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE')
     }
     const waitMs = qoderQueueDelayMs(queueInfo)
@@ -1089,7 +1133,51 @@ export class QoderAdapter extends LlmAdapter {
     if (isAborted(options.signal)) {
       throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE')
     }
-    // ⚠️ 排队**不刷新凭据**、不换账号：它与认证和额度都无关。
+    return { waited: true }
+  }
+
+  /**
+   * 排队预算耗尽时：**换下一个账号重排**（不写限流标记）。
+   *
+   * ## 用户要求（2026-10-27）
+   *
+   * > 排队超过 1 分钟就自动切账号，全部都要超过 1 分钟就直接报错
+   *
+   * ## ⚠️ 与 `switchAccountOnQuota` 的关键差异：**不标记限流**
+   *
+   * 额度受限是**按自然日**的确定性状态 —— 该账号今天就是没额度了，故必须
+   * `updateModelRateLimit` 标到 UTC+8 当日 24:00，后续请求也别再选它。
+   *
+   * 排队是**暂时**状态 —— 队列随时会通，几分钟后同一账号照样能用。若也标记，
+   * 就会把一个好好的账号锁掉一整天（用户会看到「明明配额没用完却整天不选它」）。
+   * 故这里只用**请求级**的 `tried` 排除集：本请求不再试它，但**不写池**，
+   * 下个请求仍可正常选它。
+   *
+   * @param activeAccountId - 当前排队超时的账号（加入 `tried` 以免重选）。
+   * @returns 新凭据；无可用账号时 `undefined`（调用方据此报错）。
+   */
+  private async switchAccountOnQueue(
+    options: GenerateOptions,
+    tried: Set<string>,
+    activeAccountId: string | undefined,
+  ): Promise<{ credential: QoderCredential; accountId: string } | undefined> {
+    const pool = this.options.accountPool
+    if (pool === undefined) return undefined
+
+    // 只排除、**不标记**（与额度受限的区别，见方法注释）。
+    if (activeAccountId !== undefined && activeAccountId.length > 0) {
+      tried.add(activeAccountId)
+    }
+
+    // 传 `tried`：刚排不上的账号可能仍排在第一位，不排除就会拿回同一个、
+    // 命中下面的检查而立即放弃切换（与 `switchAccountOnQuota` 同因）。
+    const next = await pool.getAvailableAccount(this.product.id, options.model, tried)
+    if (next === null || tried.has(next.entry.id)) return undefined
+    tried.add(next.entry.id)
+
+    const credential = next.credential as QoderCredential
+    // 切号后必须重新过一遍 uid 补齐（每个账号的 uid 不同，缺了会签名无效）。
+    return { credential: await this.ensureUid(credential), accountId: next.entry.id }
   }
 
   /**

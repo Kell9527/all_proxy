@@ -756,9 +756,9 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
     })
 
     it('排队总时长上限可用 DSH_QODER_QUEUE_TIMEOUT_MS 覆盖', async () => {
-      // ⚠️ 上限判定是**时间**驱动（默认 5 分钟），单测不能真等 —— 这里设 0，
-      // 语义是「立即判超时」，从而在毫秒级验证该开关确实生效且**不被 180 次
-      // 次数上限抢先命中**（两者的判定顺序是实现细节，此用例锁住它）。
+      // ⚠️ 上限判定是**时间**驱动（默认 1 分钟），单测不能真等 —— 这里设 0，
+      // 语义是「立即判超时 → 立刻换号」，从而在毫秒级验证该开关确实生效且
+      // **不被 180 次次数上限抢先命中**（两者的判定顺序是实现细节，此用例锁住它）。
       process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '0'
       try {
         const fetchImpl = vi.fn(async () => queueResponse(REAL_QUEUED)) as unknown as typeof fetch
@@ -766,28 +766,144 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
         await expect(collectWith(makeAdapter({
           fetchImpl, sleep: async (ms) => { sleeps.push(ms) },
         }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
-          .rejects.toThrow(/排队等待超时/)
+          .rejects.toThrow(/排队/)
 
         // 上限为 0 → 第一次排队即判超时，**一次都不等**（而不是把 180 次耗完）。
+        // 无账号池 ⇒ 换不到号 ⇒ 如实报错（这正是「所有账号都排不上」的形态）。
         expect(sleeps).toEqual([])
       } finally {
         delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
       }
     })
 
-    it('排队上限默认 5 分钟（2026-10-27 从 30 分钟调小）', () => {
-      // 用户报障「排队 30 分钟太久了」：实测一次 dfmodel 请求本地 16:32:30
-      // 发起、17:02:33 才以「排队等待超时」结束。交互式使用等不起半小时。
-      // ⚠️ 断言默认值本身（而非只测可覆盖）：否则日后有人把默认值改回 30 分钟
-      // 不会有任何用例失败。环境变量未设时才走默认分支。
+    it('单账号排队上限默认 1 分钟（2026-10-27 用户要求）', () => {
+      // 用户要求：「排队超过 1 分钟就自动切账号，全部都要超过 1 分钟就直接报错」。
+      // ⚠️ 断言默认值本身（而非只测可覆盖）：否则日后有人改回大值不会有任何
+      // 用例失败。环境变量未设时才走默认分支。
       const saved = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
       delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
       try {
-        expect(DEFAULT_QUEUE_TIMEOUT_MS).toBe(5 * 60_000)
-        expect(resolveQueueTimeoutMs()).toBe(5 * 60_000)
+        expect(DEFAULT_QUEUE_TIMEOUT_MS).toBe(60_000)
+        expect(resolveQueueTimeoutMs()).toBe(60_000)
       } finally {
         if (saved === undefined) delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
         else process.env.DSH_QODER_QUEUE_TIMEOUT_MS = saved
+      }
+    })
+
+    /**
+     * ## 排队换号（2026-10-27 用户要求）
+     *
+     * > 排队超过 1 分钟就自动切账号，全部都要超过 1 分钟就直接报错
+     *
+     * ⚠️ 与额度受限的**关键差异**：排队是**暂时**状态，换号时**不写限流标记**
+     * （写标记会把好账号锁掉一整天）。
+     *
+     * 单测用**可控时钟**（mock `Date.now` + `sleep` 推进时间）在毫秒级验证，
+     * 不真等 1 分钟。
+     */
+    function makeQueuePoolStub(accounts: Array<{ id: string; token: string }>) {
+      const marks: Array<{ accountId: string; modelId: string }> = []
+      const picks: Array<ReadonlySet<string> | undefined> = []
+      let index = 0
+      const pool = {
+        updateModelRateLimit: async (accountId: string, modelId: string) => {
+          marks.push({ accountId, modelId })
+        },
+        getAvailableAccount: async (_provider: string, _model: string, exclude?: ReadonlySet<string>) => {
+          picks.push(exclude)
+          while (index < accounts.length && exclude?.has(accounts[index].id) === true) index += 1
+          if (index >= accounts.length) return null
+          const a = accounts[index]
+          return {
+            entry: { id: a.id },
+            credential: buildQoderCredential(
+              parseQoderTokenPayload({ token: a.token, refresh_token: 'r', user_id: `uid-${a.id}` }),
+              { machineId: 'm-1' },
+            ),
+          }
+        },
+      }
+      return { pool, marks, picks }
+    }
+
+    it('单账号排队超预算 ⇒ 换下一个账号（第二个成功）', async () => {
+      // 可控时钟：sleep 推进 `now`，从而在毫秒级逼近「排队累计超预算」。
+      let now = 1_000_000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '1000' // 1 秒预算（便于测试）
+      try {
+        const { pool, marks, picks } = makeQueuePoolStub([
+          { id: 'acct-A', token: 'tokA' },
+          { id: 'acct-B', token: 'tokB' },
+        ])
+        let call = 0
+        const fetchImpl = vi.fn(async () => {
+          call += 1
+          // call 1、2 是 acct-A 的两次排队（第二次时预算已耗尽 ⇒ 触发换号）；
+          // call 3 是 acct-B 的请求 ⇒ 正常返回内容。
+          if (call <= 2) return queueResponse(REAL_QUEUED)
+          return envelopeResponse([textFrame('B 可用'), finishFrame])
+        }) as unknown as typeof fetch
+
+        const chunks = await collectWith(makeAdapter({
+          fetchImpl,
+          accountPool: pool as never,
+          currentAccountId: () => 'acct-A',
+          sleep: async (ms) => { now += ms },
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+        // ① acct-A 排队累计超预算后换到了 acct-B，且 B 的请求成功
+        expect(call, '应在 A 排不上后换号重发').toBe(3)
+        expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+        // ② 取号时传了 tried（含 A），否则会拿回同一个账号
+        expect(picks.some((p) => p?.has('acct-A') === true), 'tried 必须含排队超时的账号').toBe(true)
+        // ③ ⚠️ **不写限流标记**：排队是暂时的，标记会把好账号锁一整天
+        expect(marks, '排队换号不得标记限流').toEqual([])
+      } finally {
+        nowSpy.mockRestore()
+        delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      }
+    })
+
+    it('所有账号都排队超预算 ⇒ 报错（不无限换）', async () => {
+      let now = 1_000_000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '1000'
+      try {
+        const { pool, marks } = makeQueuePoolStub([
+          { id: 'acct-A', token: 'tokA' },
+          { id: 'acct-B', token: 'tokB' },
+        ])
+        // 永远排队：两个账号都会被换到，然后无号可换 ⇒ 报错
+        const fetchImpl = vi.fn(async () => queueResponse(REAL_QUEUED)) as unknown as typeof fetch
+
+        await expect(collectWith(makeAdapter({
+          fetchImpl,
+          accountPool: pool as never,
+          currentAccountId: () => 'acct-A',
+          sleep: async (ms) => { now += ms },
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+          .rejects.toMatchObject({ code: 'QUEUE' })
+
+        // 排队换号**全程不写限流标记**（与额度受限的本质区别）
+        expect(marks, '排队路径不得写限流标记').toEqual([])
+      } finally {
+        nowSpy.mockRestore()
+        delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      }
+    })
+
+    it('无账号池时排队超预算仍如实报错（不吞错）', async () => {
+      process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '0'
+      try {
+        const fetchImpl = vi.fn(async () => queueResponse(REAL_QUEUED)) as unknown as typeof fetch
+        await expect(collectWith(makeAdapter({
+          fetchImpl, sleep: async () => {},
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+          .rejects.toMatchObject({ code: 'QUEUE' })
+      } finally {
+        delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
       }
     })
   })
@@ -888,6 +1004,61 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
 
       expect(sleeps).toEqual([2000])
+    })
+
+    /**
+     * ⚠️ **SSE 通道的排队换号**必须单独测。
+     *
+     * 真实缺陷的教训：排队有**两条**下发通道（HTTP 403 与 HTTP 200 + SSE 内嵌帧），
+     * 早期修复只覆盖一条就以为修好了。换号同理 —— 只测 HTTP 形态会让 SSE 分支
+     * 的缺陷潜伏（本次改动**反向验证时实测到**：只留 HTTP 用例时，删掉 SSE 换号
+     * 分支全部用例仍通过）。
+     */
+    it('SSE 通道排队超预算也换号（不是只顾着 HTTP 那条）', async () => {
+      let now = 1_000_000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
+      process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '1000'
+      try {
+        const marks: Array<{ accountId: string }> = []
+        let index = 0
+        const accounts = [{ id: 'acct-A', token: 'tokA' }, { id: 'acct-B', token: 'tokB' }]
+        const pool = {
+          updateModelRateLimit: async (accountId: string) => { marks.push({ accountId }) },
+          getAvailableAccount: async (_p: string, _m: string, exclude?: ReadonlySet<string>) => {
+            while (index < accounts.length && exclude?.has(accounts[index].id) === true) index += 1
+            if (index >= accounts.length) return null
+            const a = accounts[index]
+            return {
+              entry: { id: a.id },
+              credential: buildQoderCredential(
+                parseQoderTokenPayload({ token: a.token, refresh_token: 'r', user_id: `uid-${a.id}` }),
+                { machineId: 'm-1' },
+              ),
+            }
+          },
+        }
+        let call = 0
+        const fetchImpl = vi.fn(async () => {
+          call += 1
+          // A 的两次排队（第 2 次时预算耗尽 ⇒ 换号），B 的请求正常返回。
+          if (call <= 2) return sseQueueResponse(INNER_ERROR)
+          return envelopeResponse([textFrame('B 可用'), finishFrame])
+        }) as unknown as typeof fetch
+
+        const chunks = await collectWith(makeAdapter({
+          fetchImpl,
+          accountPool: pool as never,
+          currentAccountId: () => 'acct-A',
+          sleep: async (ms) => { now += ms },
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+        expect(call, 'SSE 通道也应在排不上时换号').toBe(3)
+        expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+        expect(marks, '排队换号不得写限流标记').toEqual([])
+      } finally {
+        nowSpy.mockRestore()
+        delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      }
     })
 
     it('网关形态（无 code，只有 message + type）的排队也被识别', async () => {
