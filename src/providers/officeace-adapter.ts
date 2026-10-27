@@ -26,7 +26,13 @@ import type {
   StreamChunk,
 } from '../shared/llm.js'
 import { collectImages, consumeOpenAiSse, isTransportError, serializeMessages } from '../shared/openai-compat.js'
-import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
+import {
+  OFFICEACE,
+  OFFICEACE_CATALOG_TIMEOUT_MS,
+  OFFICEACE_MODELS,
+  parseOfficeAceModels,
+  type OfficeAceRemoteModel,
+} from './officeace-product.js'
 import { basicAuthorization, isExpiring, type OfficeAceCredential } from './officeace-auth.js'
 
 /**
@@ -84,6 +90,12 @@ export interface OfficeAceAdapterOptions {
   /** 覆盖默认的 fetch（测试注入）。 */
   fetchImpl?: typeof fetch
   /**
+   * 拉取远端模型目录（`GET /v2/models`）；失败时适配器回退内置兜底表。
+   *
+   * ⚠️ 不注入时目录永久冻结在 `OFFICEACE_MODELS` 那 8 条（见 `loadModels`）。
+   */
+  fetchRemoteModels?: () => Promise<OfficeAceRemoteModel[]>
+  /**
    * 图片读取桥 —— **图片输入的必要条件**。
    *
    * 未提供时收到图片消息会报 `UNSUPPORTED_CONTENT`：静默丢图会让用户以为模型
@@ -114,6 +126,17 @@ function collectMessageImages(options: GenerateOptions): Map<string, unknown> {
 }
 
 export class OfficeAceAdapter extends LlmAdapter {
+  /** 远端模型缓存；未拉取时为 undefined。 */
+  private remoteModels: OfficeAceRemoteModel[] | undefined
+
+  /**
+   * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
+   * 见 `src/shared/llm.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   */
+  override invalidateModelCatalog(): void {
+    this.remoteModels = undefined
+  }
+
   constructor(private readonly options: OfficeAceAdapterOptions) {
     super()
   }
@@ -138,13 +161,49 @@ export class OfficeAceAdapter extends LlmAdapter {
     return { id, name: OFFICEACE.displayName }
   }
 
-  /** ⚠️ 必须同步（管理端目录不 await，同其余适配器）。 */
+  /**
+   * 完整目录（**不套黑名单**），带展示名。
+   *
+   * ⚠️ 必须同步（管理端目录不 await，同其余适配器）⇒ 这里**不触发**远端拉取，
+   * 只读已缓存的那份。`listAllModelsForAdmin` 会先 `await listModels()` 把远端
+   * 目录灌进缓存、再调本方法（顺序反了就只有兜底表）。
+   */
   listAllModels(): readonly { id: string; name: string }[] {
-    return OFFICEACE_MODELS.map((m) => ({ id: m.id, name: m.name }))
+    const source = this.remoteModels ?? OFFICEACE_MODELS
+    return source.map((m) => ({ id: m.id, name: m.name }))
+  }
+
+  /**
+   * 取（并缓存）目录：远端优先，失败回退内置兜底表。
+   *
+   * 远端目录是**按账号**下发的，故不缓存「空结果」：`/v2/models` 回空时
+   * 回退兜底表，下次调用仍会重试（空目录 = 上游异常，不是「这个账号没有模型」）。
+   */
+  private async loadModels(): Promise<OfficeAceRemoteModel[]> {
+    if (this.remoteModels !== undefined) return this.remoteModels
+    if (this.options.fetchRemoteModels !== undefined) {
+      try {
+        const fetched = await this.options.fetchRemoteModels()
+        if (fetched.length > 0) {
+          this.remoteModels = fetched
+          return fetched
+        }
+      } catch {
+        // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
+      }
+    }
+    this.remoteModels = [...OFFICEACE_MODELS].map((m) => ({ id: m.id, name: m.name }))
+    return this.remoteModels
   }
 
   /**
    * 目录：凭据可读 + `/v2/models` 可达才暴露（空目录 = 隐藏，而不是报错）。
+   *
+   * ⚠️ `probe` 与 `loadModels` 是**两道独立的闸门**，不要合并：
+   * - `probe` 判的是「这凭据在 MaaS 上还有效」⇒ 失效时返回**空目录**（隐藏分组，
+   *   与未登录同形）。若改用它来拿目录，凭据失效就会退化成播报兜底表，
+   *   用户看到 8 个模型、点了却全 401 —— 比分组消失更难查。
+   * - `loadModels` 判的是「上游目录里有什么」。
    */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     const disabled = this.options.disabledModels?.() ?? new Set<string>()
@@ -156,7 +215,8 @@ export class OfficeAceAdapter extends LlmAdapter {
     } catch {
       return []
     }
-    return OFFICEACE_MODELS
+    const all = await this.loadModels()
+    return all
       .filter((m) => !disabled.has(m.id))
       .map((m) => ({
         provider: OFFICEACE.id,
@@ -169,13 +229,17 @@ export class OfficeAceAdapter extends LlmAdapter {
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const known = OFFICEACE_MODELS.find((m) => m.id === model)
+    // 远端目录里有、兜底表里没有的模型（上游新增）也能给出美化名。
+    const name = known?.name
+      ?? this.remoteModels?.find((m) => m.id === model)?.name
+      ?? model
     return {
       provider,
       id: model,
-      name: known?.name ?? model,
+      name,
       inputModalities: isMultimodalModel(model) ? (['text', 'image'] as const) : (['text'] as const),
       // ⚠️ **未知 id 不编造 `context`**：拿一个猜测值会让自动压缩按错误阈值决策
-      //    —— 如实 `undefined` 比编一个数诚实。
+      //    —— 如实 `undefined` 比编一个数诚实。（远端目录同样不带窗口信息。）
       ...(known === undefined ? {} : { context: { contextWindow: known.contextWindow } }),
     }
   }
@@ -392,6 +456,34 @@ export class OfficeAceAdapter extends LlmAdapter {
     if (status >= 500) return '华为云服务端错误：稍后重试'
     return '请确认 OfficeAce 账号已登录且有可用额度'
   }
+}
+
+/**
+ * 远端目录拉取（供 wiring 注入 `fetchRemoteModels`）。
+ *
+ * `GET {maasBaseUrl}/v2/models`，Basic 鉴权与推理同源。非 2xx / 解析出空目录
+ * 一律抛错，由适配器回退兜底表（目录是展示信息，不该让 provider 报错）。
+ *
+ * ⚠️ **必须用凭据里按账号下发的 `maasBaseUrl`**：硬编码默认域对该账号回
+ * 401 `APIG.1009`（见 {@link maasBaseUrlOf}），目录会永远退回兜底表 —— 这正是
+ * 本函数接上远端之前的实际状态。
+ */
+export async function fetchOfficeAceRemoteModels(
+  credential: OfficeAceCredential,
+  fetcher: typeof fetch = fetch,
+): Promise<OfficeAceRemoteModel[]> {
+  const key = typeof credential.modelAppKey === 'string' ? credential.modelAppKey.trim() : ''
+  const secret = typeof credential.modelAppSecret === 'string' ? credential.modelAppSecret.trim() : ''
+  if (key.length === 0 || secret.length === 0) throw new Error('officeace: 凭据缺 modelAppKey/modelAppSecret')
+  const response = await fetcher(`${maasBaseUrlOf(credential)}${OFFICEACE.modelsPath}`, {
+    method: 'GET',
+    headers: { Authorization: basicAuthorization(credential), Accept: 'application/json' },
+    signal: AbortSignal.timeout(OFFICEACE_CATALOG_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`officeace 远端目录 HTTP ${response.status}`)
+  const models = parseOfficeAceModels(await response.json() as unknown)
+  if (models.length === 0) throw new Error('officeace 远端目录为空，使用兜底表')
+  return models
 }
 
 /** 传输级错误判定（供接线层复用，与其余适配器同义）。 */

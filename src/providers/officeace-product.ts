@@ -87,3 +87,98 @@ export const OFFICEACE_MODELS = [
 
 /** 单模型上限兜底（目录未返回时用）。 */
 export const FALLBACK_CONTEXT_WINDOW = 131_072
+
+/**
+ * 远端目录条目。
+ *
+ * ⚠️ 与 `OFFICEACE_MODELS` 不同，**上游只返回 `id`**（`{id, object, created,
+ * owned_by}`），既没有展示名也没有上下文窗口/多模态能力。`name` 由
+ * {@link officeaceDisplayName} 本地生成。
+ */
+export interface OfficeAceRemoteModel {
+  readonly id: string
+  readonly name: string
+}
+
+/** `/v2/models` 的请求超时（目录是展示信息，不该像推理那样等十分钟）。 */
+export const OFFICEACE_CATALOG_TIMEOUT_MS = 20_000
+
+/**
+ * 厂商名前缀（用于把裸 id 美化成展示名）。
+ *
+ * 只覆盖上游目录里实际出现过的厂商；不在表里的段走通用首字母大写。
+ * 词表**故意做小**：写错了会把 `zhipu` 这类未知段硬套成错误的大小写，
+ * 而首字母大写至少不会歪曲 id。
+ */
+const OFFICEACE_VENDOR_NAMES: Readonly<Record<string, string>> = {
+  deepseek: 'DeepSeek',
+  glm: 'GLM',
+  kimi: 'Kimi',
+  qwen: 'Qwen',
+  openpangu: 'OpenPangu',
+}
+
+/**
+ * 上游模型 id → 展示名。
+ *
+ * 兜底表命中时用表里的美化名（`deepseek-v4.1-flash` → `DeepSeek-V4.1-Flash`）；
+ * 否则把 id 按 `-`/`.` 分段、厂商段查词表、其余段首字母大写
+ * （`kimi-k3.1-pro` → `Kimi-K3.1-Pro`）。
+ *
+ * ⚠️ **不返回裸 id**：上游目录不带 name，若直接回显 id，模型选择器会显示
+ * `deepseek-v4.1-flash-1017` 这种机器标识 —— 与 SenseNova 接远端目录时踩过的
+ * 同款体验回退（那边是「远端 name 等于 id」，这边是「远端根本不返回 name」）。
+ */
+export function officeaceDisplayName(id: string): string {
+  const known = OFFICEACE_MODELS.find((model) => model.id === id)
+  if (known !== undefined) return known.name
+  return id.split('-').map((segment) => {
+    const [head, ...rest] = segment.split('.')
+    const vendor = OFFICEACE_VENDOR_NAMES[(head ?? '').toLowerCase()]
+    const prettyHead = vendor ?? (/^\d/.test(head ?? '') || head === undefined
+      ? (head ?? '')
+      : head.charAt(0).toUpperCase() + head.slice(1))
+    return [prettyHead, ...rest].filter((part) => part.length > 0).join('.')
+  }).join('-')
+}
+
+/**
+ * 测试档模型 id 的判据（`glm-5.3-test`、`kimi-k3-test-1009`）。
+ *
+ * 兜底表**从来没有**暴露过 test 档（原型注释：「全部 11 个里 2 个 test 档不暴露」）。
+ * 接远端目录时若不过滤，这些上游灰度条目会涌进模型选择器 —— 用户选了它们
+ * 得到的可能是随时下线的内部版本。故保留原有的收窄口径。
+ */
+const OFFICEACE_TEST_MODEL_RE = /-test(?:-|$)/
+
+/**
+ * 解析 `/v2/models` 响应。
+ *
+ * 实测结构为 `{object: 'list', data: [{id, object, created, owned_by}, …]}`；
+ * 同时兼容顶层直接是数组、以及条目是裸字符串的形态 —— 上游改形状时不必
+ * 再发一版（多认一种形态的成本远低于「目录突然全空」）。
+ *
+ * 空 id 与 test 档一律丢弃；**不做去重以外的重排**：上游顺序即官方 IDE 的
+ * 渲染序，擅自排序会让「常用的排前面」这种错觉成真。
+ */
+export function parseOfficeAceModels(payload: unknown): OfficeAceRemoteModel[] {
+  const rows = Array.isArray(payload)
+    ? payload
+    : (payload !== null && typeof payload === 'object' && Array.isArray((payload as { data?: unknown }).data))
+      ? (payload as { data: unknown[] }).data
+      : []
+
+  const seen = new Set<string>()
+  const models: OfficeAceRemoteModel[] = []
+  for (const row of rows) {
+    const id = typeof row === 'string'
+      ? row.trim()
+      : (row !== null && typeof row === 'object' && typeof (row as { id?: unknown }).id === 'string'
+          ? (row as { id: string }).id.trim()
+          : '')
+    if (id.length === 0 || seen.has(id) || OFFICEACE_TEST_MODEL_RE.test(id)) continue
+    seen.add(id)
+    models.push({ id, name: officeaceDisplayName(id) })
+  }
+  return models
+}

@@ -316,7 +316,7 @@ import { TraeAdapter } from './trae-adapter.js'
 import { ClineAdapter } from './cline-adapter.js'
 import { LoomyAdapter, fetchLoomyRemoteModels } from './loomy-adapter.js'
 import { RaccoonAdapter } from './raccoon-adapter.js'
-import { OfficeAceAdapter } from './officeace-adapter.js'
+import { OfficeAceAdapter, fetchOfficeAceRemoteModels } from './officeace-adapter.js'
 import { AccioAdapter } from './accio-adapter.js'
 import { SensenovaAdapter, fetchSensenovaRemoteModels } from './sensenova-adapter.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
@@ -369,6 +369,29 @@ async function firstUsableRaccoonCredential(pool: AccountPool): Promise<RaccoonC
   for (const entry of pool.listAccountsByProvider(RACCOON.id)) {
     const credential = await pool.resolveCredentialForAccount(entry.id) as RaccoonCredential | undefined
     if (typeof credential?.access_token === 'string' && credential.access_token.length > 0) return credential
+  }
+  return undefined
+}
+
+/**
+ * 取 OfficeAce 账号池里第一个**凭据可解析且含 MaaS Basic 凭据**的账号。
+ *
+ * 与 {@link firstUsableRaccoonCredential} 同源取舍：按用户拖拽顺序短路返回，
+ * **不**按 `enabled` 与限流/积分分档过滤。
+ *
+ * ⚠️ **不能用 `ctx.resolveCredential('officeace')`**：那条路径走
+ * `officeaceExpirySelector`（按积分到期分档选号），今日积分用尽或锁定永久积分时
+ * 会**抛错**，把「拉目录」连坐成失败 —— 与 Loomy 踩过的坑同型。目录与积分无关。
+ * ⚠️ `modelAppKey` / `modelAppSecret` 缺一不可：缺了上游必然 401，跳过不发注定
+ * 失败的请求；同时取 `maasBaseUrl`（按账号下发，硬编码默认域会 401 `APIG.1009`）。
+ */
+async function firstUsableOfficeAceCredential(pool: AccountPool): Promise<OfficeAceCredential | undefined> {
+  for (const entry of pool.listAccountsByProvider(OFFICEACE.id)) {
+    const credential = await pool.resolveCredentialForAccount(entry.id) as OfficeAceCredential | undefined
+    if (credential === undefined) continue
+    const hasKey = typeof credential.modelAppKey === 'string' && credential.modelAppKey.trim().length > 0
+    const hasSecret = typeof credential.modelAppSecret === 'string' && credential.modelAppSecret.trim().length > 0
+    if (hasKey && hasSecret) return credential
   }
   return undefined
 }
@@ -804,7 +827,9 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
   registry.register(
     descriptorFor('officeace', OFFICEACE.displayName, OFFICEACE.defaultBaseUrl, {
       authKind: 'custom',
-      catalogSource: 'static-only',
+      // 远端 `/v2/models` 只回 id（无能力元数据），但**模型清单本身以远端为准**
+      // —— 上游上下架/换型号必须反映到选择器。能力（多模态）仍查静态实测表。
+      catalogSource: 'remote-first',
       supportsImages: true,
       rotatesAccounts: false,
     }),
@@ -839,6 +864,17 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       },
       refresh: () => ctx.refresh('officeace'),
       readImage: ctx.readImage,
+      // ⚠️ 这条接线**曾缺失**（2026-10-27 用户报障「OfficeAce 8 个模型、远端未返回
+      //    目录」）：未注入时适配器只播报 `OFFICEACE_MODELS` 里 2026-10-13 写死的
+      //    8 条，而上游 `/v2/models` 当时已返回 **26 条**（新增 kimi-k3 系列、
+      //    openpangu、deepseek-v4-pro 等）。点「刷新模型目录」得到的「远端未返回
+      //    目录」是**误导性文案** —— 不是远端挂了，而是根本没有远端请求。
+      //    这是同一个缺陷的第 5 次重演（codearts / raccoon / sensenova / loomy 之后）。
+      fetchRemoteModels: () => fetchRemoteCatalog('officeace', async () => {
+        const credential = await firstUsableOfficeAceCredential(ctx.pool)
+        if (credential === undefined) return []
+        return fetchOfficeAceRemoteModels(credential, fetcher)
+      }),
     }),
   )
 

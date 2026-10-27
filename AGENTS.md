@@ -256,6 +256,40 @@ UTC+8 当日 24:00）。
   同一把），refresh_token **一次性**（进 `ROTATING_REFRESH_PROVIDERS` + `RefreshCoordinator`）。
   裁掉了来源的 Windows 迁移桥（Redis 6399 / DPAPI / PowerShell）与本地 `127.0.0.1:3004`
   API / 订阅磁盘缓存（多账号下本地 cookie 无法按 ref 区分账号，缓存则是第二个数据源）。
+  **模型目录走远端**（2026-10-27 修，用户报障「为什么这个不会刷新缓存？」）：
+  面板「模型列表」恒显示 `8 个模型` + `远端未返回目录，仍显示本地缓存（8 个模型）`，
+  点「刷新模型目录」纹丝不动。根因是 `wiring.ts` 注册时**从未**传
+  `fetchRemoteModels`，适配器连这个选项都不存在，`listModels` 恒返回
+  `OFFICEACE_MODELS` 里 2026-10-13 写死的 8 条 —— 而上游 `/v2/models` 实测已返回
+  **26 条**（新增 kimi-k3 系列、openpangu、deepseek-v4-pro、glm-5.3-flash 等）。
+  那句「远端未返回目录」是**误导性文案**：不是远端挂了，而是根本没有远端请求。
+  ⚠️ 这是同一个缺陷的**第 5 次重演**（codearts / raccoon / sensenova / loomy 之后），
+  模板与另外四家同构：`fetchRemoteModels` 选项 + `remoteModels` 缓存 +
+  `invalidateModelCatalog()` + `wiring.ts` 的 `fetchRemoteCatalog('officeace', …)`。
+  六个必守点：
+  - **目录端点与 probe 是同一个 `/v2/models`**，只能靠请求头区分：`probe()` 只发
+    `Authorization`，`fetchOfficeAceRemoteModels()` 另发 `Accept: application/json`。
+    两者语义**不可合并**：probe 判「凭据还有效」，失效时返回**空目录**（隐藏分组，
+    与未登录同形）；拿它当目录来源的话，凭据一失效就退化成播报兜底表，用户看到
+    8 个模型、点了却全 401。
+  - **目录取号不能走 `ctx.resolveCredential('officeace')`**：那条路径是
+    `officeaceExpirySelector`（按积分到期分档），今日额度用尽或锁定永久积分时会
+    **抛错**，把「拉目录」连坐成失败。用 `firstUsableOfficeAceCredential`
+    （`listAccountsByProvider` 顺序、不按 `enabled`/积分过滤），与 Loomy/Raccoon 同源。
+  - **必须用凭据里按账号下发的 `maasBaseUrl`**（打硬编码默认域 = 401 `APIG.1009`
+    ⇒ 静默退兜底表，与本文件第 ① 条同因）。
+  - **上游只返回 `{id, object, created, owned_by}`，没有 `name`** ⇒ 展示名必须本地生成
+    （`officeaceDisplayName`：兜底表命中用表里的美化名，否则按 `-`/`.` 分段、
+    厂商段查词表、其余段首字母大写）。漏了这层，模型选择器会从 `DeepSeek-V4.1-Flash`
+    退化成裸 id `deepseek-v4.1-flash-1017` —— 与 SenseNova 接远端目录时踩过的体验回退同型。
+  - **`-test` 档必须过滤**（`glm-5.3-test`、`kimi-k3-test-1009`）：兜底表从来没暴露过
+    上游灰度条目，接了远端不滤就会涌进选择器。实测 26 条过滤后是 **24 条**。
+  - **`catalogSource` 改成 `remote-first`**（原为 `static-only`）。注意这个字段本身
+    **没有行为消费点**（只是描述），真正的行为来自 `fetchRemoteModels` 是否注入 ——
+    所以只改描述不接线等于没改。
+  回归用例：`tests/unit/officeace-remote-catalog.spec.ts`（14 条，含
+  `refreshModelCatalog` 端到端「刷新后能看到上游新增」）。⚠️ 写这类用例时注意
+  `probe` 走的是**全局 `fetch`**，不是注入的 `fetcher`，必须同时 `vi.stubGlobal('fetch', …)`。
   **积分**（2026-10-14 补齐，用户报障「本地仅显示登录状态，无其它显示」）：V11-HMAC-SHA256
   签名云侧直读 `GET {defaultBaseUrl}/v1/subscription`（`officeace-credits.ts`，三条签名
   规则见文件头），**每日福利**走 `POST /v1/subscription/bonus/claim`（实测活动
@@ -366,11 +400,12 @@ UTC+8 当日 24:00）。
 `expiry-sync` / `accio-credits` / `officeace-credits` /
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
-`login-window-policy` / `officeace-dedupe` / `officeace-login` / `account-phone` /
-`static-key-entry` / `officeace-expiry-rank` / `officeace-expiry-selector` /
-`officeace-consume-order` / `qoder-catalog` / `raccoon-remote-catalog` /
-`reasoning-effort-passthrough`）。
-当前 **152 个文件 3500 条用例**（2026-10-23 实测；其中
+`login-window-policy` / `officeace-dedupe` / `officeace-login` /
+`account-phone` / `static-key-entry` / `officeace-expiry-rank` /
+`officeace-expiry-selector` / `officeace-consume-order` /
+`officeace-remote-catalog` / `qoder-catalog` /
+`raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
+当前 **153 个文件 3515 条用例**（2026-10-27 实测；其中
 `buddy-oauth.spec.ts` 1 条 + `officeace-expiry-selector.spec.ts` 3 条是
 **时间相关的既有用例**失败 —— fixture 的到期时间锚在 2026-10-15，已过期，
 与本项目改动无关，`git stash` 后在改动前的基线上复现同样 4 条；
@@ -566,8 +601,6 @@ npm run dev          # 开发态（tsx watch）
 声明了上游不认的档位（如给 raccoon 加 `medium`），网关会按自己的默认表夹取，
 最终仍与预期不符。
 
-
-
 ## 已知限制
 
 - **`buddy` / `workbuddy` / `cline` / `lobsterai` / `raccoon` / `sensenova` 的
@@ -589,8 +622,13 @@ npm run dev          # 开发态（tsx watch）
   `ctx.resolveCredential` —— 后者按余额分档选号，今日额度用尽或锁定永久积分时会
   抛错，把「拉目录」连坐成失败；③ 上游实际 10 条 chat（含 `auto` 自动路由），
   比兜底表多 2 条。⚠️ 这是同一个缺陷的**第 4 次重演**（CodeArts 漏 `glm-5.3`、
-  Raccoon 漏 `sn-deepseek-v4-1-flash-1017`、SenseNova 漏 `deepseek-v4.1-flash`）：
+  Raccoon 漏 `sn-deepseek-v4-1-flash-1017`、SenseNova 漏 `deepseek-v4.1-flash`、
+  **OfficeAce 漏 24 条（2026-10-27，见上文 OfficeAce 条目）**）：
   新增 provider 时必须同时确认 `fetchRemoteModels` 接线，否则兜底表会永久冻结。
+  ⚠️ **判据只有一条**：`grep -n "fetchRemoteModels" src/providers/wiring.ts` 里
+  每个 provider 都必须命中。`catalogSource: 'remote-first'` **不能**作为依据 ——
+  那个字段没有任何行为消费点，写对了也不代表真的会发请求（OfficeAce 一直写着
+  `static-only`，改成 `remote-first` 本身也不会让它开始拉远端）。
 - **`codearts` / `trae` 的 refresh token 一次性轮换**：从 DSH 导入后，建议只让一边刷新，
   否则两边会互相作废。
 - **Raccoon 每日 300 积分的「当日登录」触发端点已确证为 `GET /api/web/office/v3/setting_info`**
