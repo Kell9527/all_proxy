@@ -578,6 +578,21 @@ export class LoginOrchestrator {
           // 新凭据写回既有 ref：OfficeAce 的 refresh_token 一次性轮换，
           // 旧那份已作废，不写回会让该账号下次刷新必失败。
           await this.options.credentials.set(existing.credentialRef, outcome.access)
+          // 凭据换新了，条目上的元数据也要跟上 —— 否则面板显示的是上一份
+          // 凭据的过期时间，续期调度也会按旧值判断（`refreshDueAccounts`
+          // 读的正是条目上的 `expiresAt`）；`refreshable` 同理，重新登录
+          // 可能让一个不可续期的账号变得可续期（或反之）。
+          // ⚠️ `updateAccount` 会替换池内对象，故更新后必须**回读**，
+          // 不能沿用 `existing`（它已不在池里）。
+          const patch: Partial<Pick<ProviderAccountEntry, 'expiresAt' | 'refreshable'>> = {}
+          if (outcome.expires > 0 && outcome.expires !== existing.expiresAt) {
+            patch.expiresAt = outcome.expires
+          }
+          if (outcome.refreshable !== existing.refreshable) patch.refreshable = outcome.refreshable
+          if (Object.keys(patch).length > 0) {
+            await this.options.pool.updateAccount(existing.id, patch)
+            return { entry: this.options.pool.findAccount(existing.id) ?? existing, reused: true }
+          }
           return { entry: existing, reused: true }
         }
       } catch (error) {

@@ -41,6 +41,7 @@ import { createUsageRecorder } from './usage/recorder.js'
 import { RotatingLogger, loggerAdapter } from './usage/logger.js'
 import { LoginOrchestrator } from './login/orchestrator.js'
 import { findExistingOfficeAceAccount } from './login/officeace-dedupe.js'
+import { findExistingQoderAccount, QODER_DEDUPE_PROVIDERS } from './login/qoder-dedupe.js'
 import { RefreshCoordinator } from './pool/refresh-coordinator.js'
 import { refreshAccountOnce } from './refresh/refresh-account.js'
 import { claimOfficeAceDailyBonuses, refreshDueAccounts } from './refresh/runtime-helpers.js'
@@ -301,9 +302,16 @@ async function startServe(): Promise<{ port: number; host: string; adminBootstra
     logger,
     // OfficeAce 判重：SSO 静默授权会让用户不小心把同一账号授权多次，
     // 不判重就会在池里堆出多条指向同一账号的条目（用户报障「重复登录多次」）。
-    dedupe: async (provider, credentialJson) => (
-      provider === 'officeace' ? findExistingOfficeAceAccount(pool, credentialJson) : undefined
-    ),
+    // Qoder 系同因（用户 2026-10-27 报障「同一个账号可以多次登录，增加多个
+    // 条目」）：按凭据 `uid` 判重，且只在同 provider 内比对（两站 uid 不可
+    // 跨站推断，判错会丢账号 —— 见 `qoder-dedupe.ts` 的文件头）。
+    dedupe: async (provider, credentialJson) => {
+      if (provider === 'officeace') return findExistingOfficeAceAccount(pool, credentialJson)
+      if (QODER_DEDUPE_PROVIDERS.has(provider)) {
+        return findExistingQoderAccount(pool, provider, credentialJson)
+      }
+      return undefined
+    },
   })
 
   const server = createGatewayServer({

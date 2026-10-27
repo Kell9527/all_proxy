@@ -400,12 +400,12 @@ UTC+8 当日 24:00）。
 `expiry-sync` / `accio-credits` / `officeace-credits` /
 `credits-endpoint-accio-officeace` / `credit-expiry` / `permanent-lock` /
 `provider-toggle` / `provider-switch-api` / `instance-watchdog` /
-`login-window-policy` / `officeace-dedupe` / `officeace-login` /
+`login-window-policy` / `officeace-dedupe` / `qoder-dedupe` / `officeace-login` /
 `account-phone` / `static-key-entry` / `officeace-expiry-rank` /
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **153 个文件 3515 条用例**（2026-10-27 实测；其中
+当前 **154 个文件 3527 条用例**（2026-10-27 实测；其中
 `buddy-oauth.spec.ts` 1 条 + `officeace-expiry-selector.spec.ts` 3 条是
 **时间相关的既有用例**失败 —— fixture 的到期时间锚在 2026-10-15，已过期，
 与本项目改动无关，`git stash` 后在改动前的基线上复现同样 4 条；
@@ -600,6 +600,48 @@ npm run dev          # 开发态（tsx watch）
 这类中间层的模型声明 `thinking.levels` 时，**声明的也必须落在该上游的白名单内**——
 声明了上游不认的档位（如给 raccoon 加 `medium`），网关会按自己的默认表夹取，
 最终仍与预期不符。
+
+## 账号判重（重复登录不堆条目）
+
+**Qoder 系（`qoder` / `qodercn`）与 OfficeAce 共用同一个判重钩子**
+（`LoginOrchestratorOptions.dedupe`，接线在 `src/index.ts` 的
+`new LoginOrchestrator({ …, dedupe })`）：
+
+| provider | 判重键 | 模块 |
+|---|---|---|
+| `officeace` | 凭据 `accountId` | `src/login/officeace-dedupe.ts` |
+| `qoder` / `qodercn` | 凭据 `uid`（兼容旧字段 `user_id`） | `src/login/qoder-dedupe.ts` |
+
+**Qoder 为什么要判重**（2026-10-27 用户报障「Qoder (中国版) 账号管理 —— 同一个
+账号可以多次登录，增加多个条目，这是不合理的」）：`data/state.json` 里实测有三条
+`qodercn` 条目（`qodercn-699b9c20` / `cc8226cf` / `0eb78dfc`）的凭据 `uid`
+**逐字相同**（`01a0b3…fa77`）—— 同一上游账号被登录三次堆成三条。危害与 OfficeAce
+的重复条目同型：选号时反复命中同一个上游账号，用户以为在轮换，而额度其实是同一个
+账号的，用完就一起用完。
+
+四条纪律：
+
+1. **判重键取 `uid` 不取 `machine_id`**：`machine_id` 是**本插件每次登录新生成**的
+   随机 UUID（`createQoderDeviceSession`），重新登录必然不同 —— 拿它判重等于永远
+   不命中。`uid` 来自设备码响应的 `user_id`，按账号稳定，且续期
+   （`applyQoderRefresh`）会**保留**它，故登录与续期两条路径都能拿到同一个值。
+2. **必须按 provider 隔离**：`qoder` 与 `qodercn` 是两个站点，各自下发自己的
+   `uid`，数值相同**不**代表同一账号。「看起来相同的 uid 是否真是同一个账号」
+   无法跨站推断，而判错方向会**丢账号**（把两个不同账号合成一个），代价远大于
+   重复条目。故 `findExistingQoderAccount` 只在同 provider 的账号里比对。
+3. **读不到 `uid` 时不判重**（宁可重复也不误判）—— 与 `officeace-dedupe.ts` 同款。
+   新增判重 provider 时沿用这条，不要为了「看起来更干净」而在判据缺失时猜。
+4. **判重命中时条目元数据也要跟上**：新凭据写回既有 ref 之后，若本次登录给出了
+   不同的 `expires` / `refreshable`，`settleInternal` 会 `updateAccount` 同步到
+   条目上 —— 否则面板显示的是上一份凭据的过期时间，`refreshDueAccounts` 也会按
+   旧值判断续期（它读的正是条目上的 `expiresAt`）。⚠️ `updateAccount` 会**替换**
+   池内对象，更新后必须回读（`findAccount`），不能沿用旧引用。
+
+回归用例 `tests/unit/qoder-dedupe.spec.ts`（12 条），其中一条**反向**用例
+（不接判重钩子时确实堆出重复条目）锁住「判重钩子是这条链路的必要环」。
+
+⚠️ 用户现有的重复条目**不会**被本次改动自动清掉（判重只拦新登录）。要合并存量
+重复条目需在面板里手动删除多余的那几条。
 
 ## 已知限制
 
