@@ -110,17 +110,28 @@ function isQuotaExceededError(error: unknown): boolean {
 export const PROVIDER = 'qoder'
 
 /**
+ * 排队总时长上限的**默认值**（毫秒）。
+ *
+ * 2026-10-27 从 30 分钟调成 **5 分钟**：实测一次 `qodercn/dfmodel` 请求
+ * （`req-55f749e3136f3afd`）在 30 分钟预算下，本地 16:32:30 发起、17:02:33
+ * 才以「排队等待超时」结束 —— 用户体感就是「卡死」，而交互式使用等不起
+ * 半小时。5 分钟仍足以跨过服务端要求的短排队（单次等待封顶
+ * `QUEUE_MAX_DELAY_MS = 10 秒`），又不至于让 UI 长期无响应。
+ */
+export const DEFAULT_QUEUE_TIMEOUT_MS = 5 * 60_000
+
+/**
  * 排队总时长上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
  *
  * ⚠️ **不能用 `parseInt(…) || 默认值`**：`0` 是**合法**配置（表示「不等，立即
- * 判超时」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||` 静默换成 30 分钟
+ * 判超时」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||` 静默换成默认值
  * —— 那会让这个开关在「想关掉排队等待」时**恰好失效**。故显式判 `undefined`。
  */
-function resolveQueueTimeoutMs(): number {
+export function resolveQueueTimeoutMs(): number {
   const raw = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
-  if (raw === undefined || raw.length === 0) return 30 * 60_000
+  if (raw === undefined || raw.length === 0) return DEFAULT_QUEUE_TIMEOUT_MS
   const parsed = Number.parseInt(raw, 10)
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 30 * 60_000
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_QUEUE_TIMEOUT_MS
 }
 
 /**

@@ -5,9 +5,11 @@ import { dirname, resolve } from 'node:path'
 import {
   QoderAdapter,
   QODER_QUEUE_MAX_ATTEMPTS,
+  DEFAULT_QUEUE_TIMEOUT_MS,
   nextUtc8DayStartMs,
   parseQoderQueueError,
   qoderQueueDelayMs,
+  resolveQueueTimeoutMs,
 } from '../../src/providers/qoder-adapter.js'
 import { QODER } from '../../src/providers/qoder-product.js'
 import { buildQoderCredential, parseQoderTokenPayload, type QoderCredential } from '../../src/providers/qoder.js'
@@ -754,7 +756,7 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
     })
 
     it('排队总时长上限可用 DSH_QODER_QUEUE_TIMEOUT_MS 覆盖', async () => {
-      // ⚠️ 上限判定是**时间**驱动（默认 30 分钟），单测不能真等 —— 这里设 0，
+      // ⚠️ 上限判定是**时间**驱动（默认 5 分钟），单测不能真等 —— 这里设 0，
       // 语义是「立即判超时」，从而在毫秒级验证该开关确实生效且**不被 180 次
       // 次数上限抢先命中**（两者的判定顺序是实现细节，此用例锁住它）。
       process.env.DSH_QODER_QUEUE_TIMEOUT_MS = '0'
@@ -770,6 +772,22 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
         expect(sleeps).toEqual([])
       } finally {
         delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      }
+    })
+
+    it('排队上限默认 5 分钟（2026-10-27 从 30 分钟调小）', () => {
+      // 用户报障「排队 30 分钟太久了」：实测一次 dfmodel 请求本地 16:32:30
+      // 发起、17:02:33 才以「排队等待超时」结束。交互式使用等不起半小时。
+      // ⚠️ 断言默认值本身（而非只测可覆盖）：否则日后有人把默认值改回 30 分钟
+      // 不会有任何用例失败。环境变量未设时才走默认分支。
+      const saved = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+      try {
+        expect(DEFAULT_QUEUE_TIMEOUT_MS).toBe(5 * 60_000)
+        expect(resolveQueueTimeoutMs()).toBe(5 * 60_000)
+      } finally {
+        if (saved === undefined) delete process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+        else process.env.DSH_QODER_QUEUE_TIMEOUT_MS = saved
       }
     })
   })
