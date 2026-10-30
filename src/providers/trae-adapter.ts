@@ -324,6 +324,20 @@ function userContentParts(
         : { type: 'image_url', image_url: { url } })
       continue
     }
+    // ⚠️⚠️ **入站本来就是 `image_url` 的块必须原样透传**（2026-10-29 真实缺陷，
+    // 与 `shared/openai-compat.ts` 同因同修）：网关把图片直接交成上游要的
+    // `{type:'image_url', image_url:{url}}` 形态，**没有** harness 原生
+    // `{type:'image', attachment}` 块 ⇒ `collectImages()` 零命中 ⇒ `imageUrls`
+    // 是 undefined。漏了这条，图会被静默丢弃（HTTP 200、上游零报错，
+    // 模型只回「我看不到图片」）。
+    if (block.type === 'image_url') {
+      const url = (block as { image_url?: { url?: unknown } }).image_url?.url
+      if (typeof url === 'string' && url.length > 0) {
+        hasImage = true
+        parts.push({ type: 'image_url', image_url: { url } })
+      }
+      continue
+    }
     if (block.type === 'tool-result' && Array.isArray(block.content)) {
       const inner = userContentParts(block.content, imageUrls)
       if (inner !== undefined) {
@@ -465,8 +479,17 @@ function serializeTraeMessages(
         typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result',
     )
     const text = contentToText(message.content)
-    // 图片：仅当本请求带图（imageUrls 非 undefined）时升级为多模态 parts。
-    const parts = imageUrls === undefined ? undefined : userContentParts(content, imageUrls)
+    // 图片：本请求带图（imageUrls 非 undefined）**或**内容里自带 `image_url` 块时
+    // 升级为多模态 parts。
+    //
+    // ⚠️ 后半句是 2026-10-29 的真实缺陷修复（与 `shared/openai-compat.ts` 同因同修）：
+    // 网关把图片直接交成 `{type:'image_url', image_url:{url}}`，**没有** harness
+    // 附件 ref ⇒ `imageUrls` 是 undefined。若仍按「有表才升级」，图被静默丢弃。
+    const carriesInlineImage = content.some((block) =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image_url')
+    const parts = imageUrls === undefined && !carriesInlineImage
+      ? undefined
+      : userContentParts(content, imageUrls ?? new Map())
     if (parts !== undefined) {
       // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
       flushToolImages()

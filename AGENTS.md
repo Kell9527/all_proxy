@@ -164,6 +164,30 @@
     已合规的只有 **`qoder` / `qodercn` / `trae` / `loomy`**。
     修某个 provider 时按上面①②③三处一起改，并补一条同类回归用例。
 
+14. **入站 `image_url` 块必须原样透传，不能只认 harness 原生附件块**
+    （2026-10-29 用户报障「qoder cn 的 DeepSeek-Flash · 免费 无法识别图片」）：
+    网关把图片交成上游要的 `{type:'image_url', image_url:{url}}` 形态
+    （`/v1/messages` 由 `anthropic-protocol.ts` 翻译，OpenAI 原生请求本就如此），
+    **没有** harness 的 `{type:'image', attachment}` 块。而共享序列化层只认后者，
+    于是两处同因、缺一不可：
+    ① `collectImages()` 对 `image_url` **零命中** ⇒ 适配器认为「本请求无图」⇒
+    传给 `serializeMessages` 的 `imageUrls` 是 `undefined`；
+    ② `serializeMessages` 又在 `imageUrls === undefined` 时**整段跳过**
+    `userContentParts` ⇒ 那些块连 `[image unavailable]` 占位符都没有，直接消失。
+    **症状极具误导性**：HTTP 200、正文正常、上游零报错，只有答案是「我看不到图片」
+    —— 用户会误判成「这个模型不能识图」，而目录里 `is_vl` 明明是 `true`。
+    ⇒ 修法两半：`userContentParts` 加 `image_url` 分支（原样放进 parts）；
+    `serializeMessages` 的判据改成「有映射表 **或** 内容里本来就带 `image_url` 块」。
+    ⚠️ **四处副本都要改**：`shared/openai-compat.ts`（qoder / cline / loomy /
+    raccoon / sensenova 共用）+ `buddy-adapter.ts` / `lobsterai-adapter.ts` /
+    `trae-adapter.ts` 各自内联的 `userContentParts`/`serializeMessages`
+    —— 只改共享那份，另外三家的识图同样是坏的（且症状一模一样）。
+    ⚠️ **纯文本仍必须输出字符串**：无图时把 content 包成
+    `[{type:'text',…}]` 会被上游以 `model_param_invalid` 400 拒收整个请求。
+    回归用例 `tests/unit/inbound-image-passthrough.spec.ts`（6 条 + 1 条
+    `collectImages` 通路隔离）。⚠️ 这与插件侧 `analyzeImage` 那条已修缺陷
+    （`9acddc7`）**完全同型** —— 移植时只搬了「附件块」那条腿。
+
 ### 已移植文件清单（基线 `3611a62`）
 
 移植方式是**只改 import 行**（`@deepseek-ai/*` → 本地等价物），实现逐字保留。

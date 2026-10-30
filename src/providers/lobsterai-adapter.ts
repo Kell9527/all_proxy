@@ -391,6 +391,20 @@ function userContentParts(
         : { type: 'image_url', image_url: { url } })
       continue
     }
+    // ⚠️⚠️ **入站本来就是 `image_url` 的块必须原样透传**（2026-10-29 真实缺陷，
+    // 与 `shared/openai-compat.ts` 同因同修）：网关把图片直接交成上游要的
+    // `{type:'image_url', image_url:{url}}` 形态，**没有** harness 原生
+    // `{type:'image', attachment}` 块 ⇒ `collectImages()` 零命中 ⇒ `imageUrls`
+    // 是 undefined。漏了这条，图会被静默丢弃（HTTP 200、上游零报错，
+    // 模型只回「我看不到图片」）。
+    if (block.type === 'image_url') {
+      const url = (block as { image_url?: { url?: unknown } }).image_url?.url
+      if (typeof url === 'string' && url.length > 0) {
+        hasImage = true
+        parts.push({ type: 'image_url', image_url: { url } })
+      }
+      continue
+    }
     if (block.type === 'tool-result' && Array.isArray(block.content)) {
       const inner = userContentParts(block.content, imageUrls)
       if (inner !== undefined) {
@@ -510,7 +524,15 @@ function serializeMessages(
     // 工具结果之外的常规内容（含顶层图片）。
     const regular = content.filter((block) =>
       !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
-    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
+    // ⚠️ **入站自带 `image_url` 块时也必须走多模态**（2026-10-29，与
+    // `shared/openai-compat.ts` 同因同修）：网关把图片直接交成上游要的
+    // `{type:'image_url', image_url:{url}}` 形态，**没有** harness 附件 ref ⇒
+    // `imageUrls` 是 undefined。若仍按「有表才升级」，这些块会被静默丢弃。
+    const carriesInlineImage = regular.some((block) =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image_url')
+    const parts = imageUrls === undefined && !carriesInlineImage
+      ? undefined
+      : userContentParts(regular, imageUrls ?? new Map())
     if (parts !== undefined) {
       flushToolImages()
       wire.push({ role: 'user', content: parts })

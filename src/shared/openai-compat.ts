@@ -111,6 +111,26 @@ export function userContentParts(
         : { type: 'image_url', image_url: { url } })
       continue
     }
+    // ⚠️⚠️ **入站本来就是 `image_url` 的块必须原样透传**（2026-10-29 真实缺陷）。
+    //
+    // 网关（`src/gateway/anthropic-protocol.ts` 与 OpenAI 原生请求）把图片直接
+    // 交成上游要的 `{type:'image_url', image_url:{url}}` 形态，**没有** harness 原生
+    // 的 `{type:'image', attachment}` 块 ⇒ `collectImages()` 一个 ref 都收不到 ⇒
+    // `stream()` 认为「本请求无图」，传进来的 `imageUrls` 是 `undefined`。
+    // 而 `serializeMessages` 只在 `imageUrls !== undefined` 时才走多模态分支，
+    // 于是这些块**整块被丢弃**：模型只收到文字，回答「我看不到图片」。
+    //
+    // 症状极具误导性：HTTP 200、正文正常、上游零报错，只有答案是错的 ——
+    // 与插件侧 `analyzeImage` 那条已修缺陷（`9acddc7`）**完全同型**，
+    // 本项目移植时漏搬了这半条修复。
+    if (block.type === 'image_url') {
+      const url = (block as { image_url?: { url?: unknown } }).image_url?.url
+      if (typeof url === 'string' && url.length > 0) {
+        hasImage = true
+        parts.push({ type: 'image_url', image_url: { url } })
+      }
+      continue
+    }
     if (block.type === 'tool-result' && Array.isArray(block.content)) {
       const inner = userContentParts(block.content, imageUrls)
       if (inner !== undefined) {
@@ -225,7 +245,17 @@ export function serializeMessages(
     // 工具结果之外的常规内容（含顶层图片）。
     const regular = content.filter((block) =>
       !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
-    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
+    // ⚠️⚠️ **不能只在 `imageUrls !== undefined` 时才走多模态**（2026-10-29 真实缺陷，
+    // 与上一条同因）：网关（`/v1/messages` 与 OpenAI 原生请求）交进来的图片已经是
+    // `{type:'image_url'}` 块、**没有** harness 附件 ref ⇒ 映射表是 `undefined`。
+    // 若这里仍按「有表才升级」，那些块永远走不到 `userContentParts` ⇒ 被当成纯文本
+    // 消息发出 ⇒ **图被静默丢弃**（模型回「我看不到图片」，HTTP 200 且上游零报错）。
+    // ⇒ 判据改为「有映射表 **或** 内容里本来就带 `image_url` 块」。
+    const carriesInlineImage = regular.some((block) =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image_url')
+    const parts = imageUrls === undefined && !carriesInlineImage
+      ? undefined
+      : userContentParts(regular, imageUrls ?? new Map())
     if (parts !== undefined) {
       flushToolImages()
       wire.push({ role: 'user', content: parts })
