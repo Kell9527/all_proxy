@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
-  fetchCodeArtsRemoteModels, isCodeArtsBenefitModel, loadBenefitCache, loadModelsCache,
+  fetchCodeArtsRemoteModels, freshRateLabel, isCodeArtsBenefitModel, loadBenefitCache, loadModelsCache,
   OPENGW_GATEWAY_CONFIG_URL, saveBenefitCache, saveModelsCache, setBenefitMemoryCache,
   SNAP_MODEL_BUILTIN_URL,
 } from '../../src/providers/models.js'
@@ -129,13 +129,142 @@ describe('fetchCodeArtsRemoteModels', () => {
     const ids = models.map((m) => m.id)
     // benefit 模型
     expect(ids).toContain('glm-5.3-flash')
-    // 日期后缀被 normalizeModelId 去掉
-    expect(ids).toContain('deepseek-v4-flash')
-    expect(ids).not.toContain('deepseek-v4-flash-0731')
+    // ⚠️ 对外 id 是**上游原始 model_id**，不再剥日期后缀（2026-10-28 改，见
+    // `normalizeModelId` 的长注释）：`deepseek-v4-flash-0731` 与
+    // `deepseek-v4-flash` 在后端是**两个独立注册的模型**，剥后缀会把它们合并掉。
+    expect(ids).toContain('deepseek-v4-flash-0731')
     // 常规模型
     expect(ids).toContain('GLM-5.2')
     // 去重：glm-5.3-flash 只出现一次
     expect(ids.filter((id) => id === 'glm-5.3-flash')).toHaveLength(1)
+  })
+
+  /**
+   * ★ 带版本后缀的 id **必须原样暴露**（issue IKQY27）。
+   *
+   * 实测 `/v1/model/builtin` 同时下发 `deepseek-v4.1-flash` 与
+   * `deepseek-v4.1-flash-1017`（两个 `display_enabled: true` 的独立条目）。
+   * 修前 `normalizeModelId` 无条件剥 `-NNNN` 且用它做 `seen` 去重键 ⇒ 1017
+   * 被静默吞掉，用户看到「IDE 已更新到 1017，我们的列表没更新」。
+   *
+   * 本机实测（2026-10-28）：上游 10 条，本项目修前只出 8 条。
+   */
+  it('★ 带版本后缀的 id 必须原样暴露，不得归一成无后缀（IKQY27）', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'deepseek-v4.1-flash', model_name: 'DeepSeek-V4.1-Flash' },
+            { model_id: 'deepseek-v4.1-flash-1017', model_name: 'DeepSeek-V4.1-Flash-1017' },
+          ],
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const ids = models.map((m) => m.id)
+    expect(ids, '新旧两版是上游并存的独立模型，必须都出现').toEqual([
+      'deepseek-v4.1-flash',
+      'deepseek-v4.1-flash-1017',
+    ])
+    // 展示名同样不裁后缀：`1017` 正是用户要看的版本信息。
+    expect(models.find((m) => m.id === 'deepseek-v4.1-flash-1017')?.name)
+      .toBe('DeepSeek-V4.1-Flash-1017')
+  })
+
+  /**
+   * ★ 消耗倍率：只取 `ratio_display`（不取 `ratio`），且**按时段选当前档**。
+   *
+   * 上游 `credit[]` 同时给 `ratio`（`0.05`）与 `ratio_display`（`0.18x`），
+   * 两者**不同量纲**（`GLM-5.2` ratio=0.05 也显示 0.7x）⇒ 用 ratio 拼串会显示
+   * 一个上游从未出现过的数字。错峰档（21:00–次日 7:59）是第二档，取
+   * `credit[0]` 会在整个错峰期显示过高的倍率。
+   */
+  it('★ 倍率只取 ratio_display，且按 time_slots 选当前生效档（错峰 21:00–7:59）', async () => {
+    const credit = [
+      { ratio: '0.05', ratio_display: '0.18x', time_slot_id: 'default' },
+      { ratio: '0.05', ratio_display: '0.09x', time_slot_id: 'off_peak' },
+    ]
+    const timeSlots = {
+      off_peak: { timezone: 'Asia/Shanghai', schedule: '0 0 21 * * *', duration: 11, timeunit: 'hour' },
+      default: { schedule: null, duration: null },
+    }
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'deepseek-v4.1-flash', model_name: 'DeepSeek-V4.1-Flash', credit, time_slots: timeSlots },
+          ],
+        }),
+      },
+    })
+    /** 取某个 UTC+8 本地时刻的倍率。 */
+    const at = async (iso: string): Promise<string | undefined> => {
+      const models = await fetchCodeArtsRemoteModels(
+        makeCredential(), fetcher, undefined, Date.parse(iso),
+      )
+      return freshRateLabel(models[0]!, Date.parse(iso))
+    }
+    // 错峰窗口内（含跨日界的两端）
+    expect(await at('2026-10-28T21:00:00+08:00')).toBe('x0.09')
+    expect(await at('2026-10-28T23:30:00+08:00')).toBe('x0.09')
+    expect(await at('2026-10-29T03:00:00+08:00')).toBe('x0.09')
+    expect(await at('2026-10-29T07:59:00+08:00')).toBe('x0.09')
+    // 窗口外
+    expect(await at('2026-10-28T08:00:00+08:00')).toBe('x0.18')
+    expect(await at('2026-10-28T20:59:00+08:00')).toBe('x0.18')
+  })
+
+  /**
+   * ★ 倍率必须能在**读取时**重算：磁盘快照 TTL 6 小时，必然跨过 21:00 边界。
+   *
+   * 若直接用拉取那一刻算出的 `rateLabel`，错峰开始后会继续显示白天档
+   * （来源实测过同型缺陷：错峰期显示过高的 0.18x）。
+   */
+  it('★ freshRateLabel 按「现在」重算，不受快照拍摄时刻影响', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [{
+            model_id: 'deepseek-v4.1-flash',
+            model_name: 'DeepSeek-V4.1-Flash',
+            credit: [
+              { ratio_display: '0.18x', time_slot_id: 'default' },
+              { ratio_display: '0.09x', time_slot_id: 'off_peak' },
+            ],
+            time_slots: {
+              off_peak: { schedule: '0 0 21 * * *', duration: 11, timeunit: 'hour' },
+              default: { schedule: null, duration: null },
+            },
+          }],
+        }),
+      },
+    })
+    // 白天拍的快照
+    const models = await fetchCodeArtsRemoteModels(
+      makeCredential(), fetcher, undefined, Date.parse('2026-10-28T10:00:00+08:00'),
+    )
+    expect(models[0]?.rateLabel, '快照里存的是白天档').toBe('x0.18')
+    // 但晚上读出来必须是错峰档
+    expect(freshRateLabel(models[0]!, Date.parse('2026-10-28T22:00:00+08:00'))).toBe('x0.09')
+    expect(freshRateLabel(models[0]!, Date.parse('2026-10-29T10:00:00+08:00'))).toBe('x0.18')
+  })
+
+  /** 上游不给 `credit[]`（或形状认不出）时**不落占位值**。 */
+  it('倍率缺失/认不出时不冒充：不落 rateLabel', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'no-credit', model_name: 'No Credit' },
+            // 形态变了（上游若改成 `x0.7`）：只改形态不改数值的契约要求**认不出就不显示**
+            { model_id: 'odd-form', model_name: 'Odd', credit: [{ ratio_display: 'x0.7' }] },
+          ],
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(models.find((m) => m.id === 'no-credit')?.rateLabel).toBeUndefined()
+    expect(models.find((m) => m.id === 'odd-form')?.rateLabel).toBeUndefined()
   })
 
   it('returns empty array when credential lacks AK/SK', async () => {

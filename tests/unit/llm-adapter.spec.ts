@@ -1,7 +1,7 @@
 import { LlmError } from '../../src/providers/llm.js'
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '../../src/providers/credential-ref.js'
-import { CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/providers/llm-adapter.js'
+import { CHAT_API_BASE, CODEARTS_FALLBACK_CONTEXT_WINDOW, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/providers/llm-adapter.js'
 import { setBenefitMemoryCache } from '../../src/providers/models.js'
 import type { CodeArtsCredential } from '../../src/providers/types.js'
 
@@ -78,45 +78,62 @@ describe('CodeArtsAdapter', () => {
     // （2026-09-23 修正，对齐 deveco-code-rust fb1b4a2）：它返回 404 的真实原因是
     // **缺少 maas_type: benefit 头**，带上即成功；带日期后缀与无后缀是后端上两个
     // 不同的模型，不能互相替代。
+    //
+    // ⚠️ 2026-10-28 真机校准：`deepseek-v4-pro` 实测 403 `TM.000010051` 权益耗尽
+    // ⇒ 已从静态表删除（同批删 `GLM-5` / `glm-5.3-flash`）。本用例改为断言
+    // **在售**的那几条 + 上游新增的那几条。
     const models = await makeAdapter().listModels('codearts')
     const ids = models.map(model => model.id)
     expect(ids).toContain('openpangu-2.0-flash')
     expect(ids).toContain('openpangu-2.0-pro')
     expect(ids).toContain('deepseek-v4-flash')
-    expect(ids).toContain('deepseek-v4-pro')
     expect(ids).toContain('deepseek-v4.1-flash')
+    // 上游在售、旧表漏掉的三条（builtin 端点下发，真机可调通或有权益缺口）
+    expect(ids).toContain('glm-5.3')
+    expect(ids).toContain('deepseek-v4.1-flash-1017')
+    expect(ids).toContain('kimi-k3')
+    // 已下架/权益已失效的旧条目不得再占位
+    expect(ids).not.toContain('deepseek-v4-pro')
+    expect(ids).not.toContain('GLM-5')
+    expect(ids).not.toContain('glm-5.3-flash')
     const flash = models.find(model => model.id === 'openpangu-2.0-flash')
     const pro = models.find(model => model.id === 'openpangu-2.0-pro')
     const dsFlash = models.find(model => model.id === 'deepseek-v4-flash')
-    const dsPro = models.find(model => model.id === 'deepseek-v4-pro')
     expect(flash).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-flash' })
     expect(pro).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-pro' })
     expect(dsFlash).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-flash' })
-    expect(dsPro).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-pro' })
     // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
     expect(ids[0]).toBe('GLM-5.2')
   })
 
   it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
-    // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
-    // deepseek-v4-flash/pro：1048576（1M）；deepseek-v4.1-flash：1000000
-    // （对齐 IDE 下发的 inferhub-provider 模型配置，2026-09 kernel 日志）。
-    // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
+    // ⚠️ 2026-10-28 真机校准（来源 `docs/agent-notes/providers-codearts.md`）：
+    // 权威来源是 IDE 下发的 `inferhub-provider.models[*].limit.context`。
+    //   GLM-5.2 / glm-5.3 / deepseek-v4.1-flash = 1_048_576
+    //     （GLM-5.2 在 10-21 起从 202_752 改成 1M；deepseek-v4.1-flash 原写
+    //      1_000_000 是错的）
+    //   glm-5.2-sft-harmony = 202_752、openpangu-* = 524_288
+    // ⚠️ **未知模型不再省略 `context`**：走具名兜底 524_288（缺窗口会让宿主的
+    //    上下文占用条整条不渲染）。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
-    expect(glm52.context).toEqual({ contextWindow: 202752 })
-    const glm53flash = await adapter.resolveModel('codearts', 'glm-5.3-flash')
-    expect(glm53flash.context).toEqual({ contextWindow: 1_048_576 })
+    expect(glm52.context).toEqual({ contextWindow: 1_048_576 })
+    const glm53 = await adapter.resolveModel('codearts', 'glm-5.3')
+    expect(glm53.context).toEqual({ contextWindow: 1_048_576 })
     const dsFlash = await adapter.resolveModel('codearts', 'deepseek-v4-flash')
-    expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
-    const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
-    expect(dsPro.context).toEqual({ contextWindow: 1048576 })
+    expect(dsFlash.context).toEqual({ contextWindow: 1_048_576 })
     const dsV41Flash = await adapter.resolveModel('codearts', 'deepseek-v4.1-flash')
-    expect(dsV41Flash.context).toEqual({ contextWindow: 1_000_000 })
-    const glm51 = await adapter.resolveModel('codearts', 'GLM-5.1')
-    expect(glm51.context).toBeUndefined()
+    expect(dsV41Flash.context).toEqual({ contextWindow: 1_048_576 })
+    // 独立注册的 1017 与老版同窗口（漏这一行会落 524_288 ⇒ 分母错 2 倍）
+    const ds1017 = await adapter.resolveModel('codearts', 'deepseek-v4.1-flash-1017')
+    expect(ds1017.context).toEqual({ contextWindow: 1_048_576 })
+    const harmony = await adapter.resolveModel('codearts', 'glm-5.2-sft-harmony')
+    expect(harmony.context).toEqual({ contextWindow: 202_752 })
     const pangu = await adapter.resolveModel('codearts', 'openpangu-2.0-pro')
-    expect(pangu.context).toBeUndefined()
+    expect(pangu.context).toEqual({ contextWindow: 524_288 })
+    // 未知模型：具名兜底，**不得省略**
+    const unknown = await adapter.resolveModel('codearts', 'brand-new-model')
+    expect(unknown.context).toEqual({ contextWindow: CODEARTS_FALLBACK_CONTEXT_WINDOW })
   })
 
   // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
@@ -130,7 +147,7 @@ describe('CodeArtsAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'codearts',
       id: 'GLM-5.2',
-      context: { contextWindow: 202752 },
+      context: { contextWindow: 1_048_576 },
       inputModalities: ['text'],
     })
     expect(typeof call.stream).toBe('function')
@@ -175,11 +192,12 @@ describe('CodeArtsAdapter', () => {
     expect(texts).toEqual(['ok'])
   })
 
-  it('listModels advertises glm-5.3-flash with the GLM family', async () => {
-    // 对齐 deveco-code-rust 90aeb17d：CodeArts Agent 后端新增 GLM-5.3 Flash
-    // （benefit 免费额度模型，后端注册 id 为全小写 glm-5.3-flash）。
+  it('listModels advertises glm-5.3 with the GLM family', async () => {
+    // 对齐 deveco-code-rust 90aeb17d：CodeArts Agent 后端新增 GLM-5.3（全小写）。
+    // ⚠️ 2026-10-28 真机校准：`glm-5.3-flash` 实测 **403 TM.000010051 权益耗尽**
+    // ⇒ 已从静态表删除；在售的是 `glm-5.3`（builtin 端点下发，实测 200）。
     const models = await makeAdapter().listModels('codearts')
-    expect(models.map((model) => model.id)).toContain('glm-5.3-flash')
+    expect(models.map((model) => model.id)).toContain('glm-5.3')
     // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
     expect(models[0]!.id).toBe('GLM-5.2')
   })
@@ -764,7 +782,8 @@ describe('CodeArtsAdapter', () => {
     // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
     const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(resolved.id).toBe('GLM-5.2')
-    expect(resolved.context?.contextWindow).toBe(202752)
+    // 2026-10-28 真机校准：GLM-5.2 的权威窗口是 1M（10-21 起上游改值）
+    expect(resolved.context?.contextWindow).toBe(1_048_576)
   })
 
   // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──

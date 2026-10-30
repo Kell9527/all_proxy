@@ -6,7 +6,7 @@ import { AccountPool } from '../../src/pool/account-pool.js'
 import { FileCredentialStore } from '../../src/pool/store.js'
 import { ProviderRegistry } from '../../src/providers/registry.js'
 import { registerAllProviders } from '../../src/providers/wiring.js'
-import { CodeArtsAdapter } from '../../src/providers/llm-adapter.js'
+import { CODEARTS_FALLBACK_CONTEXT_WINDOW, CodeArtsAdapter } from '../../src/providers/llm-adapter.js'
 import {
   OPENGW_GATEWAY_CONFIG_URL,
   SNAP_MODEL_BUILTIN_URL,
@@ -138,8 +138,63 @@ describe('CodeArts 远端模型目录接线', () => {
       fetchRemoteModels: async () => [],
     })
     const ids = (await adapter.listModels('codearts')).map((m) => m.id)
-    expect(ids).toContain('glm-5.3-flash')
-    // 静态表确实没有 `glm-5.3` —— 这正是必须接远端目录的原因。
-    expect(ids).not.toContain('glm-5.3')
+    // ⚠️ 静态表已在 2026-10-28 按真机结果校准：`glm-5.3-flash` / `GLM-5` /
+    // `deepseek-v4-pro` 实测全部 403 权益耗尽（该模型已不该再出现在列表里），
+    // 换成 `glm-5.3` / `glm-5.2-sft-harmony` / `deepseek-v4.1-flash-1017` / `kimi-k3`。
+    // 本用例锁的是「远端拿不到时仍有可用目录」，故断言表里的**在售**条目。
+    expect(ids, '静态兜底表必须非空（否则模型选择器整个 provider 分组消失）').not.toHaveLength(0)
+    expect(ids).toContain('GLM-5.2')
+    expect(ids).toContain('glm-5.3')
+    expect(ids).toContain('deepseek-v4.1-flash-1017')
+    // 已下架/权益已失效的旧条目不得再占位（真机实测 403）。
+    expect(ids).not.toContain('glm-5.3-flash')
+    expect(ids).not.toContain('GLM-5')
+    expect(ids).not.toContain('deepseek-v4-pro')
+  })
+
+  /**
+   * ★ `resolveModel` 必须**恒给** `context.contextWindow`。
+   *
+   * 缺它会让宿主的上下文占用条整条不渲染（不是显示 0%，是根本不出现）——
+   * 来源真实报障。故未知模型走具名兜底，不得省略。
+   */
+  it('★ resolveModel 恒给 contextWindow：表内优先、未知模型走具名兜底', async () => {
+    const adapter = new CodeArtsAdapter({
+      credentialRef: 'CODEARTS_ACCESS_TOKEN' as never,
+      resolveCredential: async () => undefined,
+      refresh: async () => {},
+    })
+    // 表内：GLM-5.2 = 1M（2026-10-21 起上游改值，旧值 202_752 会让占用条封顶 100%）
+    expect((await adapter.resolveModel('codearts', 'GLM-5.2')).context?.contextWindow).toBe(1_048_576)
+    // 独立注册的 1017 与老版同窗口（不补这一行会落 524_288 ⇒ 分母错 2 倍）
+    expect((await adapter.resolveModel('codearts', 'deepseek-v4.1-flash-1017')).context?.contextWindow)
+      .toBe(1_048_576)
+    // 未知模型：具名兜底，**不得省略**
+    expect((await adapter.resolveModel('codearts', 'some-future-model')).context?.contextWindow)
+      .toBe(CODEARTS_FALLBACK_CONTEXT_WINDOW)
+  })
+
+  /**
+   * ★ 展示名带消耗倍率（仓内口径 ` · x{n}`），且取不到倍率时保持裸名。
+   */
+  it('★ 展示名拼倍率（· x0.7），上游没给倍率时保持裸名', async () => {
+    const adapter = new CodeArtsAdapter({
+      credentialRef: 'CODEARTS_ACCESS_TOKEN' as never,
+      resolveCredential: async () => undefined,
+      refresh: async () => {},
+      fetchRemoteModels: async () => [
+        { id: 'GLM-5.2', name: 'GLM-5.2', rateLabel: 'x0.7' },
+        { id: 'no-rate', name: 'No Rate' },
+      ],
+    })
+    const listed = await adapter.listModels('codearts')
+    expect(listed.find((m) => m.id === 'GLM-5.2')?.name).toBe('GLM-5.2 · x0.7')
+    expect(listed.find((m) => m.id === 'no-rate')?.name).toBe('No Rate')
+    // `listAllModels`（设置页，含被关闭的模型）必须同样带倍率 ——
+    // 只改 listModels 会让「关掉的模型」退回裸 id（来源报障形态）。
+    expect(adapter.listAllModels().find((m) => m.id === 'GLM-5.2')?.name).toBe('GLM-5.2 · x0.7')
+    // ⚠️ `resolveModel().name` 用**裸名**：倍率随错峰时段变，写进会话会让
+    // 同一次会话里模型名前后不一致。
+    expect((await adapter.resolveModel('codearts', 'GLM-5.2')).name).toBe('GLM-5.2')
   })
 })

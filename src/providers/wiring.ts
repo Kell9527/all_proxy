@@ -24,7 +24,7 @@ import type { BuddyCredential, CodeArtsCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import { ProviderRegistry, type ProviderDescriptor } from './registry.js'
 import { fetchModels as fetchBuddyModels } from './buddy-oauth.js'
-import { fetchCodeArtsRemoteModels } from './models.js'
+import { fetchCodeArtsRemoteModels, type RemoteCatalogOutcome } from './models.js'
 import {
   TRAE_BATCH_MODELS_PATH,
   TRAE_REQUEST_TIMEOUT_MS,
@@ -125,10 +125,17 @@ function saveCatalogSnapshot(provider: string, models: unknown[]): void {
  *
  * ⚠️ 当该 provider 在 {@link catalogForceRefresh} 里时（手动刷新窗口），
  * **跳过内存缓存与磁盘快照新鲜度**两道短路，直接发网络。
+ *
+ * @param isComplete - 可选：本次拉取是否**完整**。只有判成完整时才把结果落成
+ *   **磁盘快照**（进程内内存缓存照旧生效）。用于多来源的 provider（当前仅
+ *   `codearts`：`gateway/config` + `/v1/model/builtin`）——一个来源失败时目录是
+ *   残缺的，落盘会让残缺**跨重启固化**（来源审计实测过：残缺目录永久缓存，
+ *   只有重启 DSH 才能恢复）。省略时恒视为完整（其余 provider 行为不变）。
  */
 async function fetchRemoteCatalog<T>(
   provider: string,
   action: () => Promise<T[]>,
+  isComplete?: () => boolean,
 ): Promise<T[]> {
   const now = Date.now()
   const force = catalogForceRefresh.has(provider)
@@ -157,7 +164,13 @@ async function fetchRemoteCatalog<T>(
       const models = await action()
       if (models.length === 0) throw new Error(`${provider} 远端目录为空或凭据失效，使用快照/内置目录`)
       catalogMemory.set(provider, { at: now, models })
-      saveCatalogSnapshot(provider, models)
+      // ⚠️ 残缺目录**只进内存、不落盘**：落盘会让它跨重启固化，表现为
+      // 「某个来源挂了以后，模型列表永远少一半，重启服务也不恢复」。
+      if (isComplete === undefined || isComplete()) {
+        saveCatalogSnapshot(provider, models)
+      } else {
+        catalogLogger?.(`[catalog] ${provider} 远端目录不完整（部分来源失败），仅本次使用、不落盘`)
+      }
       return models
     } catch (error) {
       catalogFailedAt.set(provider, Date.now())
@@ -261,7 +274,6 @@ export async function refreshModelCatalog(
     //    列表纹丝不动」。用 try/finally 保证异常时也清除，否则该 provider
     //    会在此后每次读取都无脑打上游。
     catalogForceRefresh.add(id)
-
     // ⚠️ 判据不能用「listModels 是否抛错」：**所有适配器都在内部吞掉远端失败**
     //    并回退兜底表（模型目录是展示信息，不该让 provider 报错）。于是远端
     //    挂了也会走到这里、还返回一份兜底表 —— 若据此报「成功」，用户会以为
@@ -536,11 +548,23 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
       // `glm-5.3` / `glm-5.2-sft-harmony` / `kimi-k2.6-vl` 等一律看不到。
       // 远端目录是**账号无关**的，故用 listAccountsByProvider 顺序取第一个
       // 可解析凭据（含停用账号），与来源 `service.refreshModels` 同语义。
-      fetchRemoteModels: () => fetchRemoteCatalog('codearts', async () => {
-        const credential = await firstUsableCodeArtsCredential(ctx.pool)
-        if (credential === undefined) return []
-        return fetchCodeArtsRemoteModels(credential, fetcher)
-      }),
+      //
+      // ⚠️ **完整性判据只认 `builtinOk`，不是 `isRemoteCatalogComplete`**。
+      // 两个来源的地位不对称：
+      // - `builtin`（`/v1/model/builtin`）是**全部常规模型**的来源，它挂了就等于
+      //   目录残缺 ⇒ 绝不落盘（否则残缺跨重启固化）；
+      // - `gateway/config` 是 **benefit 模型**的来源，本机恒回
+      //   `4000 invalid channel, group not found`（2026-10-28 实测）⇒ 用「两个都
+      //   成功」当判据会让**每次启动都白拉一遍网络**、6 小时快照永不生效。
+      // 故判据是「builtin 成功」；gateway 的失败只记一条日志。
+      fetchRemoteModels: () => {
+        const outcome: RemoteCatalogOutcome = { gatewayOk: false, builtinOk: false }
+        return fetchRemoteCatalog('codearts', async () => {
+          const credential = await firstUsableCodeArtsCredential(ctx.pool)
+          if (credential === undefined) return []
+          return fetchCodeArtsRemoteModels(credential, fetcher, outcome)
+        }, () => outcome.builtinOk)
+      },
     }),
   )
 
