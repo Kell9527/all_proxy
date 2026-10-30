@@ -1274,6 +1274,92 @@ describe('TRAE 适配器 · 流内错误换号', () => {
     expect(fetcher).toHaveBeenCalledTimes(2)
   })
 
+  it('流内 1005 且 **message 为空串** 时冷却仍按 12h 档（回归：曾经是 0ms）', async () => {
+    // ⚠️⚠️ 这条是本组**唯一有牙**的用例，别删也别「顺手」给 message 补上字样。
+    //
+    // 2026-10-24 真实报障：上游用 HTTP 200 + SSE 下发 `code=1005` 且
+    // `message` 为**空串**。旧实现把 `{code,message}` 序列化成 JSON 喂**文案表**
+    // `classifyTraeError`，而它的 hard-plan 判据要求「1005 且含 plan 关键词」
+    // ⇒ 判 none ⇒ traeCooldownFor(none) = 0ms ⇒ 限流标记写在失败那一刻
+    // ⇒ 下次选号立刻又选回同一个号，换号形同虚设。
+    //
+    // ⚠️ 上面那条「流内 1005 同样触发换号」的 message 带 `plan` 字样，
+    // 因此**旧实现也能通过它** —— 只有本条（空 message）能区分新旧。
+    const pool = makePool(makeCredential({ access_token: 'AT2' }))
+    const { adapter } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 1005, message: '' }])),
+        sseResponse(soloSse(['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }])),
+      ],
+    })
+    await collect(adapter, BASIC_OPTIONS)
+    expect(pool.updateModelRateLimit).toHaveBeenCalled()
+    const delta = (pool.updateModelRateLimit.mock.calls[0]![2] as number) - Date.now()
+    // 落在 (11h, 12h]：既证明不是 0ms，也证明不是 1h 兜底。
+    expect(delta, '冷却必须 > 0（0ms 等于没标记）').toBeGreaterThan(11 * 3_600_000)
+    expect(delta).toBeLessThanOrEqual(12 * 3_600_000)
+  })
+
+  it('流内 4011 的冷却取 60s 档（不是 1h 兜底）', async () => {
+    // 频率类分钟级恢复，放大到小时级会白白损失多账号池的可用容量。
+    const pool = makePool(makeCredential({ access_token: 'AT2' }))
+    const { adapter } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 4011, message: '' }])),
+        sseResponse(soloSse(['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }])),
+      ],
+    })
+    await collect(adapter, BASIC_OPTIONS)
+    const delta = (pool.updateModelRateLimit.mock.calls[0]![2] as number) - Date.now()
+    expect(delta).toBeGreaterThan(0)
+    expect(delta).toBeLessThanOrEqual(60_000)
+  })
+
+  it('**预算耗尽时撞到的最后一个账号也要写冷却**（换号预算不等于不记账）', async () => {
+    // 2026-10-25 审计（来源 f8ecc0f P1）：旧顺序是「预算耗尽 → 直接 throw」，
+    // 而 updateModelRateLimit 在它**之后** ⇒ 撞到的最后一个账号从不写冷却。
+    // 实测（3 号池）第一轮只标了 2 个，最后那个号额度已耗尽却零标记
+    // ⇒ 下次请求立刻被选回、又撞同一个 1005，用户看到「换号好像不行」。
+    //
+    // ⚠️ 构造必须**真正耗尽预算**（TRAE_MAX_ROTATE - 1 = 2 次换号）：
+    // 前两个号各失败一次、各换一次，第三个号失败时 rotateBudget 已为 0。
+    // 只造单账号池是不够的 —— 那条路径走的是「getAvailableAccount 返回 null」，
+    // 与预算分支是两个不同的出口（实测：只造单账号时把顺序改回去仍然全绿）。
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: (() => {
+        const queue: Array<{ id: string; token: string }> = [
+          { id: 'trae-2', token: 'AT2' },
+          { id: 'trae-3', token: 'AT3' },
+        ]
+        return vi.fn(async () => {
+          const next = queue.shift()
+          if (next === undefined) return null
+          return { entry: { id: next.id }, credential: makeCredential({ access_token: next.token }) }
+        })
+      })(),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 1005, message: '' }])),
+        sseResponse(soloSse(['error', { code: 1005, message: '' }])),
+        sseResponse(soloSse(['error', { code: 1005, message: '' }])),
+      ],
+    })
+    await collect(adapter, BASIC_OPTIONS).catch(() => {})
+    // 三个号各发一次：前两次换号、第三次预算耗尽
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    // ⚠️ 要害断言：三个号**都必须**被标记，包括最后那个撞在预算边界上的。
+    expect(pool.updateModelRateLimit.mock.calls).toHaveLength(3)
+    for (const call of pool.updateModelRateLimit.mock.calls) {
+      const delta = (call[2] as number) - Date.now()
+      expect(delta, `账号 ${String(call[0])} 的冷却必须 > 0`).toBeGreaterThan(11 * 3_600_000)
+    }
+  })
   it('**已产出正文后**的流内错误不换号、不重发（防重复计费）', async () => {
     const pool = makePool(makeCredential({ access_token: 'AT2' }))
     const { adapter, fetcher } = makeAdapter({

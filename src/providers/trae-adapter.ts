@@ -46,7 +46,10 @@ import {
   type TraeRemoteModel,
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
-import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
+import {
+  classifyTraeError, classifyTraeStreamCode, isRotatableTraeStreamCode,
+  recordsTraeRateLimit, shouldRotateTraeAccount,
+} from './trae-errors.js'
 import { traeCooldownFor } from './trae-cooldown-table.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
@@ -205,20 +208,6 @@ class TraeStreamErrorCause extends Error {
   }
 }
 
-/**
- * 流内错误是否**值得换号**。
- *
- * 与 HTTP 层共用同一张判据表（{@link classifyTraeError}），避免两处各写一套
- * 而逐渐分叉 —— 这正是本次缺陷的成因（流内分支当年自己写了一套「一律
- * 不可重试」的判据）。
- *
- * 对齐既有类别：`hard-plan`(1005) / `soft-rate`(4011/429) /
- * `quota-exceeded`(4008) 都换号；`4001`（模型不可调用）换号无意义
- * —— 换账号也是同一个模型被拒，故**不换号**，直接如实报错。
- */
-function isRotatableStreamError(code: number): boolean {
-  return code === 1005 || code === 4008 || code === 4011
-}
 
 /**
  * 机器指纹轮换间隔（每 N 次请求换一代，仅在显式启用时生效）。
@@ -1185,24 +1174,38 @@ export class TraeAdapter extends LlmAdapter {
       } catch (error) {
         // ② 流内可换号错误 → 标记当前账号 + 取下一个账号重发。
         if (error instanceof LlmError && error.code === TRAE_ROTATABLE_STREAM_ERROR) {
-          // 无账号池、或换号预算用尽 → 如实抛出（去掉哨兵码，换真实语义）。
-          if (this.options.accountPool === undefined || rotateBudget <= 0) {
-            throw new LlmError(error.message, 'QUOTA_EXCEEDED')
-          }
           if (options.signal?.aborted) throw error
-
-          rotateBudget -= 1
+          // ⚠️⚠️ **必须先写冷却、再判预算**（2026-10-25 审计，来源 `f8ecc0f` P1）。
+          //
+          // 旧顺序是「预算耗尽 → 直接 throw」，而 `updateModelRateLimit` 在它
+          // **之后** ⇒ **撞到的最后一个账号从不写冷却**。实测（3 号池）第一轮
+          // 只标了 2 个，最后那个号额度已耗尽却零标记 ⇒ 下次请求立刻被选回、
+          // 又撞同一个 1005/4008，用户看到「换号好像不行」。
+          //
+          // 判据很直白：**失败已经发生**，无论还要不要继续换号，这个号都必须
+          // 被记下来。预算只决定「还试不试下一个」，不该决定「记不记账」。
+          //
           // 标记当前账号在本模型上受限（UI 据此亮「限额重置」徽章）。
-          // ⚠️ 冷却时长按类别取：从哨兵错误的 `cause` 取回流内 errorCode，
-          // 重分类后走与 HTTP 层**同一张** `traeCooldownFor` 表 —— 旧实现一律
-          // 1h 兜底，额度耗尽的账号 1 小时后被选回、又 4008（同款缺陷的流内实例）。
-          if (currentAccountId.length > 0) {
+          //
+          // ⚠️⚠️ **必须走结构化码表（`classifyTraeStreamCode`），不能把
+          // `{code,message}` 序列化成 JSON 再喂文案表 `classifyTraeError`**
+          // （2026-10-24 真实报障，来源 `63a5c3f`）：
+          //
+          //   上游用 HTTP 200 + SSE `event:error` 下发 `code=1005` 且 `message`
+          //   **为空串**，而文案表的 `hard-plan` 判据要求「`1005` 且含 `plan`
+          //   关键词」⇒ 判 `none` ⇒ `traeCooldownFor('none') = 0ms` ⇒ 限流标记
+          //   写在**失败那一瞬间** ⇒ 下次选号立刻又选回同一个号，换号形同虚设。
+          //   用户侧看到徽章 `QUOTA_EXCEEDED`，而日志里两个 trae 账号在同一模型
+          //   上的标记时刻完全相同（= 失败时刻），冷却时长为 0。
+          //
+          // ⚠️ 别「顺手」把文案表放宽（去掉 `plan` 关键词要求）：正文里恰好出现
+          // 的数字 `1005` 不该被当成权益不足 —— 那条限制是给 HTTP 报文用的。
+          // 两条判据**语义不同**：文案表猜正文，结构化码表读上游枚举。
+          if (currentAccountId.length > 0 && this.options.accountPool !== undefined) {
             const streamErr = (error as { cause?: unknown }).cause instanceof TraeStreamErrorCause
               ? (error as { cause?: TraeStreamErrorCause }).cause
               : undefined
-            const kind = streamErr !== undefined
-              ? classifyTraeError(0, JSON.stringify({ code: streamErr.code, message: streamErr.message }))
-              : undefined
+            const kind = streamErr !== undefined ? classifyTraeStreamCode(streamErr.code) : undefined
             const cooldownMs = kind !== undefined ? traeCooldownFor(kind) : TRAE_RATE_LIMIT_FALLBACK_MS
             await this.options.accountPool.updateModelRateLimit(
               currentAccountId,
@@ -1210,6 +1213,14 @@ export class TraeAdapter extends LlmAdapter {
               Date.now() + cooldownMs,
             )
           }
+          // 冷却已写；现在才判「还换不换」。
+          //
+          // 无账号池、或换号预算用尽 → 如实抛出（去掉哨兵码，换真实语义）。
+          if (this.options.accountPool === undefined || rotateBudget <= 0) {
+            throw new LlmError(error.message, 'QUOTA_EXCEEDED')
+          }
+
+          rotateBudget -= 1
           // 取下一个账号。
           //
           // ⚠️ **必须传真实 modelId 且传 `tried`**：
@@ -1576,7 +1587,7 @@ export class TraeAdapter extends LlmAdapter {
                   // 已有输出则如实抛真实错误码（绝不重放，防重复计费）。
                   if (ev.errorCode !== undefined && ev.errorMessage !== undefined) {
                     const message = traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model)
-                    if (isRotatableStreamError(ev.errorCode) && !gotAnyContent) {
+                    if (isRotatableTraeStreamCode(ev.errorCode) && !gotAnyContent) {
                       // ⚠️ **errorCode 必须随哨兵带出**：外层标记冷却时长按类别取
                       //（quota 24h / soft 60s）。`LlmErrorOptions` 是**校验契约**
                       //（塞自由字段会被构造器拒绝）⇒ 走 `cause` 通道。
