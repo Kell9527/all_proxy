@@ -14,6 +14,7 @@
  * |---|---|
  * | `account.list` | `GET /api/accounts?provider=` |
  * | `account.create` | `POST /api/login/start`（两步式，返回 loginUrl） |
+ * | `account.importLocalBrowser` | `POST /api/accounts/import-local-browser` |
  * | `login.poll` | `POST /api/login/poll` |
  * | `account.update` / `delete` / `reorder` | `PATCH`/`DELETE`/`POST` 对应端点 |
  * | `model.list` | `GET /api/models`（**含被关闭的模型**） |
@@ -81,6 +82,20 @@ export function createRpcBridge() {
         return post('/api/accounts', {
           provider: payload.provider,
           apiKey: payload.apiKey,
+          ...(payload.nickname ? { nickname: payload.nickname } : {}),
+        }, signal)
+      }
+      case 'account.importLocalBrowser': {
+        // 从**本机浏览器**导入登录态（仅 Magicrew）：读服务端本机浏览器的
+        // localStorage（只读），签发 mgw_ key 后落成一条独立账号。
+        //
+        // ⚠️ 与 'account.create' 是**两条路**：那条要服务端开窗、用户在服务端的
+        //    窗口里登（服务端无桌面时不可用）；这条不需要任何窗口。
+        // ⚠️ 千万**别**忘了在这里登记方法名 —— 漏了会得到一句
+        //    「未知管理方法: account.importLocalBrowser」，而按钮看起来完全正常
+        //    （用户 2026-10-30 实测踩到）。
+        return post('/api/accounts/import-local-browser', {
+          provider: payload.provider,
           ...(payload.nickname ? { nickname: payload.nickname } : {}),
         }, signal)
       }

@@ -104,6 +104,39 @@ describe('登录开窗接线（源码级断言）', () => {
     expect(hubSource).toContain('loginLinkHint(provider)')
   })
 
+  it('rpc-bridge 必须登记 account.importLocalBrowser（否则「未知管理方法」）', () => {
+    // ⚠️⚠️ 这条锁的是用户 2026-10-30 实测踩到的坑：面板按钮接好了、后端端点也写好了，
+    //    但 **rpc-bridge 的方法分派表漏登记** ⇒ 点按钮得到一句
+    //    「未知管理方法: account.importLocalBrowser」。
+    //
+    //    为什么极易漏：`rpcCall` 有两层 —— 面板里写 'rpcCall(method)'，
+    //    而这层 bridge 负责把**方法名**翻译成 HTTP 路径。只加后端端点、只改面板
+    //    调用，中间这张表不会报错，只会在运行时给一句「未知方法」。
+    //
+    //    ⚠️ 断言用方法名 + 路径**两个**串：只断言方法名可能是注释里出现的（本文件
+    //    就有大量注释提到它），那会变成一条永远为真的假断言。
+    const caseAt = bridgeSource.indexOf("case 'account.importLocalBrowser':")
+    expect(caseAt).toBeGreaterThan(-1)
+    // 路径必须在同一个 case 里（取该 case 到下一个 case 之间的片段）
+    const after = bridgeSource.slice(caseAt)
+    const nextCase = after.indexOf("case ", 10)
+    const body = nextCase > 0 ? after.slice(0, nextCase) : after
+    expect(body).toContain('/api/accounts/import-local-browser')
+  })
+
+  it('Magicrew 不展示登录链接（那条链接对它毫无作用）', () => {
+    // ⚠️ 在用户自己的浏览器里打开 magicrew 的登录页毫无作用 —— 凭据要落在
+    //    **服务端**那扇窗的 localStorage 里才读得到。展示它只会让用户以为
+    //    「点了就该有反应」，然后对着没反应的页面反复点。
+    expect(hubSource).toContain("provider !== 'magicrew' && loginUrlForManual")
+  })
+
+  it('Magicrew 的新建账号按钮走导入而不是 createAccount', () => {
+    // ⚠️ 走 createAccount 会去调 /api/login/start 让**服务端**开窗，而服务端
+    //    没有桌面时用户看不见那个窗口。
+    expect(hubSource).toContain("provider === 'magicrew') void importLocalBrowserAccount()")
+  })
+
   it('判重命中时前端提示「已在池中」并指引如何加新账号（reused 一路透传）', () => {
     // rpc-bridge：login.poll 透传 reused
     expect(bridgeSource).toContain('reused: r.reused === true')
