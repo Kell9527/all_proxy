@@ -19,7 +19,9 @@ import {
 } from './llm.js'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
-import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
+import {
+  creditExhaustedResetAtMs, isCreditExhausted, isRateLimited, parseRateLimitError,
+} from './llm-adapter.js'
 import { ToolCallId } from './llm.js'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from './llm.js'
 import {
@@ -1349,16 +1351,44 @@ export class BuddyAdapter extends LlmAdapter {
     }
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
-      // 限流处理：把当前账号在该模型上的重置时间记录下来，然后逐个尝试
-      // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
+      // 限流 / 额度耗尽处理：把当前账号在该模型上的重置时间记录下来，然后逐个
+      // 尝试其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
       // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
       // 状态与实际判定不一致）。
-      if (this.options.accountPool && isRateLimited(errorText)) {
+      //
+      // ⚠️⚠️ **额度耗尽（14018）必须与频率限流分开判、但走同一个换号分支**
+      // （2026-10-25 真实缺陷，Gitee IKQ6HJ）：两者动作相同（换号 + 写冷却），
+      // 但**冷却终点语义相反**：
+      //
+      //   | | 频率限流（6004 / 429） | 额度耗尽（14018） |
+      //   |---|---|---|
+      //   | 恢复方式 | 分钟级滚动窗口，时间到了就恢复 | 等次日配额 / 充值 |
+      //   | 冷却终点 | 服务端声明时刻，否则 +1h 兜底 | **UTC+8 当日 24:00** |
+      //   | 写成 +1h 的后果 | 无（本来就该 1 小时） | 每小时被选回、必然再失败 |
+      //
+      // 修前：14018 与频率限流**共用 HTTP 429**，而 `isRateLimited` 的文案表里
+      // 没有「权益/积分耗尽」⇒ 判 false ⇒ **整段换号逻辑被跳过**、直接抛给用户。
+      // 即便侥幸命中，`parseRateLimitError` 也会按「1 小时后」兜底 —— 而 14018
+      // 的报文里**一个时间字段都没有**（实测原文
+      // `{"error":{"data":{"code":14018,"msg":"Credits exhausted. …"}}}`），
+      // 于是账号每小时被重新选中一次、必然再失败一次，用户看到「面板说可以用了，
+      // 一试又不行」。
+      let creditExhausted = isCreditExhausted(errorText)
+      if (this.options.accountPool && (creditExhausted || isRateLimited(errorText))) {
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
 
         for (;;) {
-          const parsed = parseRateLimitError(errorText, options.model)
+          // ⚠️ 终点按语义分派，**不能**统一走 `parseRateLimitError`：
+          // 额度耗尽取 UTC+8 自然日 24:00；频率限流取服务端时刻或 +1h 兜底。
+          //
+          // ⚠️ 每轮都按**当前** `errorText` 重算：换号后新账号的失败原因可能
+          // 与上一个账号不同（A 额度耗尽、B 频率限流），沿用旧值会把 B 也
+          // 锁到当天 24:00 —— 那会白锁掉一个本来 1 小时后就恢复的账号。
+          creditExhausted = isCreditExhausted(errorText)
+          const parsed = creditExhausted
+            ? { modelId: options.model, resetTimeMs: creditExhaustedResetAtMs() }
+            : parseRateLimitError(errorText, options.model)
           if (!parsed) break
           // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）
           if (currentAccountId) {
@@ -1385,7 +1415,10 @@ export class BuddyAdapter extends LlmAdapter {
             return
           }
           errorText = await response.text().catch(() => '')
-          if (!isRateLimited(errorText)) {
+          // ⚠️ 换号后的新账号同样可能是「额度耗尽」—— 判据必须与入口同源，
+          // 否则第一个号耗尽、第二个号也耗尽时会被当成「非限流」直接抛出，
+          // 用户看到的是原始 14018 报文而不是「所有账号均受限」。
+          if (!isCreditExhausted(errorText) && !isRateLimited(errorText)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
             throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }

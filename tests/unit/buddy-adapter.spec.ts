@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, registerBuddyLlm } from '../../src/providers/buddy-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/providers/buddy.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/providers/product.js'
+import { creditExhaustedResetAtMs } from '../../src/providers/llm-adapter.js'
 
 const CREDENTIAL_REF = credentialRef('BUDDY_ACCESS_TOKEN')
 
@@ -1815,6 +1816,96 @@ describe('BuddyAdapter 账号池限流切换', () => {
       },
     }
   }
+
+  /**
+   * 额度耗尽（`14018 Credits exhausted`）响应体 —— 上游实测原文形态。
+   *
+   * ⚠️ 码在**第二层**（`error.data.code`），且**与频率限流共用 HTTP 429**。
+   * 报文里**一个时间字段都没有** —— 这正是「+1h 兜底」必然错的原因。
+   */
+  function creditExhaustedBody(): string {
+    return JSON.stringify({
+      error: {
+        data: {
+          code: 14018,
+          msg: 'Credits exhausted. Please visit the link below to purchase add-on packs.',
+        },
+      },
+    })
+  }
+
+  it('额度耗尽（14018）也触发换号，且冷却终点是 UTC+8 当日 24:00（不是 +1h）', async () => {
+    // ⚠️⚠️ 这条是本组的要害：修前 14018 不被 isRateLimited 命中 ⇒ **整段换号
+    // 逻辑被跳过** ⇒ 用户看到原始 14018 报文、池里其它账号一个都不试。
+    // 即便命中，按 +1h 兜底也会让账号每小时被选回、必然再失败。
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [{ id: 'acct-2', token: 'AT2' }],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        if (token === 'AT2') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        // 上游实测回 HTTP 429（与频率限流共用）
+        return new Response(creditExhaustedBody(), { status: 429 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 换号真的发生了（修前这里只会有 [AT1]）
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 受限账号被记录，且 modelId 透传正确
+    expect(pool.recorded).toHaveLength(1)
+    expect(pool.recorded[0]!.accountId).toBe('acct-1')
+    expect(pool.recorded[0]!.modelId).toBe(DEFAULT_MODEL)
+    // ⚠️ 要害断言：终点必须是 UTC+8 当日 24:00，不是 +1h。
+    const delta = pool.recorded[0]!.resetAtMs - Date.now()
+    expect(delta).toBeGreaterThan(0)
+    expect(delta).toBeLessThanOrEqual(24 * 3_600_000)
+    // 与 creditExhaustedResetAtMs() 逐毫秒一致（证明用的是同一个函数，不是本地另算）
+    const expected = creditExhaustedResetAtMs()
+    expect(Math.abs(pool.recorded[0]!.resetAtMs - expected)).toBeLessThan(2_000)
+  })
+
+  it('额度耗尽后全部账号都耗尽 ⇒ 报 QUOTA_EXCEEDED（而非原始 14018 报文）', async () => {
+    // 用户侧差别很大：原始报文是一坨 JSON，QUOTA_EXCEEDED 会被映射成 429 + 可读文案。
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [{ id: 'acct-2', token: 'AT2' }],
+    )
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async () => new Response(creditExhaustedBody(), { status: 429 }),
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+    // 两个账号都被记录了（第一个在入口、第二个在换号后的判据）
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+  })
 
   it('逐个尝试所有账号，每个失败账号都被记录限流', async () => {
     const pool = makePool(

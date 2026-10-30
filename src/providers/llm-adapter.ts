@@ -2179,6 +2179,108 @@ export function isRateLimited(body: string): boolean {
 }
 
 /**
+ * 额度耗尽的业务码（CodeBuddy 系实测值）。
+ *
+ * ⚠️ 与 {@link RATE_LIMIT_BUSINESS_CODE}（6004 = 频率限流）**不可合并**：
+ * 两者动作相同（换号 + 写冷却）但**冷却终点相反**（见 {@link isCreditExhausted}）。
+ */
+export const CREDIT_EXHAUSTED_BUSINESS_CODE = 14018
+
+/**
+ * 额度耗尽的文案兜底判据（码值腿之外的唯一通道）。
+ *
+ * 上游原话（`www.workbuddy.ai`，HTTP 429）：
+ * `Credits exhausted. Please visit the link below to purchase add-on packs…`
+ *
+ * ⚠️ **关键词必须窄**：`insufficient` 单独出现**过宽**（见 {@link isCreditExhausted}）。
+ */
+const CREDIT_EXHAUSTED_PATTERN =
+  /credits?\s+exhausted|quota\s+exhausted|积分.{0,4}(?:不足|耗尽|用尽)|额度.{0,4}(?:不足|耗尽|用尽)|余额.{0,4}(?:不足|耗尽|用尽)/i
+
+/**
+ * 额度**耗尽**（不是频率限流）的判据 —— 「钱用光了」，不是「发太快」。
+ *
+ * ## ⚠️⚠️ 为什么必须与 {@link isRateLimited} 分开（真实缺陷，Gitee IKQ6HJ）
+ *
+ * 两者的**动作完全相同**（换号 + 写冷却标记），但**冷却终点的语义相反**：
+ *
+ * | | 频率限流（6004 / 429） | 额度耗尽（14018 / Credits exhausted） |
+ * |---|---|---|
+ * | 恢复方式 | 时间到了就恢复（分钟级滚动窗口） | **等次日配额 / 充值** |
+ * | 冷却终点 | 服务端声明时刻，否则 +1h 兜底 | **UTC+8 当日 24:00** |
+ * | 写成 +1h 的后果 | 无（本来就该 1 小时） | **每小时被重新选中一次、必然再失败** |
+ *
+ * 用户侧症状（原始报障）：「面板说可以用了，一试又不行」—— 面板的『限额重置』
+ * 显示的是失败时刻 + 1 小时，到点后账号被重新选中、必然再失败一次、再写一条
+ * 1 小时标记，**循环往复**。而真实出路是等次日配额或充值。
+ *
+ * ## 为什么是「UTC+8 当日 24:00」而不是「+24h」
+ *
+ * 与 `loomyCooldownResetAtMs`（Gitee IKL80H 那起事故）**同一条纪律**：
+ * 额度按 UTC+8 自然日结算，用滑动 24h 会让 23:50 烧光的账号被封到**次日 23:50**
+ * —— 用户 0 点后上游明明已放行、本服务仍说「没到重置时间」，白等近一整天。
+ * 四家同口径的既有实现：`loomyCooldownResetAtMs` / `qoder-adapter` /
+ * `zcode-adapter` / 本文件的 codearts 分支。
+ *
+ * ## 判据刻意**窄**
+ *
+ * 只认 `14018` 码值与 `credits exhausted` 完整短语。**不收** `insufficient` 这类
+ * 泛词 —— 上下文超长报文里的 `the context window is insufficient for this model`
+ * 会被误伤，而那是「换号无益」的另一类失败；中文侧同样只收
+ * 「额度/积分/余额 + 不足/耗尽」的**确定性组合**。
+ *
+ * ⚠️ **本函数只看响应体，不看状态码**：14018 实测回 **HTTP 429**，但它与
+ * 频率限流共用 429 ⇒ 状态码对这一格**没有判别力**，只能靠码值/文案。
+ *
+ * @param body - 响应体（可能为空串）。
+ */
+export function isCreditExhausted(body: string): boolean {
+  if (body.length === 0) return false
+  // ① 结构化业务码：只认 JSON 的 `code` 字段（与 `hasRateLimitBusinessCode` 同一
+  //    取舍 —— 全文搜 `14018` 会被 UUID 里的数字子串误命中）。
+  //
+  //    ⚠️ **必须同时认嵌套形态**：buddy 系的真实报文是
+  //    `{"error":{"data":{"code":14018,"msg":"…"}}}`（码在**第二层**），
+  //    只看顶层 `code` 会让码值腿在这家**恒不命中**、只剩英文文案腿 ——
+  //    而上游一改文案就静默失效。
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    const inner = typeof data.error === 'object' && data.error !== null
+      ? data.error as Record<string, unknown>
+      : undefined
+    const nested = typeof inner?.data === 'object' && inner.data !== null
+      ? inner.data as Record<string, unknown>
+      : undefined
+    const codes = [data.code, inner?.code, nested?.code]
+    if (codes.some(code => code === CREDIT_EXHAUSTED_BUSINESS_CODE
+      || code === String(CREDIT_EXHAUSTED_BUSINESS_CODE))) {
+      return true
+    }
+  } catch {
+    // 非 JSON：交给文案腿。
+  }
+  // ② 文案腿（网关包装过的 200/400、纯文本错误页、以及 `errorDetail` 产物）。
+  return CREDIT_EXHAUSTED_PATTERN.test(body)
+}
+
+/**
+ * 额度耗尽的冷却终点：**UTC+8 当日 24:00**。
+ *
+ * 与 {@link isCreditExhausted} 配套，供 `buddy-adapter` 的换号记账分支与
+ * `account-probe` 的重测回写共用 —— **只留一份实现**，两处各算一次必然漂移。
+ *
+ * ⚠️ **必须放在本文件（共享层）而不是某个渠道的适配器里**：`account-probe.ts`
+ * 也要用它（重测时把同一时刻回传给存储），而探测层不得反向依赖某个渠道的
+ * 适配器 —— 那些 spec 普遍 `vi.mock('../../src/buddy-adapter.js')`，形成依赖后
+ * 那个 mock 会把该函数一起变成 `undefined`（Gitee IKQ6HJ 报告里记录的同一处陷阱）。
+ *
+ * @param nowMs - 当前时刻（注入以便单测）。
+ */
+export function creditExhaustedResetAtMs(nowMs: number = Date.now()): number {
+  return nextUtc8DayStartMs(nowMs)
+}
+
+/**
  * 重置时间的两种句式（中文 / 英文），并**捕获实际时区**而非硬编码 UTC+8。
  *
  * 中文（buddy 国内版）："您的使用量已超出频率限制，将在 2026-09-11 18:08:17 UTC+8 重置"
