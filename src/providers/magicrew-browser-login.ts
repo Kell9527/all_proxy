@@ -696,6 +696,16 @@ export async function createChromiumMagicrewLogin(
     initialUrl: url,
     ...deps.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: deps.readyTimeoutMs },
     label: '超级麦吉',
+    // ⚠️ Edge 兜底告警的产品名**显式**给，不依赖 label 的默认值：
+    //    那两句文案的读者是用户，"超级麦吉" 比裸 label 更清楚。
+    edgeLabel: '超级麦吉',
+    // ⚠️ 前缀用 `[magicrew]`（本项目其余 13 处日志同口径）。
+    //    不传会落到默认的 `[jet-hub]` —— 那是上游插件的名字，**本项目别处不存在**，
+    //    用户按 `magicrew` 搜日志会一条都搜不到。
+    logPrefix: '[magicrew]',
+    // ⚠️ 本产品**没有 captcha**：默认文案（若 Edge 异常导致 captcha 失败）会把用户
+    //    引去查一个根本不存在的环节。这里换成真实的失败面 —— 登录页打不开。
+    failureHint: '若 Edge 异常导致登录页打不开或读不到登录态',
     notFoundHint: '（网页版登录需要本机有一个 Chromium 内核浏览器）',
     ...deps.log === undefined ? {} : { log: deps.log },
   })

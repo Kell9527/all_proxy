@@ -180,3 +180,56 @@ describe('多账号：每次登录必须是新的会话（否则读到上一个�
     }
   })
 })
+
+describe('诊断日志：浏览器链路的告警必须真的能落进日志', () => {
+  it('orchestrator 把 log 接进 startUrlFlow，且 magicrew 分支透传（接线不能断）', async () => {
+    // ⚠️⚠️ 这条锁的是一处**已实际漏掉**的接线：`startMagicrewLoginFlow` 的
+    //    `log` 链路本身是通的（一路传到 `ChromiumSession`），但 orchestrator 里
+    //    **调用时根本没传** ⇒ 整条链是断的，而症状是「日志里一个字都没有」，
+    //    与「用户没登」完全一样。
+    //
+    //    上游对这条日志的定性：放弃等待时那一行「CDP 与磁盘都没读到凭据」是
+    //    下次报障时**唯一能区分两者**的东西。
+    //
+    // ⚠️ **为什么不跑一次 `orchestrator.start('magicrew')` 来验**：那会真的
+    //    spawn 一个 Chromium 窗口弹到用户桌面上 —— 上游记过两次「单测弹出真实
+    //    浏览器窗口」的污染，并明确要求这条腿必须走注入的 `sessionFactory`。
+    //    而 `sessionFactory` 收不到 `log`（它只拿 URL），所以从这里观测不到。
+    //    ⇒ 只能对**接线本身**做结构断言。这类断言在别处是劣选，但这里是唯一安全的。
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const source = readFileSync(join(process.cwd(), 'src/login/orchestrator.ts'), 'utf8')
+    // ① flowOptions 声明里有 log
+    expect(source).toContain('log?: (message: string) => void')
+    // ② start() 从 logger 桥接出 log（走 warn：诊断行不会默认级别被滤掉）
+    expect(source).toContain('log: (message: string) => logger.warn(message)')
+    // ③ magicrew 分支把它传下去（漏这一行 = 前两步白做）
+    expect(source).toContain('flowOptions.log === undefined ? {} : { log: flowOptions.log }')
+  })
+
+  it('magicrew 的浏览器日志用 [magicrew] 前缀，不是上游插件的 [jet-hub]', async () => {
+    // ⚠️ `[jet-hub]` 是**上游插件的名字**，在本项目的其它任何地方都不存在。
+    //    移植时若沿用默认前缀，用户按 `magicrew` 搜日志会一条都搜不到。
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const source = readFileSync(join(process.cwd(), 'src/providers/magicrew-browser-login.ts'), 'utf8')
+    expect(source).toContain("logPrefix: '[magicrew]'")
+    // ⚠️ 且**不得**把默认值改掉：zcode 那条腿的日志一直是 [jet-hub]，
+    //    改默认值会让既有排查习惯失效（默认值是为了逐字保持）。
+    const session = readFileSync(join(process.cwd(), 'src/providers/chromium-session.ts'), 'utf8')
+    expect(session).toContain("?? '[jet-hub]'")
+  })
+
+  it('magicrew 的 Edge 告警不出现 captcha 字样（本产品没有这个环节）', async () => {
+    // ⚠️ 默认文案是「若 Edge 异常导致 captcha 失败」—— 那是 zcode 的语境。
+    //    magicrew 照搬会让用户去查一个根本不存在的环节。
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const source = readFileSync(join(process.cwd(), 'src/providers/magicrew-browser-login.ts'), 'utf8')
+    expect(source).toContain('failureHint:')
+    expect(source).toContain('登录页打不开')
+    // 且默认值保持 captcha 语境不变（zcode 逐字保持）
+    const session = readFileSync(join(process.cwd(), 'src/providers/chromium-session.ts'), 'utf8')
+    expect(session).toContain('captcha 失败')
+  })
+})

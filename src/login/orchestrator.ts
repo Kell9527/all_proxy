@@ -112,7 +112,22 @@ function loomyOutcome(login: LoomyLoginResult & { phone: string; nickname?: stri
 async function startUrlFlow(
   provider: string,
   fetcher: typeof fetch,
-  flowOptions: { pollIntervalMs?: number; method?: string; region?: string } = {},
+  flowOptions: {
+    pollIntervalMs?: number
+    method?: string
+    region?: string
+    /**
+     * 诊断输出（透传给需要它的 provider）。
+     *
+     * ⚠️ 目前只有 **magicrew** 真的消费它，且**必须接**：
+     * 浏览器登录失败/超时时，那一行「CDP 与磁盘都没读到凭据」是下次报障时
+     * **唯一能区分「用户没登」与「我们读凭据的方式坏了」**的东西。
+     * 不传 ⇒ 那行日志等于不存在，而症状（白转 4 分钟）两者完全一样。
+     *
+     * 其余 provider 忽略该字段。
+     */
+    log?: (message: string) => void
+  } = {},
 ): Promise<UrlFlowHandle> {
   switch (provider) {
     case 'codearts': {
@@ -252,7 +267,7 @@ async function startUrlFlow(
       // ⚠️ 浏览器起不来（无 GUI / 没装 Chromium）⇒ 抛 `BrowserDeploymentError`，
       // 由前端展示「需要本机有一个 Chromium 内核浏览器」的可执行提示。
       const flow = await startMagicrewLoginFlow({
-        ...(flowOptions.pollIntervalMs !== undefined ? {} : {}),
+        ...(flowOptions.log === undefined ? {} : { log: flowOptions.log }),
       })
       return {
         loginUrl: flow.loginUrl,
@@ -389,10 +404,14 @@ export class LoginOrchestrator {
    */
   async start(provider: string, method?: string, options?: { region?: string }): Promise<StartedLoginSession> {
     const fetcher = this.options.fetcher ?? fetch
+    const logger = this.options.logger
     const flow = await startUrlFlow(provider, fetcher, {
       pollIntervalMs: this.options.pollIntervalMs,
       ...(method === undefined ? {} : { method }),
       ...(options?.region === undefined ? {} : { region: options.region }),
+      // ⚠️ 走 `logger.warn` 而不是 `info`：浏览器登录的诊断行是**异常路径**上的线索
+      // （起不来 / 读不到凭据 / 落到 Edge 兜底），在 warn 级别才不会被默认日志级别滤掉。
+      ...(logger === undefined ? {} : { log: (message: string) => logger.warn(message) }),
     })
     const id = `login-${randomUUID().slice(0, 8)}`
     const record: SessionRecord = {

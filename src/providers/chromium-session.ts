@@ -1106,6 +1106,25 @@ export interface ChromiumSessionOptions {
    */
   notFoundHint?: string
   /**
+   * 诊断日志的**行首前缀**（默认 `[jet-hub]`）。
+   *
+   * ⚠️ 默认值是为 zcode **逐字保持**用的（zcode 那条腿的日志一直是 `[jet-hub] …`，
+   * 改前缀会让既有的日志检索习惯失效）。
+   * ⚠️ 新调用方**应当传自己的前缀**：magicrew 传 `[magicrew]`，与该项目其余
+   * 13 处日志同口径。不传的话，magicrew 的浏览器诊断行会混在 `[jet-hub]` 里 ——
+   * 而 `jet-hub` 在**本项目的其它任何地方都不存在**（它只是上游插件的名字），
+   * 用户按 `magicrew` 搜日志会一条都搜不到。
+   */
+  logPrefix?: string
+  /**
+   * Edge 兜底告警里的**「失败了会怎样」**那半句（默认是 captcha 语境）。
+   *
+   * ⚠️ 默认值同样是为 zcode 逐字保持（`若 Edge 异常导致 captcha 失败`）。
+   * ⚠️ magicrew **没有 captcha** —— 照搬会让用户去查一个本产品根本没有的环节。
+   * 新调用方应按自己的失败面给一句（如「若 Edge 异常导致登录页打不开」）。
+   */
+  failureHint?: string
+  /**
    * Edge 兜底告警里的产品名（默认取 {@link label}）。
    *
    * ⚠️ 也是**逐字保持**用的：zcode 原句写的是 `zcode captcha`，
@@ -1286,9 +1305,13 @@ export class ChromiumSession {
      */
     if (isEdgeExecutable(executable)) {
       const edgeLabel = this.options.edgeLabel ?? label
+      // ⚠️ 前缀与「失败后果」都取自选项（见对应字段的注释）：
+      //    默认值让 zcode 逐字不变，新调用方传自己的口径。
+      const prefix = this.options.logPrefix ?? '[jet-hub]'
+      const failureHint = this.options.failureHint ?? '若 Edge 异常导致 captcha 失败'
       this.log?.(
-        `[jet-hub] ${edgeLabel} 未检测到 Chrome/Chromium，改用系统 Edge（msedge.exe）产出 —— ` +
-        `若 Edge 异常导致 captcha 失败，可安装 Chrome/Chromium 或用 ${envName} 指定其它浏览器。`,
+        `${prefix} ${edgeLabel} 未检测到 Chrome/Chromium，改用系统 Edge（msedge.exe）产出 —— ` +
+        `${failureHint}，可安装 Chrome/Chromium 或用 ${envName} 指定其它浏览器。`,
       )
     }
 
