@@ -57,6 +57,9 @@ const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
   // 但本项目的「粘贴 key 建号」会造出 `SENSENOVA_ACCOUNT_*` ref，
   // 故登记以保证 ACCOUNT_REF_RE 与本表一致（否则自建 ref 会被判为不可识别）。
   SENSENOVA: 'sensenova',
+  // Magicrew（超级麦吉）：浏览器登录建号时会造出 `MAGICREW_ACCOUNT_*` ref。
+  // 与 SENSENOVA 同理 —— 不登记的话自建 ref 会被判为不可识别、账号被静默丢弃。
+  MAGICREW: 'magicrew',
 }
 
 /**
@@ -65,7 +68,7 @@ const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
  * ⚠️ 前缀集合必须与 {@link PROVIDER_BY_REF_PREFIX} 一致 —— 少一个就会让那类
  * 账号在导入时被静默丢弃（来源正是如此漏掉了四个）。
  */
-const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|CLINE|LOOMY|RACCOON|OFFICEACE|ACCIO|SENSENOVA)_ACCOUNT_([0-9A-Fa-f]{6,})$/
+const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|CLINE|LOOMY|RACCOON|OFFICEACE|ACCIO|SENSENOVA|MAGICREW)_ACCOUNT_([0-9A-Fa-f]{6,})$/
 
 /**
  * `refresh_token` 一次性轮换的 provider。
@@ -75,7 +78,13 @@ const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|
  * OfficeAce（华为 MDS）同样一次性；Accio（阿里）参考实现明确记录「刷新会轮换
  * refresh_token」。导入后若 DSH 与 all_proxy 都去刷新，会互相作废。
  */
-const ROTATING_REFRESH_PROVIDERS = new Set(['codearts', 'trae', 'officeace', 'accio'])
+const ROTATING_REFRESH_PROVIDERS = new Set([
+  'codearts', 'trae', 'officeace', 'accio',
+  // Magicrew（超级麦吉）：来源模块头第 2 条硬约束 —— refresh_token
+  // 「7 天、**一次性轮换**」，每换一次就作废旧的。故必须进本表（与 codearts /
+  // trae 同因：两边都去刷新会互相作废，账号莫名掉登录）。
+  'magicrew',
+])
 
 /** 导入来源路径。 */
 export interface DshPaths {

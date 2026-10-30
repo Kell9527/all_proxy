@@ -15,6 +15,7 @@
  * |---|---|---|---|
  * | raccoon | `GET {apiBase}/v1/user_info` | `phone` | 完整 11 位 |
  * | accio | `POST /api/auth/userinfo` | `maskedMobile` | 上游脱敏 `+86 189****3950` |
+ * | magicrew | `GET {host}/api/v1/contact/accounts/me/users` | `phone` | **本地号（10 位，无国家码）** |
  *
  * 取不到时按 provider 回退：officeace 显示华为 `accountId`（上游**没有**任何
  * 手机号来源，见下），其余显示 ref 名 —— 与改动前完全一致。
@@ -56,6 +57,9 @@ import { fetchRaccoonUserInfo } from '../providers/raccoon-oauth.js'
 import type { RaccoonCredential } from '../providers/raccoon.js'
 import { fetchAccioUserInfo } from '../providers/accio-credits.js'
 import type { AccioCredential } from '../providers/accio.js'
+import { fetchMagicrewProfile } from '../providers/magicrew-profile.js'
+import { MAGICREW } from '../providers/magicrew-product.js'
+import { parseMagicrewCredential } from '../providers/magicrew-auth.js'
 
 /** 取到过的手机号：几乎不变，缓存 6 小时。 */
 const PHONE_HIT_TTL_MS = 6 * 60 * 60 * 1000
@@ -157,6 +161,23 @@ export class AccountPhoneResolver {
       if (provider === 'accio') {
         const info = await fetchAccioUserInfo(credential as unknown as AccioCredential, { fetcher })
         return normalizePhone(info?.maskedMobile)
+      }
+      if (provider === 'magicrew') {
+        // ⚠️ 走**共享**的 `parseMagicrewCredential`（jwt 是唯一必需字段，与适配器 /
+        //    池同一条口径），不在这里另判一次凭据形状。
+        const parsed = parseMagicrewCredential(credential)
+        if (parsed === undefined) return undefined
+        const profile = await fetchMagicrewProfile({
+          jwt: parsed.jwt,
+          organizationCode: parsed.organizationCode,
+          product: MAGICREW,
+          fetchImpl: fetcher,
+        })
+        // ⚠️ 上游给的是**本地号码（10 位）**，原样展示 —— **不补国家码**：
+        //    10 位既可能是「少了国家码」也可能是「少了首位」，两者无法从号码
+        //    本身区分。编造一个 11 位号会让用户以为登录的是另一个账号。
+        //    （见 `src/login/magicrew-login.ts` 的 `normalizeMagicrewPhone`。）
+        return normalizePhone(profile.phone)
       }
     } catch (error) {
       this.deps.logger?.warn?.(`[account-phone] ${provider} 查询账号身份失败: ${String(error)}`)

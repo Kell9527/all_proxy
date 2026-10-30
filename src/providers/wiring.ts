@@ -365,6 +365,10 @@ import { OfficeAceAdapter, fetchOfficeAceRemoteModels } from './officeace-adapte
 import { fetchOfficeAceModelTokenRates } from './officeace-credits.js'
 import { AccioAdapter } from './accio-adapter.js'
 import { SensenovaAdapter, fetchSensenovaRemoteModels } from './sensenova-adapter.js'
+import { MagicrewAdapter } from './magicrew-adapter.js'
+import { MAGICREW } from './magicrew-product.js'
+import { fetchMagicrewCatalogModels } from './magicrew-catalog.js'
+import { parseMagicrewCredential } from './magicrew-auth.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
@@ -999,6 +1003,67 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
         fetchSensenovaRemoteModels(ctx.pool, SENSENOVA, fetcher)),
     }),
   )
+
+  // ── Magicrew（超级麦吉）：三层凭证 + 浏览器登录 ──
+  //
+  // ⚠️ 与其余 12 家的**根本差异：登录必须借本机 Chromium**。上游没有 OAuth
+  // 回调通道，凭据（网页 JWT + organizationCode）只存在于浏览器的 localStorage
+  // 里 ⇒ 只能「开一个独立 profile 的窗口让用户自己登，再把凭据读回来」。
+  // 这条腿的实现在 `magicrew-browser-login.ts`（移植自来源，判据逐条真机取证）。
+  //
+  // ⚠️ **多账号靠「每次登录一个一次性 profile」**：复用 profile 会让第二个账号
+  // 一秒内读到**上一个账号**的 jwt ⇒ 建不出新账号（来源记过这条）。
+  // 本项目的 `LoginOrchestrator` 每次 `start()` 一条会话，天然并发，
+  // 故 profile 隔离必须在浏览器登录那一层保证（已由 `profilePrefix` 做到）。
+  //
+  // 换号：**无请求级换号**（`rotatesAccounts: false`）—— 本适配器不写
+  // `modelRateLimit`，没有换号分支。如实登记，不臆造。
+  registry.register(
+    descriptorFor('magicrew', MAGICREW.displayName, MAGICREW.host, {
+      authKind: 'custom',
+      catalogSource: 'remote-first',
+      supportsImages: true,
+      rotatesAccounts: false,
+    }),
+    new MagicrewAdapter({
+      product: MAGICREW,
+      // ⚠️ 透传 modelId：本家虽无换号，但池的模型级限流过滤仍按它工作
+      // （手工在面板标记的限流也要生效）。空串会让过滤整体短路。
+      resolveCredential: (modelId?: string) => ctx.resolveCredential('magicrew', modelId) as never,
+      accountPool: ctx.pool,
+      warn: (message) => ctx.logger.warn(message),
+      // ⚠️ 读图入口的**契约差异**：`WiringContext.readImage` 返回类型不含
+      // `undefined`（缺附件服务时直接抛），而本适配器要的是「读不到返回 undefined，
+      // 由适配器统一判成 INVALID_REQUEST」。故这里包一层：抛错转成 undefined，
+      // 让「读不到」与「没配入口」两条路的文案由适配器统一给出。
+      readImage: async (attachment) => {
+        try {
+          return await ctx.readImage(attachment)
+        } catch {
+          return undefined
+        }
+      },
+      fetchRemoteModels: () => fetchRemoteCatalog('magicrew', async () => {
+        // ⚠️ 目录取号**不走 `ctx.resolveCredential`**：那条路径会按限流/积分过滤，
+        // 把「拉目录」连坐成失败（与 Loomy / Raccoon / OfficeAce 同因）。
+        const account = ctx.pool.listAccountsByProvider('magicrew')
+          .find((entry) => entry.enabled !== false)
+        if (account === undefined) return []
+        const credential = parseMagicrewCredential(await ctx.credentials.resolve(account.credentialRef))
+        if (credential === undefined) return []
+        const models = await fetchMagicrewCatalogModels({
+          jwt: credential.jwt,
+          organizationCode: credential.organizationCode,
+          product: MAGICREW,
+          fetchImpl: fetcher,
+        })
+        // ⚠️ `fetchRemoteCatalog` 要可变数组（它会 push/slice），而目录原语返回
+        // readonly ⇒ 这里复制一次。别改成 `as` 断言：那会在真往只读数组写时
+        // 静默失败（冻结对象上 push 会抛，非冻结则悄悄改到缓存里）。
+        return [...models]
+      }),
+    }),
+  )
 }
 
 /**
@@ -1021,4 +1086,5 @@ export const ALL_PROVIDER_IDS = [
   'officeace',
   'accio',
   'sensenova',
+  'magicrew',
 ] as const

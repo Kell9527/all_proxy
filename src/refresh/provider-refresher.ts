@@ -63,10 +63,16 @@ import { refreshOfficeAceCredential, type OfficeAceCredential } from '../provide
 import { refreshAccioCredential } from '../providers/accio-oauth.js'
 import { accioExpiresAtMs, type AccioCredential } from '../providers/accio.js'
 import { isAccioTerminalRefreshError } from '../providers/accio-auth.js'
+import { refreshMagicrewKey } from '../providers/magicrew-auth.js'
+import { MAGICREW } from '../providers/magicrew-product.js'
 
 /** 已接线的 provider。loomy 没有 refresh 端点，属已知限制（AGENTS.md）。 */
 export const REFRESH_SUPPORTED_PROVIDERS = new Set([
   'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon', 'officeace', 'accio',
+  // Magicrew（超级麦吉）：refresh_token 一次性轮换（见 dsh-import 的同名登记）。
+  // ⚠️ 本家续期的产物是 **api_key（2 小时）**，不是 jwt —— 与其余各家语义不同，
+  // 故 `expiresAt` 写的是 api_key 的到期时刻（见 refreshMagicrew）。
+  'magicrew',
 ])
 
 /** 刷新结果：新凭据（整体替换写回凭据存储）。 */
@@ -359,6 +365,61 @@ async function refreshAccio(credential: Record<string, unknown>, fetcher: typeof
 }
 
 /**
+ * Magicrew：`PUT /api/v1/model-gateway/tokens`（body 只带 refresh_token）。
+ *
+ * ## ⚠️⚠️ 本家的「续期」续的是 **api_key**，不是 jwt
+ *
+ * 三层凭证的有效期完全不同（来源实测）：网页 JWT 30 天、`mgw_` api_key **2 小时**、
+ * refresh_token 7 天且**一次性轮换**。能自动续的只有 api_key —— jwt 过期只能重新登录。
+ * ⇒ 本函数**不碰 jwt**，原样保留它（拉目录 / 积分还要用）。
+ *
+ * ## ⚠️ 续期**不走 JWT 头**
+ *
+ * 来源明确：PUT 时带上 JWT 反而会在 JWT 过期时把「能续的」变成「不能续的」
+ * —— 这条路径的存在意义就是 JWT 已经没用了。
+ *
+ * ## ⚠️ 终态判据必须窄
+ *
+ * refresh_token 一次性 ⇒ 一旦上游说「不认了」就是终态（只能重登）。
+ * 但网络抖动 / 5xx / 超时**不是**终态（否则一次瞬时失败被固化成单向门，
+ * 账号永久判死）。
+ */
+async function refreshMagicrew(
+  credential: Record<string, unknown>,
+  fetcher: typeof fetch,
+): Promise<RefreshedCredential> {
+  const refreshToken = credential['refreshToken']
+  if (typeof refreshToken !== 'string' || refreshToken.length === 0) {
+    // ⚠️ 没有 refresh_token **不抛终态**：凭据仍能用 jwt 拉目录 / 积分。
+    //    返回原凭据让调用方把这次续期当「无需续期」处理。
+    return credential
+  }
+  let key
+  try {
+    key = await refreshMagicrewKey({ refreshToken, product: MAGICREW, fetchImpl: fetcher })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    // ⚠️ 终态：上游明确说这份 refresh_token 不认了 / 已被消费。
+    //    其余（网络、5xx、超时）一律按可重试处理。
+    if (/invalid|expired|used|consumed|已失效|已使用|不合法|token无效/i.test(message)) {
+      throw new RefreshTokenExpiredError(
+        `Magicrew refresh_token 已失效（一次性），请重新登录（${message}）`,
+      )
+    }
+    throw networkError('Magicrew', error)
+  }
+  // ⚠️ 一次性轮换：上游回了新 token 就必须用新的（否则下一轮拿旧 token 去换必然失败）。
+  //    ⚠️ 这里**只覆盖**续期相关的三个字段，jwt / organizationCode / phone / nickname
+  //    全部原样保留 —— 丢掉它们会让「拉目录」与「卡片展示」一起坏掉。
+  return {
+    ...credential,
+    apiKey: key.apiKey,
+    ...key.apiKeyExpiresAt === undefined ? {} : { apiKeyExpiresAt: key.apiKeyExpiresAt },
+    ...key.refreshToken === undefined ? {} : { refreshToken: key.refreshToken },
+  } as RefreshedCredential
+}
+
+/**
  * 刷新某账号的凭据并返回**新凭据**。
  *
  * ⚠️ 调用方（调度器/适配器回调）必须把返回值**立即回写**凭据存储——
@@ -385,6 +446,7 @@ export async function refreshProviderCredential(
     case 'raccoon': return refreshRaccoon(credential, fetcher)
     case 'officeace': return refreshOfficeAce(credential)
     case 'accio': return refreshAccio(credential, fetcher)
+    case 'magicrew': return refreshMagicrew(credential, fetcher)
     case 'loomy':
       throw new Error('Loomy 没有 refresh 端点，token 过期只能重新登录（手机号验证码路径成本很低）')
     default:

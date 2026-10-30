@@ -47,6 +47,7 @@ import { startRaccoonLoginFlow } from '../providers/raccoon-login-page.js'
 import { startOfficeAceLoginFlow } from '../providers/officeace-login.js'
 import { startAccioLoginFlow } from '../providers/accio-login.js'
 import type { AccioRegion } from '../providers/accio-product.js'
+import { startMagicrewLoginFlow } from '../login/magicrew-login.js'
 
 /**
  * 登录会话的存活上限：到点自动清理回调服务器与端口。
@@ -237,6 +238,40 @@ async function startUrlFlow(
         loginUrl: flow.loginUrl,
         result: flow.result.then(outcomeFromFlowResult),
         cancel: flow.close,
+      }
+    }
+    case 'magicrew': {
+      // ⚠️ **本家必须借本机 Chromium**：上游没有 OAuth 回调，凭据只存在于
+      // 浏览器的 localStorage 里 ⇒ 只能「起一个独立 profile 的窗口让用户自己登，
+      // 再把凭据读回来」。
+      //
+      // ⚠️⚠️ **多账号靠「每次登录一个一次性 profile」**：复用 profile 会让第二个
+      // 账号一秒内读到**上一个账号**的 jwt（来源实测）⇒ 建不出新账号。
+      // 该隔离在 `magicrew-browser-login.ts` 的 `profilePrefix` 里保证。
+      //
+      // ⚠️ 浏览器起不来（无 GUI / 没装 Chromium）⇒ 抛 `BrowserDeploymentError`，
+      // 由前端展示「需要本机有一个 Chromium 内核浏览器」的可执行提示。
+      const flow = await startMagicrewLoginFlow({
+        ...(flowOptions.pollIntervalMs !== undefined ? {} : {}),
+      })
+      return {
+        loginUrl: flow.loginUrl,
+        result: flow.result.then((result) => {
+          // ⚠️ `undefined` = 用户没登完（超时 / 关窗），**不是失败**：
+          // 抛一个可读的错误，让 poll 给出「登录超时，请重试」而不是静默 pending。
+          if (result === undefined) {
+            throw new Error('登录超时：未在时限内完成超级麦吉网页登录（请重试）')
+          }
+          return {
+            access: result.access,
+            expires: result.expires ?? 0,
+            // ⚠️ 恒 true：api_key 可由 refresh_token 续期（一次性轮换，
+            // 见 `magicrew-auth.ts` 的 `refreshMagicrewKey`）。
+            refreshable: true,
+            ...(result.nickname === undefined ? {} : { nickname: result.nickname }),
+          }
+        }),
+        cancel: flow.cancel,
       }
     }
     default:

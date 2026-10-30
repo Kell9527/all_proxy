@@ -13,12 +13,12 @@ import { parseModelRef } from '../../src/providers/registry.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
-/** 全部 13 个 provider 的期望清单（与规格一致）。 */
+/** 全部 14 个 provider 的期望清单（与规格一致）。 */
 const EXPECTED = [
-  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'officeace', 'accio', 'sensenova',
+  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'officeace', 'accio', 'sensenova', 'magicrew',
 ]
 
-describe('13 个 provider 的装配', () => {
+describe('14 个 provider 的装配', () => {
   let dir: string
   let pool: AccountPool
   let registry: ProviderRegistry
@@ -42,9 +42,9 @@ describe('13 个 provider 的装配', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('注册了全部 13 个 provider（一个不少、一个不多）', () => {
+  it('注册了全部 14 个 provider（一个不少、一个不多）', () => {
     expect(registry.ids().sort()).toEqual([...EXPECTED].sort())
-    expect(registry.ids()).toHaveLength(13)
+    expect(registry.ids()).toHaveLength(14)
   })
 
   it('ALL_PROVIDER_IDS 与注册结果一致（防止清单漂移）', () => {

@@ -221,6 +221,10 @@ const OFFICEACE_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/
 const ACCIO_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%23FF6A00"/%3E%3Ctext x="12" y="17.5" font-size="13" font-family="sans-serif" font-weight="800" fill="white" text-anchor="middle"%3EAC%3C/text%3E%3C/svg%3E';
 const SENSENOVA_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="white"/%3E%3Ctext x="12" y="17.5" font-size="14" font-family="sans-serif" font-weight="800" fill="%23E60012" text-anchor="middle"%3ESN%3C/text%3E%3C/svg%3E';
 
+// ⚠️ 上游没有可用的 logo 资产 ⇒ 用文字占位（与 SENSENOVA_ICON 同款降级）。
+//    别塞一个「看起来像官方」的自造图形：那会让人以为这是官方图标。
+const MAGICREW_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="white"/%3E%3Ctext x="12" y="17.5" font-size="13" font-family="sans-serif" font-weight="800" fill="%23FF6A00" text-anchor="middle"%3E%E9%BA%A6%3C/text%3E%3C/svg%3E';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -239,6 +243,9 @@ const PROVIDERS = Object.freeze([
   { id: 'officeace', label: 'OfficeAce (华为云)', icon: OFFICEACE_ICON, logoClass: 'officeace' },
   { id: 'accio', label: 'Accio (阿里)', icon: ACCIO_ICON, logoClass: 'accio' },
   { id: 'sensenova', label: 'SenseNova (商汤)', icon: SENSENOVA_ICON, logoClass: 'sensenova' },
+  // ⚠️ label 用『超级麦吉』而不是『Magicrew』：与 `MAGICREW.displayName` 一致，
+  // 且用户认的是中文名（上游站点就叫这个）。长度也在不换行范围内。
+  { id: 'magicrew', label: '超级麦吉', icon: MAGICREW_ICON, logoClass: 'magicrew' },
 ]);
 
 /**

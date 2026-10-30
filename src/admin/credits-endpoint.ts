@@ -57,6 +57,9 @@ import { isAccioExpired, type AccioCredential } from '../providers/accio.js'
 import { fetchAccioBalanceDetailed } from '../providers/accio-credits.js'
 import { isExpiring, type OfficeAceCredential } from '../providers/officeace-auth.js'
 import { fetchOfficeAceBalanceDetailed } from '../providers/officeace-credits.js'
+import { fetchMagicrewBalance } from '../providers/magicrew-credits.js'
+import { MAGICREW } from '../providers/magicrew-product.js'
+import { parseMagicrewCredential } from '../providers/magicrew-auth.js'
 import { credentialRef } from '../providers/credential-ref.js'
 import type { CreditsBalanceExtra } from '../providers/credits.js'
 import type { ProviderAccountEntry } from '../providers/types.js'
@@ -386,6 +389,44 @@ async function fetchBalancesInner(provider: string, deps: CreditsEndpointDeps): 
           )
           balance = result.balance
           if (result.balance === null) error = result.error ?? '积分查询失败'
+        }
+      } catch (caught) {
+        deps.warn?.(`[credits] balances 账号 ${entry.id} 失败: ${String(caught)}`)
+        error = caught instanceof Error ? caught.message : String(caught)
+        balance = null
+      }
+      out.push({ accountId: entry.id, nickname: entry.nickname, balance, ...(error === undefined ? {} : { error }) })
+    }
+    return { accounts: out }
+  }
+  if (provider === 'magicrew') {
+    // Magicrew（超级麦吉）：`GET /api/v1/quota/points/total`（JWT + organization-code）。
+    //
+    // ⚠️ **不自动领任何东西**：本家没有签到 / 领奖端点（与 OfficeAce 不同）。
+    //    照抄 OfficeAce 的「拉余额前自动领」会得到一条必然 404 的写请求。
+    //
+    // ⚠️ 余额里的 `total_points` 是**全部积分**（含长期），而批次只给临期的
+    //    ⇒ `fetchMagicrewBalance` 会合成一个「长期积分」包，使 sum === total。
+    //    少了那一层，hover 列的合计会比卡片少一截（用户以为丢了积分）。
+    for (const entry of accounts) {
+      let balance: CreditBalance | null = null
+      let error: string | undefined
+      try {
+        const credential = await resolveFreshCredential(deps, entry)
+        const parsed = credential === undefined ? undefined : parseMagicrewCredential(credential)
+        if (parsed === undefined) {
+          error = '凭据未配置或已损坏'
+        } else {
+          const result = await fetchMagicrewBalance({
+            jwt: parsed.jwt,
+            organizationCode: parsed.organizationCode,
+            product: MAGICREW,
+            fetchImpl: fetcher,
+          })
+          balance = result ?? null
+          // ⚠️ 失败返回 `undefined`（**不是** 0）：「查不到」与「余额为零」
+          //    在 UI 上是两件事，混成 0 会让用户以为额度被清空。
+          if (balance === null) error = '积分查询失败'
         }
       } catch (caught) {
         deps.warn?.(`[credits] balances 账号 ${entry.id} 失败: ${String(caught)}`)
