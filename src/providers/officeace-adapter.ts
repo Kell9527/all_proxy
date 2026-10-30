@@ -31,6 +31,7 @@ import {
   OFFICEACE_CATALOG_TIMEOUT_MS,
   OFFICEACE_MODELS,
   parseOfficeAceModels,
+  type OfficeAceModelTokenRate,
   type OfficeAceRemoteModel,
 } from './officeace-product.js'
 import { basicAuthorization, isExpiring, type OfficeAceCredential } from './officeace-auth.js'
@@ -96,6 +97,16 @@ export interface OfficeAceAdapterOptions {
    */
   fetchRemoteModels?: () => Promise<OfficeAceRemoteModel[]>
   /**
+   * 拉取模型积分倍率（`GET /v1/model-token-rates`）；失败一律返回 `[]`。
+   *
+   * ⚠️ 与 `fetchRemoteModels` **分开注入**：两者是不同的端点、不同的失败语义
+   * （目录失败要回退兜底表，倍率失败只是少一列数字），合并成一个会在
+   * 「目录拿得到、倍率拿不到」时把整个目录判成失败。
+   *
+   * 不注入时模型列表照常显示，只是没有倍率那一段。
+   */
+  fetchRemoteTokenRates?: () => Promise<OfficeAceModelTokenRate[]>
+  /**
    * 图片读取桥 —— **图片输入的必要条件**。
    *
    * 未提供时收到图片消息会报 `UNSUPPORTED_CONTENT`：静默丢图会让用户以为模型
@@ -128,13 +139,25 @@ function collectMessageImages(options: GenerateOptions): Map<string, unknown> {
 export class OfficeAceAdapter extends LlmAdapter {
   /** 远端模型缓存；未拉取时为 undefined。 */
   private remoteModels: OfficeAceRemoteModel[] | undefined
+  /**
+   * 模型积分倍率缓存（`model id → 倍率`）；未拉取 / 拉取失败时为 undefined。
+   *
+   * ⚠️ 与 `remoteModels` **分开缓存**：目录有 6 小时 TTL 与磁盘快照两层，
+   * 而倍率是随套餐/活动变动的独立数据。合并成一个字段会让「刷新目录」把
+   * 倍率一并丢掉，或反之 —— 两者失败的后果不同（目录失败要回退兜底表，
+   * 倍率失败只是少一列数字），故各自独立。
+   */
+  private remoteTokenRates: Map<string, number> | undefined
 
   /**
    * 丢弃已缓存的远端模型目录，供管理端「刷新模型目录」按钮强制重拉。
    * 见 `src/shared/llm.ts` 与 `wiring.ts` 的 `refreshModelCatalog`。
+   *
+   * 倍率一并丢弃：用户点「刷新」时，倍率也是他期待被刷新的一部分。
    */
   override invalidateModelCatalog(): void {
     this.remoteModels = undefined
+    this.remoteTokenRates = undefined
   }
 
   constructor(private readonly options: OfficeAceAdapterOptions) {
@@ -168,9 +191,39 @@ export class OfficeAceAdapter extends LlmAdapter {
    * 只读已缓存的那份。`listAllModelsForAdmin` 会先 `await listModels()` 把远端
    * 目录灌进缓存、再调本方法（顺序反了就只有兜底表）。
    */
-  listAllModels(): readonly { id: string; name: string }[] {
+  listAllModels(): readonly { id: string; name: string; costCoefficient?: number }[] {
     const source = this.remoteModels ?? OFFICEACE_MODELS
-    return source.map((m) => ({ id: m.id, name: m.name }))
+    return source.map((m) => {
+      const rate = this.remoteTokenRates?.get(m.id)
+      return rate === undefined ? { id: m.id, name: m.name } : { id: m.id, name: m.name, costCoefficient: rate }
+    })
+  }
+
+  /**
+   * 取（并缓存）模型积分倍率。
+   *
+   * 失败**不缓存**（`undefined` 保持原样）：上游临时抖动一次就永久失去倍率列，
+   * 比每次多打一次请求糟得多。这与 `loadModels` 「不缓存空结果」同一条纪律。
+   *
+   * 返回 `Map`（而非数组）：消费方按模型 id 查，逐条 `find` 是 O(n²)，
+   * 而目录常有几十条。
+   */
+  private async loadTokenRates(): Promise<Map<string, number>> {
+    if (this.remoteTokenRates !== undefined) return this.remoteTokenRates
+    if (this.options.fetchRemoteTokenRates === undefined) return new Map()
+    try {
+      const rates = await this.options.fetchRemoteTokenRates()
+      const map = new Map<string, number>()
+      for (const rate of rates) {
+        if (rate.costCoefficient !== undefined) map.set(rate.model, rate.costCoefficient)
+      }
+      // 空表也缓存：说明上游确实没有倍率数据（与网络失败不同），反复重试无益。
+      this.remoteTokenRates = map
+      return map
+    } catch {
+      // 倍率是展示信息，失败不得影响目录（见 options.fetchRemoteTokenRates 的注释）。
+      return new Map()
+    }
   }
 
   /**
@@ -216,15 +269,21 @@ export class OfficeAceAdapter extends LlmAdapter {
       return []
     }
     const all = await this.loadModels()
+    // 倍率与目录**并行取**，但只等目录结果；倍率失败退化成空 Map（少一列数字）。
+    const rates = await this.loadTokenRates()
     return all
       .filter((m) => !disabled.has(m.id))
-      .map((m) => ({
-        provider: OFFICEACE.id,
-        id: m.id,
-        name: m.name,
-        // ⚠️ **图片准入闸门**：不声明 `image` 时附件在入库阶段就被拒。
-        inputModalities: isMultimodalModel(m.id) ? (['text', 'image'] as const) : (['text'] as const),
-      }))
+      .map((m) => {
+        const rate = rates.get(m.id)
+        return {
+          provider: OFFICEACE.id,
+          id: m.id,
+          name: m.name,
+          // ⚠️ **图片准入闸门**：不声明 `image` 时附件在入库阶段就被拒。
+          inputModalities: isMultimodalModel(m.id) ? (['text', 'image'] as const) : (['text'] as const),
+          ...(rate === undefined ? {} : { costCoefficient: rate }),
+        }
+      })
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {

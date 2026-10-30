@@ -145,6 +145,8 @@ export async function listAllModelsForAdmin(
   name: string
   contextWindow?: number
   disabled: boolean
+  /** 积分消耗倍率（相对基准价）；缺席 = 该 provider 不提供倍率。 */
+  costCoefficient?: number
   /** 不可用时的归因层级（global / provider / model）。 */
   blockedBy?: string
 }>> {
@@ -156,12 +158,12 @@ export async function listAllModelsForAdmin(
     name: string
     contextWindow?: number
     disabled: boolean
+    costCoefficient?: number
     blockedBy?: string
   }> = []
   for (const { descriptor, adapter } of registry.list()) {
     const providerEnabled = pool.providerEnabled(descriptor.id)
     const disabled = pool.disabledModelsFor(descriptor.id)
-    let models: readonly { id: string; name: string }[]
     try {
       // ⚠️ 先调 listModels 再调 listAllModels：前者的副作用是把远端目录拉进
       // 缓存（ensureRemoteModels），后者才读得到；顺序反了就只有兜底表。
@@ -172,8 +174,15 @@ export async function listAllModelsForAdmin(
     // 显示列表必须**含被关闭的模型**（否则用户无法重新开启），且要带倍率
     // 展示名——listAllModels 正是为此存在（Buddy/Lobsterai 适配器实现，
     // 不受黑名单过滤）。没有该方法的适配器退化为 listModels。
+    //
+    // ⚠️ 类型上这里同时接受 `costCoefficient`：OfficeAce 的 `listAllModels`
+    //    会把它一起带出来（倍率是「这一行」的属性，与 name 同级）。声明里少写
+    //    这个字段不会有编译错误，只会让倍率在装配层被静默丢掉 —— 与
+    //    `isFree` 曾经漏透出到 `LlmModelInfo` 是同一种「解析到了但没透出」缺陷。
+    type CatalogRow = { id: string; name: string; costCoefficient?: number }
+    let models: readonly CatalogRow[]
     try {
-      const listAll = (adapter as unknown as { listAllModels?: (provider: string) => readonly { id: string; name: string }[] }).listAllModels
+      const listAll = (adapter as unknown as { listAllModels?: (provider: string) => readonly CatalogRow[] }).listAllModels
       models = typeof listAll === 'function'
         ? listAll.call(adapter, descriptor.id)
         : await adapter.listModels(descriptor.id)
@@ -190,6 +199,7 @@ export async function listAllModelsForAdmin(
         // 解析失败不影响列出。
       }
       // 归因层级与 model-switching 的判定顺序一致：全局 → provider → 模型。
+      const rate = model.costCoefficient
       const blockedBy = !globalEnabled
         ? 'global'
         : !providerEnabled
@@ -203,6 +213,8 @@ export async function listAllModelsForAdmin(
         model: model.id,
         name: model.name,
         ...contextWindow === undefined ? {} : { contextWindow },
+        // 积分倍率（目前仅 OfficeAce）：缺席表示该 provider 不提供，不是「免费」。
+        ...(rate === undefined ? {} : { costCoefficient: rate }),
         disabled: blockedBy !== undefined,
         ...(blockedBy !== undefined ? { blockedBy } : {}),
       })

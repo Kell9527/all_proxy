@@ -328,8 +328,26 @@ function formatCredits(value) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-/** 把一个包的明细格式化成 tooltip 的一行。 */
-function formatPackageLine(pkg) {
+/**
+ * 格式化积分消耗倍率（`0.18` → `0.18`，`2.38` → `2.38`，`0.7` → `0.70`）。
+ *
+ * 为什么要单独一个函数而不是复用 `formatCredits`：后者对整数不补小数位
+ * （`0.5` 会显示成 `0.5`），而倍率是**同一列并排比较**的数字 ——
+ * 小数位不齐会让 `0.5` 与 `0.18` 看起来像不同量级。这里统一保留两位，
+ * 且对 `< 0.01` 的极小倍率回退到 4 位（否则 `0.004` 会变成 `0.00`，
+ * 看起来像免费）。
+ *
+ * @returns 非有限数返回 `null`（调用方据此整段不渲染）。
+ */
+function formatCreditCoefficient(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  if (value === 0) return '0';
+  // 小于 0.01 保留 4 位：否则「几乎免费」会被四舍五入成 0.00。
+  if (Math.abs(value) < 0.01) return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+  return value.toFixed(2);
+}
+
+/** 把一个包的明细格式化成 tooltip 的一行。 */function formatPackageLine(pkg) {
   const remaining = formatCredits(pkg.remaining) ?? '?';
   const total = formatCredits(pkg.total) ?? '?';
   const parts = [`${pkg.active ? '' : '[已失效] '}${pkg.name || '未命名'}: ${remaining} / ${total}`];
@@ -691,6 +709,8 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
  * （实测确认的行为倒退）。若将来确需多选，必须先把行容器改成 `<div>`。
  */
 function ModelToggle({ model, busy, onToggle }) {
+  // 先算一次：两处（title 与正文）都用它，且 null 时整段不渲染。
+  const rateText = formatCreditCoefficient(model.costCoefficient);
   return React.createElement('label', {
     className: 'dim-jh-modelRow',
     'data-disabled': model.disabled ? 'true' : 'false',
@@ -698,7 +718,22 @@ function ModelToggle({ model, busy, onToggle }) {
   },
     React.createElement('span', { className: 'dim-jh-modelInfo' },
       React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
-      React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
+      React.createElement('code', { className: 'dim-jh-modelId' }, model.id),
+      // 积分消耗倍率（目前仅 OfficeAce 有）：与果办客户端选择器同款
+      // 「0.18x」形态。**缺席时整段不渲染** —— 多数 provider 不提供倍率，
+      // 给它们画一条空占位只会让每行都多一截留白。
+      //
+      // ⚠️ 缺席 ≠ 免费：它表示「上游没给这个模型的倍率」。故不显示 `0x`，
+      // 也不加「免费」字样（`isFree` 是另一个语义，见 Qoder 的免费额度分组）。
+      typeof model.costCoefficient === 'number'
+        ? React.createElement('span', {
+            className: 'dim-jh-modelRate',
+            title: `积分消耗倍率 ${rateText ?? '?'}x：`
+              + '相对基准价的比例，越小越便宜（不代表免费）',
+          },
+          `${rateText ?? '?'}x`,
+          React.createElement('span', { className: 'dim-jh-modelRateUnit' }, ' 积分'))
+        : null),
     React.createElement('input', {
       type: 'checkbox',
       className: 'dim-jh-switch',

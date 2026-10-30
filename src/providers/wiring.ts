@@ -91,6 +91,27 @@ let catalogLogger: ((message: string) => void) | undefined
  */
 const catalogForceRefresh = new Set<string>()
 
+/**
+ * 该 provider 的**副目录**缓存键（前缀 `<id>-`）。
+ *
+ * 目前只有 OfficeAce 用：主目录是 `/v2/models`（键 `officeace`），模型倍率是
+ * 另一个端点（`/v1/model-token-rates`，键 `officeace-token-rates`）。两者共用
+ * `fetchRemoteCatalog` 的三层缓存，但**键必须不同** —— 共用一个键会让倍率数据
+ * 覆盖模型目录（形状不同），或让目录刷新把倍率留在旧值上。
+ *
+ * ⚠️ 前缀扫描而不是硬编码清单：将来若再加副目录（如某家的价格表），
+ * 只要按 `<id>-xxx` 起键名就自动被「刷新模型目录」一并清理，
+ * 不会重演「点了刷新、某一列纹丝不动」。
+ */
+function collectSideCatalogKeys(provider: string): string[] {
+  const prefix = `${provider}-`
+  const keys = new Set<string>()
+  for (const key of catalogMemory.keys()) if (key.startsWith(prefix)) keys.add(key)
+  for (const key of catalogFailedAt.keys()) if (key.startsWith(prefix)) keys.add(key)
+  for (const key of catalogForceRefresh.keys()) if (key.startsWith(prefix)) keys.add(key)
+  return [...keys]
+}
+
 /** 目录缓存有效期（内存与磁盘快照共同的「觉得还新鲜」的上限）。 */
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 /** 拉取失败后的冷却时长。 */
@@ -274,6 +295,17 @@ export async function refreshModelCatalog(
     //    列表纹丝不动」。用 try/finally 保证异常时也清除，否则该 provider
     //    会在此后每次读取都无脑打上游。
     catalogForceRefresh.add(id)
+    // ③b **副目录**（当前仅 officeace 的模型倍率）走的是**独立的缓存键**
+    //     `officeace-token-rates`。只清主键会让「刷新模型目录」把倍率留在旧值上
+    //     —— 用户点了刷新却看到过期的倍率，而界面上没有任何线索说明为什么。
+    //    这里按 `<id>-` 前缀一并清理，避免为每个副目录硬编码一遍。
+    const sideKeys = collectSideCatalogKeys(id)
+    for (const sideKey of sideKeys) {
+      catalogMemory.delete(sideKey)
+      catalogFailedAt.delete(sideKey)
+      catalogForceRefresh.add(sideKey)
+    }
+
     // ⚠️ 判据不能用「listModels 是否抛错」：**所有适配器都在内部吞掉远端失败**
     //    并回退兜底表（模型目录是展示信息，不该让 provider 报错）。于是远端
     //    挂了也会走到这里、还返回一份兜底表 —— 若据此报「成功」，用户会以为
@@ -295,6 +327,7 @@ export async function refreshModelCatalog(
       }
     } finally {
       catalogForceRefresh.delete(id)
+      for (const sideKey of sideKeys) catalogForceRefresh.delete(sideKey)
     }
 
     const afterFetchedAt = diskFetchedAt(id)
@@ -329,6 +362,7 @@ import { ClineAdapter } from './cline-adapter.js'
 import { LoomyAdapter, fetchLoomyRemoteModels } from './loomy-adapter.js'
 import { RaccoonAdapter } from './raccoon-adapter.js'
 import { OfficeAceAdapter, fetchOfficeAceRemoteModels } from './officeace-adapter.js'
+import { fetchOfficeAceModelTokenRates } from './officeace-credits.js'
 import { AccioAdapter } from './accio-adapter.js'
 import { SensenovaAdapter, fetchSensenovaRemoteModels } from './sensenova-adapter.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
@@ -898,6 +932,21 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
         const credential = await firstUsableOfficeAceCredential(ctx.pool)
         if (credential === undefined) return []
         return fetchOfficeAceRemoteModels(credential, fetcher)
+      }),
+      // 模型积分倍率（面板「模型列表」每行的 `0.18x`）—— 数据源是云侧
+      // `GET /v1/model-token-rates`，**不在** `/v1/subscription/*` 下（实测那条
+      // 路径回 `APIG.0303`，是另一条 API 的 appkey 认证）。依据见
+      // `fetchOfficeAceModelTokenRates` 的文件头。
+      // ⚠️ 走同一份 `fetchRemoteCatalog` 三层缓存（内存 6 小时 / 磁盘快照 /
+      // 失败冷却）：倍率随套餐与活动变动，但不该每次开面板都打一次上游。
+      fetchRemoteTokenRates: () => fetchRemoteCatalog('officeace-token-rates', async () => {
+        const credential = await firstUsableOfficeAceCredential(ctx.pool)
+        if (credential === undefined) return []
+        const rates = await fetchOfficeAceModelTokenRates(credential, fetcher)
+        // 空表按失败处理：让 `fetchRemoteCatalog` 保留磁盘快照，而不是用空表
+        // 覆盖掉上次成功的结果（上游抖动一次就丢整列倍率）。
+        if (rates.length === 0) throw new Error('officeace 模型倍率为空')
+        return rates
       }),
     }),
   )

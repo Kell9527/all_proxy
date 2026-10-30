@@ -157,6 +157,17 @@ export interface LlmModelInfo {
   name: string
   description?: string
   inputModalities?: readonly ModelModality[]
+  /**
+   * 该模型的**积分消耗倍率**（相对基准价，如 `0.18` 表示基准价的 18%）。
+   *
+   * 目前只有 OfficeAce 填（`GET /v1/model-token-rates`）。它不是「一次调用扣
+   * 多少分」—— 那是 `token 数 / tokensPerPoint × 倍率`，而 `tokensPerPoint`
+   * 上游当前不下发。故语义明确限定为**相对贵贱**，界面按 `0.18x` 展示。
+   *
+   * ⚠️ 缺席 ≠ 0：缺席表示「该 provider 不提供倍率，或上游没给这个模型」，
+   * 与「免费」无关。消费方必须区分，否则会把未知当免费。
+   */
+  costCoefficient?: number
 }
 
 /** provider 自有的上下文容量。 */

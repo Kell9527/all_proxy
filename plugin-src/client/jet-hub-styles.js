@@ -222,6 +222,12 @@ const STYLES = `
    ⚠️ id 早期是 flex: none（拒绝收缩）—— 那正是「开关被挤出可视区」最直接的成因。 */
 .dim-jh-modelName { flex: 0 1 auto; min-width: 0; overflow: hidden; font-size: 13px; line-height: 19px; font-weight: 500; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
 .dim-jh-modelId { flex: 0 1 auto; min-width: 0; max-width: 46%; overflow: hidden; padding: 1px 5px; border-radius: 5px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); text-overflow: ellipsis; white-space: nowrap; }
+/* 积分消耗倍率（目前仅 OfficeAce）：flex: none —— 它是**比较用的数字**，
+   被省略号截断就失去了全部意义。名称与 id 都允许收缩，把空间让给它。
+   ⚠️ 等宽数字（tabular-nums）让同列小数点对齐，否则 0.18 与 2.38 看起来
+   长短不一，反而更难比较。 */
+.dim-jh-modelRate { flex: none; padding: 1px 6px; border-radius: 5px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #646a73); white-space: nowrap; }
+.dim-jh-modelRateUnit { color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 开关：基于 checkbox 绘制，保持原生语义（可聚焦、可键盘操作、可读屏） */
 .dim-jh-switch { flex: none; appearance: none; -webkit-appearance: none; position: relative; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--dsw-alias-border-l2, #d0d3d9); cursor: pointer; transition: background .18s ease; }

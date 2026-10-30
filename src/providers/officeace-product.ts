@@ -31,6 +31,8 @@ export interface OfficeAceProduct {
   readonly defaultBaseUrl: string
   readonly chatPath: string
   readonly modelsPath: string
+  /** 模型积分倍率端点（云侧 V11 签名，与 officeace-credits 的余额查询同套规则）。 */
+  readonly modelTokenRatesPath: string
   /** 会话级超时（毫秒）。推理含思考链，给足。 */
   readonly requestTimeoutMs: number
   /** 首字节超时。 */
@@ -46,6 +48,7 @@ export const OFFICEACE: OfficeAceProduct = {
   defaultBaseUrl: DEFAULT_BASE_URL,
   chatPath: '/v2/chat/completions',
   modelsPath: '/v2/models',
+  modelTokenRatesPath: '/v1/model-token-rates',
   requestTimeoutMs: 600_000,
   headerTimeoutMs: 180_000,
   chunkTimeoutMs: 300_000,
@@ -98,6 +101,15 @@ export const FALLBACK_CONTEXT_WINDOW = 131_072
 export interface OfficeAceRemoteModel {
   readonly id: string
   readonly name: string
+  /**
+   * 积分消耗倍率（`0.18` = 基准价的 18%）。
+   *
+   * 与 {@link OfficeAceModelTokenRate} 同源，但**挂在这里**是因为消费方是
+   * 「模型列表」的每一行 —— 目录条目本来就是那一行的载体，再开一条平行数组
+   * 就得在装配层按 id 对齐，漏对齐的表现是「倍率整列消失」而看不出原因。
+   * 缺席 = 上游没给这个模型的倍率（不是 0）。
+   */
+  readonly costCoefficient?: number
 }
 
 /** `/v2/models` 的请求超时（目录是展示信息，不该像推理那样等十分钟）。 */
@@ -181,4 +193,86 @@ export function parseOfficeAceModels(payload: unknown): OfficeAceRemoteModel[] {
     models.push({ id, name: officeaceDisplayName(id) })
   }
   return models
+}
+
+/**
+ * 单个模型的积分消耗倍率（`GET /v1/model-token-rates` 的一条）。
+ *
+ * 这是**面板「模型列表」里那个「0.18x + 积分」的数据源**，也是本项目此前
+ * 唯一缺口的 OfficeAce 积分信息 —— 余额早已接入（`officeace-credits.ts`），
+ * 但「某个模型贵不贵」一直看不到。
+ *
+ * ## 字段来源（果办 `packages/api/dist/index.js` 的 `getModelTokenRates` → `XWe`）
+ *
+ * 云端响应 `{models: [{model_name, prompt_tokens_per_point,
+ * completion_tokens_per_point, cached_tokens_per_point, cost_coefficient}]}`，
+ * 客户端原样转发（驼峰化）。实测**目前只下发 `cost_coefficient`**，另三个
+ * 字段在响应里缺席 —— 故全部可选，缺失时界面不渲染对应项，**绝不补 0**。
+ *
+ * ⚠️ `costCoefficient` 是**相对倍率**（`0.18` = 基准价的 18%），不是积分绝对值：
+ * 实际扣分 = token 数 / `tokensPerPoint` × 倍率，而 `tokensPerPoint` 当前不下发。
+ * 故面板只把它当**比较用的相对贵贱**展示，不宣称能算出扣多少分。
+ */
+export interface OfficeAceModelTokenRate {
+  readonly model: string
+  /** 相对倍率（越小越便宜）。缺失时该模型不参与倍率展示。 */
+  readonly costCoefficient?: number
+  /** 多少 prompt token 折 1 分。上游当前不下发。 */
+  readonly promptTokensPerPoint?: number
+  /** 多少 completion token 折 1 分。上游当前不下发。 */
+  readonly completionTokensPerPoint?: number
+  /** 多少缓存命中 token 折 1 分。上游当前不下发。 */
+  readonly cachedTokensPerPoint?: number
+}
+
+/** 从 unknown 里取有限数字（排除字符串数字与 NaN/Infinity）。 */
+function finiteNumber(value: unknown): number | undefined {
+  const n = typeof value === 'number' ? value : Number.NaN
+  return Number.isFinite(n) ? n : undefined
+}
+
+/**
+ * 解析 `/v1/model-token-rates` 响应。
+ *
+ * 实测结构 `{models: [{model_name, cost_coefficient}]}`。三条容错：
+ * ① 顶层也认裸数组；② 字段同时认下划线（云端原文）与驼峰（客户端归一化后的
+ * 形态）—— 两种都在真实链路里出现过；③ `model_name` **必须 trim**：
+ * 实测 `kimi-k3` 那条回的是 `"kimi-k3\n"`（末尾带换行），不 trim 就匹配不上
+ * 目录里的 id，那个模型会静默显示成「无倍率」。
+ *
+ * 空模型名与倍率为非有限数的条目直接丢弃（宁可少显示，不要显示 `0x` 骗人）。
+ */
+export function parseOfficeAceModelTokenRates(payload: unknown): OfficeAceModelTokenRate[] {
+  const rows = Array.isArray(payload)
+    ? payload
+    : (payload !== null && typeof payload === 'object' && Array.isArray((payload as { models?: unknown }).models))
+      ? (payload as { models: unknown[] }).models
+      : []
+
+  const out: OfficeAceModelTokenRate[] = []
+  const seen = new Set<string>()
+  for (const row of rows) {
+    if (row === null || typeof row !== 'object') continue
+    const r = row as Record<string, unknown>
+    const rawName = r.model_name ?? r.modelName ?? r.model
+    const model = typeof rawName === 'string' ? rawName.trim() : ''
+    if (model.length === 0 || seen.has(model)) continue
+    seen.add(model)
+    const rate: OfficeAceModelTokenRate = {
+      model,
+      costCoefficient: finiteNumber(r.cost_coefficient ?? r.costCoefficient),
+      promptTokensPerPoint: finiteNumber(r.prompt_tokens_per_point ?? r.promptTokensPerPoint),
+      completionTokensPerPoint: finiteNumber(r.completion_tokens_per_point ?? r.completionTokensPerPoint),
+      cachedTokensPerPoint: finiteNumber(r.cached_tokens_per_point ?? r.cachedTokensPerPoint),
+    }
+    // 四个字段全缺 ⇒ 这条不携带任何信息，留着只会让调用方误以为「有数据」。
+    if (
+      rate.costCoefficient === undefined
+      && rate.promptTokensPerPoint === undefined
+      && rate.completionTokensPerPoint === undefined
+      && rate.cachedTokensPerPoint === undefined
+    ) continue
+    out.push(rate)
+  }
+  return out
 }

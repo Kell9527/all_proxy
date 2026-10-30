@@ -28,7 +28,7 @@
  */
 
 import { createHash, createHmac } from 'node:crypto'
-import { OFFICEACE } from './officeace-product.js'
+import { OFFICEACE, parseOfficeAceModelTokenRates, type OfficeAceModelTokenRate } from './officeace-product.js'
 import type { OfficeAceCredential } from './officeace-auth.js'
 import {
   roundCredits,
@@ -402,6 +402,54 @@ export async function maybeClaimOfficeAceBonus(
 /** 测试辅助：清空领取去重表（避免跨用例串日期键）。 */
 export function resetOfficeAceBonusClaimThrottle(): void {
   bonusClaimState.clear()
+}
+
+/**
+ * 拉取**模型积分倍率**（`GET {defaultBaseUrl}/v1/model-token-rates`）。
+ *
+ * ## 为什么这个端点在 credits 文件里
+ *
+ * 它与余额是同一套 V11-HMAC-SHA256 签名、同一个云侧 origin，差别只在路径。
+ * 放进 `officeace-product.ts` 会导致签名逻辑出现第二份拷贝 —— 而 `signAndRequest`
+ * 的三条铁律（GET 不带 `Content-Type`、密钥派生的 hex 当 key、LF 分隔）每一条
+ * 都曾因实现漂移而 401（见 {@link signAndRequest} 的文件头）。
+ *
+ * ## 端点是怎么找到的（别再猜错路径）
+ *
+ * 面板与客户端界面显示的是「模型名 + `0.18x` + 积分图标」，数据源并不在
+ * `/v1/subscription/*` 下面 —— 实测 `/v1/subscription/model-token-rates` 返回
+ * `APIG.0303 app not found`（那是**另一条** API 的 appkey 认证），而**正确路径
+ * 不带 `subscription` 前缀**。依据是果办客户端本地服务的实现
+ * （`packages/api/dist/index.js` 的 `getModelTokenRates`）。
+ *
+ * ## 失败语义：返回空数组，**不抛错**
+ *
+ * 倍率是**展示信息**：拿不到时模型列表照样要能看、能开关。抛错会让
+ * `listAllModelsForAdmin` 的 `listModels` 失败的既有容错链把整个目录拖下水。
+ *
+ * @returns 解析后的倍率表；凭据缺字段 / 非 2xx / 非 JSON 时返回 `[]`。
+ */
+export async function fetchOfficeAceModelTokenRates(
+  credential: OfficeAceCredential,
+  fetcher: typeof fetch = fetch,
+): Promise<OfficeAceModelTokenRate[]> {
+  if (credential === undefined || credential.access.length === 0 || credential.securityToken.length === 0) {
+    return []
+  }
+  const body = await signAndRequest(
+    `${OFFICEACE.defaultBaseUrl.replace(/\/+$/, '')}${OFFICEACE.modelTokenRatesPath}`,
+    credential,
+    'GET',
+    undefined,
+    fetcher,
+  )
+  if (!body.ok || body.text.length === 0) return []
+  try {
+    return parseOfficeAceModelTokenRates(JSON.parse(body.text) as unknown)
+  } catch {
+    // 2xx 但不是 JSON：按「读不到」处理（与余额查询的非 JSON 分支同）。
+    return []
+  }
 }
 
 /**
