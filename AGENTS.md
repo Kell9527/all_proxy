@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-`all_proxy` 把 **13 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API**，
+`all_proxy` 把 **14 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API**，
 并自带一个网页管理端。目标形态是**独立 HTTP 服务**，不依赖 DeepSeek Harness 运行时。
 
 单进程同时提供：对外 API（`/v1/*`）、管理 API（`/api/*`）、管理端页面。
@@ -34,7 +34,7 @@
 | 项 | 来源（DSH 插件） | 本项目 | 原因 |
 |---|---|---|---|
 | 模型开关语义 | **仅目录过滤**：关闭的模型仍可被解析、仍能收发请求 | **硬拦截**：调用被关闭的模型返回 `404 model_not_found` 且不发上游请求 | 对外提供 API 时，调用方知道模型名就能绕过开关，开关将形同虚设 |
-| 模型寻址 | 裸模型 id（provider 由适配器路由隐含） | **强制 provider 前缀** `<provider>/<model>` | 13 个 provider 之间重名严重（`deepseek-v4-flash`、`glm-5.2` 等多处重复） |
+| 模型寻址 | 裸模型 id（provider 由适配器路由隐含） | **强制 provider 前缀** `<provider>/<model>` | 14 个 provider 之间重名严重（`deepseek-v4-flash`、`glm-5.2` 等多处重复） |
 | 凭据存储 | `ctx.credentials`（`$DSH_HOME/.credentials.yaml`） | 自持 JSON 凭据文件（可读写、可自由刷新回写） | 规避与 DSH 两边同时刷新导致一次性 `refresh_token` 互相作废 |
 | 目录门控 `providerCatalogVisible` | 用于隐藏无账号的 provider 分组 | **整体删除** | 它只影响 DSH 模型选择器的分组显示，不改路由；对外 API 无此概念 |
 | 续期调度 | 由 DSH 插件生命周期驱动 | 由本服务自己的定时器驱动 | 无 DSH 运行时 |
@@ -477,6 +477,86 @@ UTC+8 当日 24:00）。
   （`orchestrator.start(provider, method, { region })`），管理端「+ 新建账号」先弹区域
   预选；缺省与非法值归一成 `cn`。
 
+**第 14 个 provider —— Magicrew（超级麦吉，`i-magic-service.letsmagic.cn`）**
+（2026-10-30 从来源 `392d370` 移植）：本项目**第一个必须借本机 Chromium 登录**的
+provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organizationCode`）只存在于
+浏览器的 localStorage 里。文件：`magicrew-product.ts` / `magicrew-auth.ts` /
+`magicrew-catalog.ts` / `magicrew-credits.ts` / `magicrew-profile.ts` /
+`magicrew-adapter.ts` / `magicrew-local-browser.ts` / `magicrew-browser-login.ts` /
+**`chromium-session.ts`**（浏览器设施，1636 行，零第三方依赖）+ `src/login/magicrew-login.ts`。
+
+### ⚠️⚠️ 多账号的根本前提：**每次登录一个一次性 profile**
+
+复用 profile 会让第二个账号**一秒内读到上一个账号的 jwt**（来源实测）⇒ 按契约判成
+「替换旧账号」⇒ **建不出新账号**。隔离由
+`mkdtempSync(join(tmpdir(), 'magicrew-login-'))` 保证（每次追加随机后缀，**哪怕前缀
+写死**）。⚠️ 一旦哪天有人「优化」成传固定的 `userDataDir`（例如为了复用登录态），
+多账号立刻串号 —— 而症状是「第二个账号加不进来」，完全看不出与这里有关。
+`magicrew.spec.ts` 用两条用例分别锁「两次独立会话」与「mkdtemp 必得不同目录」。
+
+### ⚠️ 读凭据必须「CDP 实时优先、磁盘兜底」
+
+真机报障（来源 2026-10-29）：用户登录成功后仍显示「尚未配置账号」，白转 4 分钟。
+根因不是路径错 —— Chromium **把 localStorage 缓在内存**，只有关窗才刷到 leveldb ⇒
+「登录完那一刻」磁盘里还是空的。CDP（`Target.getTargets` →
+`attachToTarget {flatten:true}` → `Runtime.evaluate` 带 `sessionId`）读实时值。
+**两条腿都要留**：删磁盘那条 → 老 Chromium 上必然失败；删 CDP 那条 → 退回本次报障。
+⚠️ 页面在登录中会导航，**不要缓存 `sessionId`**（导航即失效 ⇒ 永不恢复）。
+
+### ⚠️ 打开的必须是**网页域 + `/login`**，不是 API 子域
+
+网页在 `www.letsmagic.cn`、API 在 `i-magic-service.letsmagic.cn`。打开 API 子域会得到
+一个没有页面的域名，且 localStorage 也不在那个 origin 下 ⇒ **恒读不到且完全静默**。
+**不带邀请码**：`?invitation=` 会把新注册的号挂在某个邀请码下，不代用户决定归属。
+
+### 三层凭证与两处硬约束
+
+| 层 | 有效期 | 用途 | 续期 |
+|---|---|---|---|
+| 网页 JWT | 30 天 | 目录 / 计费 / 积分 | 只能重登 |
+| `mgw_` api_key | **2 小时** | 推理 | `PUT /tokens` |
+| refresh_token | 7 天，**一次性轮换** | 换 api_key | 同上 |
+
+1. **签新 key 会吊销旧 key** ⇒ 全 provider 只允许两个签发入口（登录 / 续期），
+   **绝不在热路径**（推理前）签发 —— 否则并发请求拿到刚被吊销的 key（症状：偶发
+   「token无效」，重试又能成，极难复现）。
+2. **refresh_token 一次性轮换** ⇒ 已进 `ROTATING_REFRESH_PROVIDERS`（与 codearts /
+   trae 同因：两边都刷会互相作废）。续期**只续 api_key、不动 jwt**，且 `PUT` 时
+   **不带 JWT 头**（带上会在 JWT 过期时把「能续的」变成「不能续的」）。
+
+### 手机号与昵称（用户要求「用手机号就把手机号展示出来」）
+
+浏览器登录落库的凭据里**既没有 phone 也没有展示名** ⇒ 卡片恒显示「超级麦吉」。
+故登录时主动取一次 `GET /api/v1/contact/accounts/me/users`（**带 `/users`**，不带的
+实测 404；**两个头都要**：`authorization` + `organization-code`）：`nickname` 写进
+凭据供卡片昵称，`phone` 写进凭据的 `phone` 字段 ⇒ `src/admin/account-phone.ts` 的
+`PHONE_FIELDS` 读它，**面板「凭据」一栏直接显示手机号**。另给 `account-phone.ts`
+加了 magicrew 上游查询腿（凭据里没有 phone 的存量账号也能显示）。
+⚠️ **上游给的是本地号（10 位），原样展示、不编造国家码**：10 位既可能是「少了
+国家码」也可能是「少了首位」，无法从号码本身区分；编一个 11 位号会让用户以为登录的
+是另一个账号（照着它重新登录会输错）。宁可显示不完整号。
+
+### 推理面四个必守点
+
+- **成功判据是业务码，不是 HTTP 状态**：错配的 api_key 得到 **HTTP 200 +
+  `{"code":403,"message":"token无效"}`**（content-type 是 application/json）⇒
+  进流之前**先看 content-type**，否则会把 JSON 当 SSE 读、报「没收到任何内容」；
+- **`max_tokens` 未提供就一个字都不发**（来源真账号实测：不发 → `stop` + 1491 字符
+  完整；发 `512` → `length` + 916 字符截断）。修前恒发 512 ⇒ **每轮都被截断**；
+- **`stream_options.include_usage` 必须显式要**：不发上游就不回 usage 帧，而 usage 是
+  上下文占用条与 token 记账的唯一来源；
+- **档位只声明 `none` / `high`**：上游认 7 档但 `reasoning_tokens` **不单调**（51~91
+  波动）⇒ 声明 7 档是假的，一档不声明则用户**无法关闭思考**。非法档位**不发**。
+
+图片走注入的 `readImage` 内联原始字节；**读不到就抛 `INVALID_REQUEST`，绝不降级成
+占位文字**（那会让模型「看不到但以为看到了」）。⚠️ `WiringContext.readImage` 返回类型
+不含 `undefined`（缺附件服务时直接抛），适配器要的是「读不到返回 `undefined`」⇒
+`wiring.ts` 包了一层把抛错转 `undefined`，文案由适配器统一给出。
+
+`rotatesAccounts: false` —— 本适配器**不写** `modelRateLimits`，无请求级换号。
+积分：`balance: true` / `dailyCheckin: false`（上游无签到端点，别照抄 OfficeAce 的
+「拉余额时自动领」）。
+
 **测试**：来源 `tests/unit/` 的 84 个文件经 `scripts/port-tests.mjs` 移植，
 加上本项目自写的（`llm` / `account-pool` / `gateway` / `divergence-gating` /
 `sensenova*` / `officeace*` / `accio*` / `trae-cooldown-table` / `serial-queue` /
@@ -488,11 +568,15 @@ UTC+8 当日 24:00）。
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **154 个文件 3527 条用例**（2026-10-27 实测；其中
-`buddy-oauth.spec.ts` 1 条 + `officeace-expiry-selector.spec.ts` 3 条是
-**时间相关的既有用例**失败 —— fixture 的到期时间锚在 2026-10-15，已过期，
-与本项目改动无关，`git stash` 后在改动前的基线上复现同样 4 条；
-`gateway-auth.spec.ts` 1 条偶发，单独跑通过）。
+当前 **159 个文件 3619 条用例，全绿**（2026-10-30 实测）。
+⚠️ 之前登记的那 4 条「时间相关的既有失败」（`buddy-oauth.spec.ts` 1 条 +
+`officeace-expiry-selector.spec.ts` 3 条，fixture 锚在 2026-10-15）**已修**：
+把锚点改成「相对真实时钟」（`officeace` 的 `NOW` 取当前分钟、`buddy` 的促销
+`schedule` 改成 `now ± 1 天`）。**写新 fixture 时别再写死日期** —— 那等于埋一颗
+到点必爆的雷，而爆炸时机与改动完全无关，极难归因。
+⚠️ `gateway.spec` / `anthropic.spec` / `loomy-wechat-login.spec` 在**全量并发**下
+偶发 `bad port`（裸 `fetch` 在端口回收窗口内被拒）；单独跑均通过，重跑亦通过。
+这是环境边界，不是代码缺陷。
 
 **未移植的测试**（来源里依赖 DSH 服务容器或断言 DSH 源码结构，本项目无对应物）：
 `plugin.spec` / `jet-hub-rpc.spec` / `jet-hub-store.spec` / `backup.spec` /
@@ -507,7 +591,7 @@ all_proxy/
 ├── src/                    后端 TypeScript 源码
 │   ├── index.ts            入口（CLI 与 serve 组装）
 │   ├── gateway/            对外 HTTP 端点（OpenAI / Anthropic 协议、静态托管）
-│   ├── providers/          13 个 provider 的适配层
+│   ├── providers/          14 个 provider 的适配层
 │   ├── pool/               账号池与凭据存储
 │   ├── auth/               API Key 存储与入站鉴权
 │   ├── admin/              管理 API 与管理端鉴权
