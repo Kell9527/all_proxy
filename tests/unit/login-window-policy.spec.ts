@@ -131,10 +131,17 @@ describe('登录开窗接线（源码级断言）', () => {
     expect(hubSource).toContain("provider !== 'magicrew' && loginUrlForManual")
   })
 
-  it('Magicrew 的新建账号按钮走导入而不是 createAccount', () => {
-    // ⚠️ 走 createAccount 会去调 /api/login/start 让**服务端**开窗，而服务端
-    //    没有桌面时用户看不见那个窗口。
-    expect(hubSource).toContain("provider === 'magicrew') void importLocalBrowserAccount()")
+  it('Magicrew 的两条腿都在：主按钮服务端开窗、次按钮从本机浏览器导入', () => {
+    // ⚠️⚠️ 两条腿的**失败条件互补**，缺一条就让某类部署彻底没法加账号：
+    //    · 主按钮（createAccount → 服务端 spawn 窗口）：要求服务端**有桌面**；
+    //    · 次按钮（importLocalBrowserAccount → 读本机浏览器）：要求那台机器的
+    //      浏览器里已登录过。
+    //
+    //    历史：第一版只有链接（两条都不通，用户点链接没反应）；第二版只有导入
+    //    （服务端开窗那条被误删了，而它本是主路径）。两条都要留。
+    expect(hubSource).toContain("provider === 'magicrew') void createAccount()")
+    // 次按钮：仅 magicrew 渲染，且调导入而不是 createAccount
+    expect(hubSource).toContain("onClick: () => void importLocalBrowserAccount()")
   })
 
   it('判重命中时前端提示「已在池中」并指引如何加新账号（reused 一路透传）', () => {

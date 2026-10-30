@@ -2375,6 +2375,20 @@ function ProviderPanel({ provider, rpcCall }) {
               ? '处理中…'
               : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
           : null,
+        // Magicrew 的**第二条腿**：从本机浏览器读已登录态（不需要窗口）。
+        //
+        // ⚠️ 为什么两条腿都要留（不是冗余）：
+        //    · 主按钮（服务端开窗）要求服务端**有桌面**，能 spawn 出可见窗口；
+        //    · 本按钮要求「**运行本服务那台机器**的浏览器里已登录过」。
+        //    两者的失败条件互补，删任一条都会让某类部署彻底没法加账号。
+        provider === 'magicrew'
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '从**运行本服务这台机器**的浏览器里读取已登录的超级麦吉账号（适合服务端没有桌面、看不到登录窗口的场景）。⚠️ 一个浏览器只能存一份登录态：加新账号要换浏览器或无痕窗口各登一次。',
+              disabled: creating || importingLocal,
+              onClick: () => void importLocalBrowserAccount(),
+            }, importingLocal ? '正在读取本机浏览器…' : '从本机浏览器导入')
+          : null,
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
@@ -2391,12 +2405,19 @@ function ProviderPanel({ provider, rpcCall }) {
             if (supportsStaticKey(provider)) setAskApiKey(true);
             // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。
             else if (provider === 'accio') setAskAccioRegion(true);
-            // ⚠️ Magicrew（超级麦吉）：**走「从本机浏览器导入」，不弹链接**。
-            //    它的凭据只存在于浏览器 localStorage，而主登录路径是「服务端开窗」
-            //    —— 服务端无桌面时用户看不见那个窗口。原先这里走 createAccount 并
-            //    把链接展示给用户，结果用户在自己浏览器里登录、服务端读的却是另
-            //    一个一次性 profile ⇒ 永远读不到（「点了链接没有任何反应」）。
-            else if (provider === 'magicrew') void importLocalBrowserAccount();
+            // ⚠️ Magicrew（超级麦吉）：**走 createAccount，让「服务端」开窗**。
+            //
+            //    它没有 OAuth 回调，凭据只存在于浏览器 localStorage ⇒「登录」=
+            //    起一个浏览器让用户在里面登，再由后端把凭据读回来。那条腿由**后端**
+            //    spawn（`magicrew-browser-login.ts`），所以这里必须调 createAccount。
+            //
+            //    ⚠️ 但**不能**把它的 loginUrl 展示给用户（见下方链接区的判据）：
+            //    链接对它是死路 —— 在用户**自己**浏览器里登，服务端读的是另一个
+            //    一次性 profile ⇒ 永远读不到（用户 2026-10-30 报障「点了没反应」）。
+            //
+            //    ⚠️ 这条腿要求服务端**有桌面**（能 spawn 出可见窗口）。远程/容器
+            //    部署时看不到那个窗口 ⇒ 用旁边的「从本机浏览器导入」按钮。
+            else if (provider === 'magicrew') void createAccount();
             else void createAccount();
           },
           disabled: creating || addingKey || importingLocal,

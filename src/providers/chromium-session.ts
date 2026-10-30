@@ -173,9 +173,34 @@ function windowsBrowserCandidates(
    */
   exists: (path: string) => boolean = existsSync,
 ): string[] {
-  const localAppData = env.LOCALAPPDATA ?? ''
-  const programFiles = env.PROGRAMFILES ?? ''
-  const programFilesX86 = env['PROGRAMFILES(X86)'] ?? ''
+  /**
+   * ⚠️⚠️ **三个目录变量都必须有兜底，不能直接 `?? ''`**（2026-10-30 用户实测缺陷）。
+   *
+   * 直接取空串的后果是级联的、而且**完全静默**：
+   *
+   * 1. `join('', 'Google', 'Chrome', 'Application', 'chrome.exe')` 拼出的是一个
+   *    **相对路径** `Google\Chrome\Application\chrome.exe`；
+   * 2. `findBrowserExecutable` 只接受**绝对路径**（那里有 `isAbsolute` 过滤，
+   *    见 `browserCandidates` 头部「坑 1」）⇒ **整条候选链一条都不剩**；
+   * 3. `findBrowserExecutable()` 返回 `undefined` ⇒ 上层报「找不到可用的浏览器」。
+   *
+   * 而机器的真实状态是**装了 Chrome 与 Edge**（实测：`C:\Program Files\Google\Chrome\
+   * Application\chrome.exe` 与 `C:\Program Files (x86)\Microsoft\Edge\Application\
+   * msedge.exe` 都存在）。用户看到「请先装一个 Chromium 内核浏览器」，而它明明装着。
+   *
+   * 触发条件不罕见：从某些启动器/服务/受限环境起来的进程**拿不到这三个变量**
+   *（本仓库的沙箱里实测三者全 `undefined`）。
+   *
+   * ⚠️ 兜底值与 `magicrewBrowserRoots`（`magicrew-local-browser.ts`）**必须一致**：
+   * 那个模块读 localStorage 时早就这么兜了，两处口径不同会出现「能读到登录态、
+   * 却找不到浏览器」这种自相矛盾的状态。
+   *
+   * ⚠️ 兜底**不覆盖「变量存在但是空串」的语义吗**？覆盖 —— 空串与缺失在
+   * `existsSync` 眼里等价（都拼不出有效绝对路径），一起兜掉才是对的。
+   */
+  const localAppData = env.LOCALAPPDATA || join(home, 'AppData', 'Local')
+  const programFiles = env.PROGRAMFILES || 'C:\\Program Files'
+  const programFilesX86 = env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)'
   const scoopRoot = scoopRootFromPath(env, exists)
   const defaultScoopRoot = join(home, 'scoop')
   /**
