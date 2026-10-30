@@ -14,7 +14,19 @@ import { OFFICEACE } from '../../src/providers/officeace-product.js'
  * （降级成手动顺序）、档位优先级、锁定永久积分时「只剩永久桶 ⇒ 无可用账号」。
  */
 
-const NOW = Date.UTC(2026, 9, 15, 12, 0, 0)
+/**
+ * 「现在」的锚点。
+ *
+ * ⚠️⚠️ **必须相对真实时钟，不能写死日期**（2026-10-30 修）：这个 fixture 原来锚在
+ * `Date.UTC(2026, 9, 15)`（2026-10-15），而 `parseOfficeAceSubscription` 内部用
+ * **真实 `Date.now()`** 算 `expired` —— 于是过了一天之后所有桶都被判成「已失效」、
+ * 3 条用例集体变红。selector 注入了 `now` 也救不回来：那个 `expired` 标记在
+ * **解析层**就定了，selector 只消费它。
+ *
+ * 取整到分钟：让 `earliestExpiringAt` 的等值断言不受毫秒抖动影响，
+ * 同时仍远早于任何 `NOW + n` 的到期时刻。
+ */
+const NOW = Math.floor(Date.now() / 60_000) * 60_000
 const DAY = 24 * 60 * 60 * 1000
 
 function cred(overrides: Partial<OfficeAceCredential> = {}): OfficeAceCredential {

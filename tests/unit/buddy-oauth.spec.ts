@@ -399,7 +399,15 @@ describe('buddy fetchModels', () => {
             modelPromotions: [{
               enabled: true, priority: 200, modelIds: ['hy4-preview-f'],
               discount: { discountedCredits: '0x', factor: 0 },
-              schedule: { timezone: 'Asia/Shanghai', validFrom: '2026-09-11T00:00:00+08:00', validUntil: '2026-10-11T00:00:00+08:00' },
+              // ⚠️⚠️ **必须相对真实时钟**（2026-10-30 修）：原来写死
+              // `validUntil: '2026-10-11'`，过了那天这条促销就「已结束」⇒
+              // 「免费」断言恒红。促销生效判据是**按 schedule 本地推算此刻**
+              // （`factor: 0` 是「免费」而不是「已结束」），故锚点必须跟着 now 走。
+              schedule: {
+                timezone: 'Asia/Shanghai',
+                validFrom: new Date(Date.now() - 86_400_000).toISOString(),
+                validUntil: new Date(Date.now() + 86_400_000).toISOString(),
+              },
             }],
           },
         }), { status: 200 }),
