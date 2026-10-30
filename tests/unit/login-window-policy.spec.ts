@@ -30,6 +30,20 @@ describe('shouldAutoOpenLoginWindow', () => {
   it('未知 provider 按自动开窗处理（保守：不改变既有交互）', () => {
     expect(shouldAutoOpenLoginWindow('newthing')).toBe(true)
   })
+
+  it('Magicrew 不自动开窗（凭据在服务端那扇一次性 profile 的窗口里）', () => {
+    // ⚠️⚠️ 用户 2026-10-30 报障：「我点进去链接后 …/login 也没有响应回来，而且这种
+    //    情况在同个浏览器，只能一个账号」。
+    //
+    //    根因：magicrew 没有 OAuth 回调，凭据只存在于浏览器的 localStorage。它的主
+    //    登录路径是**服务端** spawn 一个一次性 profile 的窗口让用户登。在前端再开
+    //    一个链接 = 在**用户自己的**浏览器里登，而服务端读的是它自己那个 profile
+    //    ⇒ 永远读不到，界面表现就是「点了没反应」，直到 4 分钟超时。
+    //
+    //    与 officeace 的 false **理由不同**：那个是 SSO 静默复用（怕替用户选账号），
+    //    这个纯粹是「那条链接对 magicrew 没有任何作用」。
+    expect(shouldAutoOpenLoginWindow('magicrew')).toBe(false)
+  })
 })
 
 describe('loginLinkHint', () => {
@@ -46,6 +60,21 @@ describe('loginLinkHint', () => {
 
   it('OfficeAce 的提示要说明「欢迎使用」回调页即授权成功（不是错误）', () => {
     expect(loginLinkHint('officeace')).toContain('欢迎使用OfficeAce')
+  })
+
+  it('Magicrew 的提示必须点明「窗口在服务端」与「加新账号用无痕窗口」', () => {
+    // ⚠️ 三件事缺一不可，每一条都对应一次真实误解：
+    //    ① 窗口由**服务端**开 —— 否则用户去点链接、在自己浏览器里登（本次报障）；
+    //    ② 远程部署看不到那个窗口 ⇒ 改用「从本机浏览器导入」；
+    //    ③ 一个浏览器只存一份登录态 —— 否则用户以为同一窗口能加多个账号
+    //      （原话「只能一个账号」）。
+    const hint = loginLinkHint('magicrew')
+    expect(hint).toContain('服务端')
+    expect(hint).toContain('从本机浏览器导入')
+    expect(hint).toContain('无痕')
+    // ⚠️ 且**不得**出现「授权回调」这类误导措辞：magicrew 没有回调，
+    //    凭据靠**读浏览器**拿到。
+    expect(hint).not.toContain('授权回调')
   })
 
   it('其余 provider 的提示讲拦截与远程场景', () => {

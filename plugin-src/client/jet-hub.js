@@ -1323,6 +1323,22 @@ function ProviderPanel({ provider, rpcCall }) {
    * 它记进表单历史。粘贴操作本身不受影响。
    */
   const [askApiKey, setAskApiKey] = React.useState(false);
+  /**
+   * Magicrew「从本机浏览器导入」的忙碌态与结果提示。
+   *
+   * ⚠️ 为什么 magicrew 需要一条**独立于登录**的通路（2026-10-30 用户报障）：
+   * 它的主登录路径是「**服务端** spawn 一次性 profile 的窗口让用户登」。
+   * 服务端有桌面时没问题，但远程/容器部署时那个窗口用户看不见；而用户
+   * 在**自己**浏览器里登录，服务端读的是它自己那个一次性 profile ⇒ 永远读不到，
+   * 界面表现就是「点了链接没有任何反应」。另外 localStorage 一个浏览器
+   * profile 只存一份 ⇒ 同一个窗口登第二个账号会覆盖第一个（「只能一个账号」）。
+   *
+   * 本按钮读**服务端本机**浏览器里已登录的凭据（只读），因此要求「在运行本服务
+   * 的那台机器的浏览器里登录过」；多账号 = 每个账号在不同浏览器/无痕窗口各登
+   * 一次、各导入一次。
+   */
+  const [importingLocal, setImportingLocal] = React.useState(false);
+  const [importNotice, setImportNotice] = React.useState(null);
   const [apiKeyInput, setApiKeyInput] = React.useState('');
   const [apiKeyNickname, setApiKeyNickname] = React.useState('');
   const [addingKey, setAddingKey] = React.useState(false);
@@ -1918,6 +1934,57 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
+   * 从**本机浏览器**导入 magicrew 登录态（读服务端本机浏览器的 localStorage）。
+   *
+   * 与「+ 新建账号」的根本差别：那条路要**服务端开窗**、用户在服务端的窗口里登，
+   * 服务端无桌面时不可用。本路径不需要任何窗口 —— 用户在自己浏览器登好，
+   * 服务端去**读**（只读，不写、不碰 cookie）。
+   *
+   * ⚠️ 读的是**运行本服务那台机器**的浏览器。远程部署时那里通常什么也没有，
+   * 后端会如实报「未读到登录态」而不是伪装成功。
+   */
+  const importLocalBrowserAccount = async () => {
+    setImportingLocal(true);
+    setImportNotice(null);
+    try {
+      const res = await rpcCall('account.importLocalBrowser', { provider });
+      if (!mounted.current) return;
+      const account = res && res.account;
+      const details = [];
+      if (account && account.hasApiKey === false) {
+        details.push(
+          '⚠️ 未能签发推理用的 api_key：账号已建好，能查目录与积分，'
+          + '但**发消息会报「未登录」**。请稍后点该账号的「重测」，或重新导入一次。');
+      }
+      if (account && account.hasPhone === true) {
+        details.push('已读到手机号，会显示在账号卡片的「凭据」一栏。');
+      }
+      details.push(
+        '要再添加一个账号：换一个浏览器或无痕窗口登录 www.letsmagic.cn，再点一次本按钮。'
+        + '一个浏览器只能存一份登录态，同一窗口登第二个会覆盖第一个。');
+      setImportNotice({
+        tone: account && account.hasApiKey === false ? 'warn' : 'info',
+        text: '已从本机浏览器导入账号' + (account && account.nickname ? '：' + account.nickname : ''),
+        details,
+      });
+      await loadAccounts();
+    } catch (caught) {
+      if (!mounted.current) return;
+      setImportNotice({
+        tone: 'error',
+        text: (caught && caught.message) || '从本机浏览器导入失败',
+        details: [
+          '本按钮读的是**运行本服务那台机器**的浏览器登录态。',
+          '若本服务跑在远程/容器里，那里没有你的浏览器 —— 请改在有桌面的机器上',
+          '运行本服务，或用「+ 新建账号」让服务端开窗登录。',
+        ],
+      });
+    } finally {
+      if (mounted.current) setImportingLocal(false);
+    }
+  };
+
+  /**
    * 停用 / 启用账号。
    *
    * ## 与模型可见性的联动（用户明确要求）
@@ -2324,13 +2391,40 @@ function ProviderPanel({ provider, rpcCall }) {
             if (supportsStaticKey(provider)) setAskApiKey(true);
             // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。
             else if (provider === 'accio') setAskAccioRegion(true);
+            // ⚠️ Magicrew（超级麦吉）：**走「从本机浏览器导入」，不弹链接**。
+            //    它的凭据只存在于浏览器 localStorage，而主登录路径是「服务端开窗」
+            //    —— 服务端无桌面时用户看不见那个窗口。原先这里走 createAccount 并
+            //    把链接展示给用户，结果用户在自己浏览器里登录、服务端读的却是另
+            //    一个一次性 profile ⇒ 永远读不到（「点了链接没有任何反应」）。
+            else if (provider === 'magicrew') void importLocalBrowserAccount();
             else void createAccount();
           },
-          disabled: creating || addingKey,
+          disabled: creating || addingKey || importingLocal,
           // ⚠️ 行尾四个右括号：① 收 newAccountBusyLabel 调用，②③④ 依次收
           // button / 按钮组 headerActions / 面板头 panelHead（原文这里是三个，
           // 因为那时的第三参数是字符串字面量，不需要自己的收尾括号）。
-        }, newAccountBusyLabel(provider, { creating, addingKey })))),
+        }, importingLocal
+          ? '正在读取本机浏览器…'
+          : newAccountBusyLabel(provider, { creating, addingKey })))),
+    // 从本机浏览器导入的结果（成功 / 失败都走这里）。
+    // ⚠️ 失败文案必须点明「读的是**运行本服务那台机器**的浏览器」：用户最常见的
+    //    误解是「我在自己电脑上登录了，为什么读不到」—— 而远程部署时服务端那台
+    //    机器上根本没有他的浏览器。这句话就是那个问题的答案。
+    importNotice
+      ? React.createElement(
+          'div',
+          {
+            className: 'dim-jh-probeNotice',
+            'data-tone': importNotice.tone,
+            role: importNotice.tone === 'error' ? 'alert' : 'status',
+          },
+          React.createElement('div', null, importNotice.text),
+          importNotice.details && importNotice.details.length > 0
+            ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+                importNotice.details.map((line, index) =>
+                  React.createElement('li', { key: index }, line)))
+            : null)
+      : null,
     probeNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -2427,7 +2521,10 @@ function ProviderPanel({ provider, rpcCall }) {
     // 授权在任意机器上完成都会落同一个账号条目（轮询在服务端进行）。
     // OfficeAce 更是主路径：它的授权页会静默复用浏览器已登录账号，
     // 必须由用户自己选浏览器/无痕窗口打开（loginLinkHint 讲清这件事）。
-    loginUrlForManual
+    // ⚠️ Magicrew **不展示**登录链接（2026-10-30 用户报障）：在用户自己的浏览器里
+    //    打开它毫无作用 —— 凭据要落在**服务端**那扇窗的 localStorage 里才读得到。
+    //    展示它只会让用户以为「点了就该有反应」，然后对着没反应的页面反复点。
+    provider !== 'magicrew' && loginUrlForManual
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
           'data-tone': loginTimedOut ? 'error' : 'warn',

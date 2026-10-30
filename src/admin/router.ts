@@ -47,6 +47,7 @@ import { claimAll as claimAllCredits, claimOnboarding, fetchBalances, keepAliveD
 import { claimOfficeAceDailyBonuses } from '../refresh/runtime-helpers.js'
 import { maskCredentialPath, parseCredentialRef, validateFileRefInput } from '../pool/credential-ref-kind.js'
 import { AccountPhoneResolver } from './account-phone.js'
+import { importMagicrewFromLocalBrowser } from './magicrew-import.js'
 
 /** 管理 API 的依赖。 */
 export interface AdminOptions {
@@ -494,6 +495,59 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
         const entry = await createStaticKeyAccount(pool, credentials, provider, apiKey, rawNickname)
         // ⚠️ 只回昵称与 id，**绝不回显 key**（明文 key 只在请求体里出现过）。
         return { ok: true, account: { id: entry.id, provider: entry.provider, nickname: entry.nickname } }
+      })
+      return true
+    }
+
+    /**
+     * **从本机浏览器导入**（当前仅 Magicrew）—— 2026-10-30 用户报障引入。
+     *
+     * 用户原话：「我点进去链接后 https://www.letsmagic.cn/login 也没有响应回来，
+     * 而且这种情况在同个浏览器，只能一个账号」。
+     *
+     * 根因：magicrew 没有 OAuth 回调，凭据只存在于浏览器 localStorage。主登录路径
+     * 是「**服务端** spawn 一次性 profile 的窗口」—— 服务端有桌面时好用，但
+     * 远程/容器部署时用户看不见那扇窗；而用户在自己浏览器里登，服务端读的是
+     * 它自己那个 profile ⇒ 永远读不到（界面表现：点了没反应，直到 4 分钟超时）。
+     * 另外 localStorage 一个 profile 只存一份 ⇒ 同一窗口登第二个账号会覆盖第一个，
+     * 这就是「只能一个账号」。
+     *
+     * 本端点读**服务端本机**浏览器里已登录的凭据（只读），签发 mgw_ key 后落成
+     * 一条**独立**账号。多账号：每个账号在不同浏览器/无痕窗口各登一次、各导入一次。
+     *
+     * ⚠️ 读不到 ⇒ **明确报错**，不建空账号（那不是故障，是本机没登录过）。
+     */
+    if (path === '/api/accounts/import-local-browser' && method === 'POST') {
+      const body = await readBody(req)
+      if (!body.ok) { sendJson(res, 400, { error: { code: 'invalid_request_error', message: body.message } }); return true }
+      const provider = typeof body.value['provider'] === 'string' ? body.value['provider'].trim() : ''
+      const rawNickname = typeof body.value['nickname'] === 'string' ? body.value['nickname'].trim() : ''
+      await runWrite('account-import-local-browser', provider, async () => {
+        // ⚠️ 白名单而非「所有 provider」：只有 magicrew 的凭据是「浏览器
+        //    localStorage 里的 jwt + 组织码」，其余各家的凭据是 OAuth token，
+        //    读浏览器没有任何意义（也读不到）。
+        if (provider !== 'magicrew') {
+          throw new Error(
+            `provider "${provider}" 不支持从本机浏览器导入（当前仅支持: magicrew）`,
+          )
+        }
+        if (registry.get(provider) === undefined) throw new Error(`未知 provider "${provider}"`)
+        const result = await importMagicrewFromLocalBrowser({
+          pool,
+          credentials,
+          nickname: rawNickname,
+          ...options.fetcher === undefined ? {} : { fetcher: options.fetcher },
+          warn: (message) => logger.warn(message),
+        })
+        if ('kind' in result && result.kind === 'not-found') {
+          throw new Error(
+            '未从本机浏览器读到超级麦吉的登录态。'
+            + '请先在**运行本服务的这台机器**的浏览器里登录 www.letsmagic.cn，再重试；'
+            + '若本服务跑在远程/容器里、本机没有你的浏览器，此路不通 —— '
+            + '请改在有桌面的机器上运行本服务，或用「+ 新建账号」让服务端开窗登录。',
+          )
+        }
+        return { ok: true, account: result }
       })
       return true
     }
