@@ -44,7 +44,7 @@ import { findExistingOfficeAceAccount } from './login/officeace-dedupe.js'
 import { findExistingQoderAccount, QODER_DEDUPE_PROVIDERS } from './login/qoder-dedupe.js'
 import { RefreshCoordinator } from './pool/refresh-coordinator.js'
 import { refreshAccountOnce } from './refresh/refresh-account.js'
-import { claimOfficeAceDailyBonuses, refreshDueAccounts } from './refresh/runtime-helpers.js'
+import { claimMagicrewDailyPoints, claimOfficeAceDailyBonuses, refreshDueAccounts } from './refresh/runtime-helpers.js'
 
 /** 当前模块所在目录（源码态与产物态都能用）。 */
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -341,7 +341,7 @@ async function startServe(): Promise<{ port: number; host: string; adminBootstra
     logger,
   })
 
-  // ── 周期任务：静默续期 + 用量保留策略 + OfficeAce 每日福利 ──
+  // ── 周期任务：静默续期 + 用量保留策略 + OfficeAce 每日福利 + Magicrew 登录积分 ──
   //
   // ⚠️ OfficeAce 的福利按 **UTC+8 自然日**作废（上游 `expired_time` 折合北京时间
   // 当日 23:59:59），当轮不领就永久失去。它原本**只**在「用户打开积分面板」时
@@ -349,11 +349,22 @@ async function startServe(): Promise<{ port: number; host: string; adminBootstra
   // 当天额度直接作废。用户报障的原话是「刚刚我在客户端打开了，然后登录领了
   // 100 分」—— 是**打开面板那个动作**领的，不是服务自己领的。
   // 去重按自然日（`officeAceDayKey`），故每小时跑一次是安全的。
+  //
+  // ⚠️ Magicrew 的每日登录积分（200 分/天）同样是**当日 23:59:59 作废**
+  // （`expire_type: 1`，前端文案「奖励的积分在今日内有效，明天登录还能领取
+  // 新的积分哦！」）。不领就白丢，故同样挂在这里；去重按 UTC+8 自然日
+  // （`magicrewDayKey`），每小时跑是安全的。
+  // ⚠️ 它**刻意不走续期**：jwt 是网页登录态，刷新要开 Chromium 走浏览器登录，
+  // 绝不能由定时任务自动化（会替用户决定登哪个账号）。jwt 过期时领取自然失败。
   const tick = (): void => {
     void refreshDueAccounts({ pool, credentials, logger, coordinator: refreshCoordinator })
     void claimOfficeAceDailyBonuses({ pool, credentials, logger, coordinator: refreshCoordinator })
       .catch((error: unknown) => {
         logger.warn(`[officeace] 领取当日福利任务异常: ${error instanceof Error ? error.message : String(error)}`)
+      })
+    void claimMagicrewDailyPoints({ pool, credentials, logger })
+      .catch((error: unknown) => {
+        logger.warn(`[magicrew] 领取登录积分任务异常: ${error instanceof Error ? error.message : String(error)}`)
       })
     usage.applyRetention()
   }

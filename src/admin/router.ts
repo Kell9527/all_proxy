@@ -840,6 +840,14 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
     // 可能已经错过窗口（额度按 UTC+8 自然日作废）。面板点一下能立刻看到结果，
     // 不必等下一个整点。
     //
+    // ⚠️ **Magicrew 刻意不走这个入口**。它的每日登录积分是「每天必须主动领」
+    //    的签到语义（不是服务端自动发放），故用手动入口是 `credits.claimAll`
+    //    （面板的「一键领取积分」按钮，能力位 `dailyCheckin`）—— 那里逐账号
+    //    返回 `claimed / already-claimed / inactive / failed`，正是面板已有的
+    //    渲染路径。再挂一个 dailyBonus 会让同一个动作有两个按钮，且本函数的
+    //    汇总形状（`alreadyClaimed/skipped/totalPoints`）与 claimAll 的
+    //    `ClaimSummary`（`alreadyClaimed/inactive/totalCredit`）不同，多一处漂移面。
+    //
     // ⚠️ 用 `force: true`：手动的语义就是「现在就试一次」，被去重表静默忽略
     // 会让人以为按钮坏了。领取后仍会更新去重表，故定时任务不会重复打上游。
     //

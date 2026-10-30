@@ -24,6 +24,7 @@
 
 import {
   MAGICREW,
+  MAGICREW_LOGIN_GIFT_PATH,
   MAGICREW_MODEL_POINTS_PATH,
   MAGICREW_POINTS_PATH,
   type MagicrewProduct,
@@ -314,6 +315,220 @@ export async function fetchMagicrewModelPoints(params: {
  * 后者会把一个真能用的渠道从聚合轮换里剔掉。
  * ⚠️ 反之「余额为 0」必须 `UNUSABLE`：否则余额耗尽的账号仍会被选中、请求随即失败。
  */
+// ───────────────────── 每日登录积分（签到）─────────────────────
+
+/**
+ * `POST {host}/api/v1/login-gift` 的响应 `data`（**实测 2026-10-30，三个真实账号**）。
+ *
+ * ```json
+ * // ① 首领（本仓未取证到 granted:true 的报文，见下）
+ * { "granted": true/false, "point_amount": 200, "expire_type": 1, "message": "..." }
+ * // ② 今天已领（账号 36F3213A / 5C4C7E3A 实测）
+ * { "granted": false, "point_amount": 0, "expire_type": 1, "message": "今日已领取登录积分" }
+ * // ③ 不具备活动资格（账号 3615D785 实测）
+ * { "granted": false, "point_amount": 0, "expire_type": 1, "message": "当前账号暂不符合活动参与条件" }
+ * ```
+ *
+ * ## ⚠️ 成功判据是 `data.granted`，**不是** HTTP 状态、也不是 `code`
+ *
+ * 三种情形全是 **HTTP 200 + `code:1000`(ok)**。「今天已领」与「没资格」在
+ * 协议层都是**成功的请求**，只是没发分。拿 `res.ok` 或 `code===1000` 当
+ * 「领到了」会每天给出一条假的「+200 分」日志与面板提示。
+ *
+ * ## ⚠️ `expire_type: 1` = 当日到期（`expires_at` 实测为当天 23:59:59）
+ *
+ * 前端枚举 `PointsValidity = { daily:'daily', monthly:'monthly', permanent:'permanent' }`
+ * 与文案 `pointsValiditys.daily = "当天有效"` 一致；每日登录奖励弹窗的说明句是
+ * 「奖励的积分在今日内有效，明天登录还能领取新的积分哦！」。
+ * ⇒ **签到分不会累计**，当天没领就作废，第二天重新领。
+ * 这是本家与 OfficeAce（100 分/天，同样当日作废）同型、但比 Loomy 更紧迫的性质。
+ *
+ * ## ⚠️ 幂等性已实测：重复 POST **不报错、不重复发分**
+ *
+ * 同一账号连续两次 POST 得到同一个 `granted:false` + `point_amount:0`，
+ * 余额零变化。故本函数**可以**放心重试 —— 不需要「先查状态再领」的预检，
+ * 也就没有 OfficeAce 那种「预检与领取之间状态被改」的竞态。
+ *
+ * ## ⚠️ 未取证：`granted:true` 的真实报文
+ *
+ * 实测三个账号当天**都已领过**（其中两个余额里正好有 200/195 的临期批次，
+ * 到期时刻都是当天 23:59:59），所以没能观测到首领那一次的响应体。
+ * ⇒ 解析按「`granted === true` 且 `point_amount` 是正数」双条件（见
+ * {@link parseMagicrewClaim}），**任一不满足就当作没领到**，绝不用
+ * 「HTTP 200 就算加 200 分」兜底。
+ */
+export interface MagicrewClaimResult {
+  /** 本次**真的**发分了（`data.granted === true` 且 `point_amount` 为正）。 */
+  readonly kind: 'claimed' | 'already-claimed' | 'ineligible' | 'failed'
+  /** 本次新领到的积分（仅 `kind==='claimed'` 时 > 0）。 */
+  readonly points: number
+  /** 上游原文（`failed` 时是错误描述），供面板/日志显示真实原因。 */
+  readonly message?: string
+}
+
+/** 把 `/api/v1/login-gift` 的响应体解析成 {@link MagicrewClaimResult}。 */
+export function parseMagicrewClaim(body: unknown): MagicrewClaimResult {
+  if (typeof body !== 'object' || body === null) {
+    return { kind: 'failed', points: 0, message: '响应不是 JSON 对象' }
+  }
+  const envelope = body as { code?: unknown, message?: unknown, data?: unknown }
+  // 业务码非 1000 ⇒ 上游明确报错（未登录 / token 无效等）。
+  if (typeof envelope.code === 'number' && envelope.code !== 1000) {
+    const label = typeof envelope.message === 'string' ? envelope.message : ''
+    return { kind: 'failed', points: 0, message: label.length > 0 ? label : `上游业务码 ${envelope.code}` }
+  }
+  const data = typeof envelope.data === 'object' && envelope.data !== null
+    ? envelope.data as { granted?: unknown, point_amount?: unknown, message?: unknown }
+    : undefined
+  if (data === undefined) {
+    return { kind: 'failed', points: 0, message: '响应缺少 data' }
+  }
+  const label = typeof data.message === 'string' && data.message.length > 0 ? data.message : undefined
+  const amount = typeof data.point_amount === 'number' && Number.isFinite(data.point_amount)
+    ? data.point_amount
+    : 0
+  // ⚠️ 双条件：只有 granted 为 true **且**真的有分才算领到。
+  //    单看 granted 会被「以后上游改成先置 granted 再异步发分」骗到；
+  //    单看 amount>0 则在 granted:false 的异常报文里凭空加分。
+  if (data.granted === true && amount > 0) {
+    return { kind: 'claimed', points: amount, ...(label === undefined ? {} : { message: label }) }
+  }
+  // 没发分：区分「今天已领」与「没资格」——两者的处理完全不同。
+  // 「已领」当天不必再试；「没资格」重试也没用，但可能日后开通活动，
+  // 故两者都**记录当日已决**，只在文案上区分（见 maybeClaimMagicrewDaily）。
+  const text = label ?? ''
+  if (text.includes('已领取') || text.includes('已签到')) {
+    return { kind: 'already-claimed', points: 0, message: text }
+  }
+  if (text.includes('不符合') || text.includes('无资格') || text.includes('暂未开通')) {
+    return { kind: 'ineligible', points: 0, message: text }
+  }
+  // 兜底：`granted:false` 但文案不认识 ⇒ 当作已领（**不发分就是不发分**），
+  // 但保留原文让人能看出上游换了措辞。
+  return { kind: 'already-claimed', points: 0, message: text.length > 0 ? text : '未发分（上游未说明原因）' }
+}
+
+/**
+ * 领取当日登录积分（`POST {host}/api/v1/login-gift`，**无请求体**）。
+ *
+ * ## 实测要点（2026-10-30）
+ *
+ * - `GET` 同一路径回 **405 `Allow: POST`** ⇒ 端点存在且只认 POST。
+ * - POST 的 body 必须是**空**：前端调用是 `e.post('/api/v1/login-gift', void 0, ...)`。
+ *   传 `{}` 与不传在实测中都是 200，但按前端逐字形态发 `undefined` body 最稳。
+ * - 需要 `authorization` + `organization-code` 两个头（缺后者在部分组织下 500）。
+ *
+ * ## 失败语义
+ *
+ * 网络/解析失败 ⇒ `kind:'failed'`（**不抛错**）：一个账号的抖动不该让定时任务
+ * 的整轮 sweep 中断，也不该让面板的「补领」按钮变成一片红。
+ */
+export async function claimMagicrewDailyCheckin(params: {
+  jwt: string
+  organizationCode: string
+  product?: MagicrewProduct
+  fetchImpl?: typeof fetch
+}): Promise<MagicrewClaimResult> {
+  const product = params.product ?? MAGICREW
+  const fetchImpl = params.fetchImpl ?? fetch
+  let response: Response
+  try {
+    response = await fetchImpl(`${product.host}${MAGICREW_LOGIN_GIFT_PATH}`, {
+      // ⚠️ 同 `fetchMagicrewBalance`：必须带超时，否则积分路径会挂到 undici 默认 ~300s。
+      signal: AbortSignal.timeout(product.requestTimeoutMs),
+      method: 'POST',
+      headers: headersOf({ jwt: params.jwt, organizationCode: params.organizationCode, product }),
+    })
+  } catch (error) {
+    return { kind: 'failed', points: 0, message: error instanceof Error ? error.message : String(error) }
+  }
+  const text = await response.text().catch(() => '')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // ⚠️ 非 JSON 时带上 HTTP 状态：405/404 说明路径变了，401 说明凭据失效 ——
+    //    这两种都不该被当成「今天已领」而静默跳过。
+    return { kind: 'failed', points: 0, message: `HTTP ${response.status}：响应不是 JSON` }
+  }
+  const result = parseMagicrewClaim(parsed)
+  if (result.kind === 'failed' && !response.ok) {
+    return { ...result, message: `HTTP ${response.status}：${result.message ?? ''}`.trim() }
+  }
+  return result
+}
+
+/**
+ * 「今天领过就别再领」的去重表（按凭据 ref，进程内 Map、不落盘）。
+ *
+ * ⚠️ 语义与 `officeace-credits.ts` 的同名表**逐条一致**（那边踩过的坑这里不重踩）：
+ * - **按 ref 而非全局**：多账号各自要领，共用一把锁会让第二个账号永远领不到。
+ * - **有结论才记日期**：`claimed` / `already-claimed` / `ineligible` 三种都算
+ *   「今天已有结论」；`failed` **不记**，只记尝试时刻用于短冷却 —— 早期实现
+ *   「先标记再请求」曾把一次网络抖动记成「已领」，该账号整天不再重试。
+ * - **按 UTC+8 自然日**：额度当日 23:59:59 作废，同日重复领取毫无收益。
+ *
+ * ⚠️ 上游对重复领取幂等（实测），故这张表只是**省一次请求**，不是正确性依赖。
+ */
+interface MagicrewClaimState {
+  /** 已有结论（领到 / 今天已领 / 无资格）的 UTC+8 日期键。失败时不写。 */
+  settledDay?: string
+  /** 最近一次尝试的时刻（毫秒，含失败）。 */
+  lastAttemptAt: number
+  /** 最近一次结论（面板「今天是什么状态」用）。 */
+  lastKind?: MagicrewClaimResult['kind']
+}
+
+const MAGICREW_CLAIM_STATE = new Map<string, MagicrewClaimState>()
+
+/** 失败后的重试冷却（与 OfficeAce 同值：定时任务与面板会同时打这一枪）。 */
+const MAGICREW_CLAIM_RETRY_COOLDOWN_MS = 10 * 60 * 1000
+
+/** UTC+8 自然日键（`YYYY-MM-DD`）。**不取本机时区** —— 上游按 UTC+8 结算。 */
+export function magicrewDayKey(now: Date = new Date()): string {
+  return new Date(now.getTime() + BEIJING_OFFSET_MS).toISOString().slice(0, 10)
+}
+
+/**
+ * 带闸门的领取：今天已有结论则不重复打上游。
+ *
+ * @returns `undefined` 表示被闸门挡下（**没有**发出请求）；否则是上游的真实结论。
+ */
+export async function maybeClaimMagicrewDaily(params: {
+  jwt: string
+  organizationCode: string
+  ref: string
+  product?: MagicrewProduct
+  fetchImpl?: typeof fetch
+  now?: () => number
+  /** 手动补领：跳过去重闸门（用户点按钮就是「现在就试一次」）。 */
+  force?: boolean
+}): Promise<MagicrewClaimResult | undefined> {
+  const at = (params.now ?? Date.now)()
+  const dayKey = magicrewDayKey(new Date(at))
+  const state = MAGICREW_CLAIM_STATE.get(params.ref)
+  if (params.force !== true && state !== undefined) {
+    if (state.settledDay === dayKey) return undefined
+    if (at - state.lastAttemptAt < MAGICREW_CLAIM_RETRY_COOLDOWN_MS) return undefined
+  }
+  MAGICREW_CLAIM_STATE.set(params.ref, { ...state, lastAttemptAt: at })
+  const result = await claimMagicrewDailyCheckin({
+    jwt: params.jwt,
+    organizationCode: params.organizationCode,
+    ...(params.product === undefined ? {} : { product: params.product }),
+    ...(params.fetchImpl === undefined ? {} : { fetchImpl: params.fetchImpl }),
+  })
+  if (result.kind !== 'failed') {
+    MAGICREW_CLAIM_STATE.set(params.ref, { settledDay: dayKey, lastAttemptAt: at, lastKind: result.kind })
+  }
+  return result
+}
+
+/** 测试辅助：清空领取去重表（避免跨用例串日期键）。 */
+export function resetMagicrewClaimThrottle(): void {
+  MAGICREW_CLAIM_STATE.clear()
+}
+
 export async function magicrewExpiry(params: {
   jwt: string
   organizationCode: string

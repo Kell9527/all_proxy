@@ -554,8 +554,42 @@ provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organiz
 `wiring.ts` 包了一层把抛错转 `undefined`，文案由适配器统一给出。
 
 `rotatesAccounts: false` —— 本适配器**不写** `modelRateLimits`，无请求级换号。
-积分：`balance: true` / `dailyCheckin: false`（上游无签到端点，别照抄 OfficeAce 的
-「拉余额时自动领」）。
+
+积分：`balance: true` / `dailyCheckin: true`。**每日登录积分 200 分，当天
+23:59:59 作废、不累计**（`expire_type: 1`；前端文案「奖励的积分在今日内有效，
+明天登录还能领取新的积分哦！」）。领取端点 `POST /api/v1/login-gift`（**无请求体**，
+`GET` 回 `405 Allow: POST`）。
+
+⚠️ **曾经这里写的是 `dailyCheckin: false`，「依据上游无签到端点」—— 那是错的。**
+错因值得记住：当时只翻了 `app.asar` 找「签到」，而客户端 `Magic.exe` **只是加载
+`https://www.letsmagic.cn/super` 的 Electron 网页壳**（主进程用 `${WebUrl}/super`
+拼 URL），业务逻辑全在网页端 chunk 里 ⇒ 在 exe 里搜中文必然零命中，据此得出
+「没有该端点」的结论等于**把「没找到」当成「不存在」**。
+🔑 **以后核实某家有没有某端点，先确认客户端是不是远程网页壳**：若是，就得去
+上游网页域拉 `/assets/index-*.js` 与懒加载 chunk 找真实调用点。
+
+四条实现纪律（`src/providers/magicrew-credits.ts` 的 `parseMagicrewClaim`）：
+1. **成功判据是 `data.granted === true` 且 `point_amount > 0`**，不是 HTTP 状态、
+   也不是 `code`。实测三种情形**全是 HTTP 200 + `code:1000`(ok)**：领到 /「今日已
+   领取登录积分」/「当前账号暂不符合活动参与条件」。拿 `res.ok` 当成功会每天报假的
+   「+200 分」。
+2. **`ineligible` 是独立状态**，既不是失败（重试无益，算失败会每小时打一次必然
+   同样结果的上游），也不是已领（算已领会让用户以为拿到了 200 分）。
+3. **上游对重复领取幂等**（同一账号连打两次同样回 `granted:false` + 零变化）⇒
+   **不需要**像 Buddy / Trae 那样先查状态再领，没有预检竞态。
+4. **失败不记日期**（只记尝试时刻做 10 分钟冷却）：早期「先标记再请求」会把一次
+   网络抖动记成「整天已领」。去重按 **UTC+8 自然日**（`magicrewDayKey`）。
+5. ⚠️ **未取证 `granted:true` 的真实报文**（实测三个账号当天都已领过）⇒ 解析按
+   双条件，任一不满足当没领到，**绝不用「HTTP 200 就算加 200 分」兜底**。
+
+领取入口两条，**共用 `maybeClaimMagicrewDaily`**：
+- **定时**：`claimMagicrewDailyPoints`（`src/index.ts` 的 `tick`，小时级；启动即跑一次）。
+  ⚠️ **刻意不走续期**：jwt 是网页登录态，刷新要开 Chromium 走浏览器登录，绝不能
+  由定时任务自动化（会替用户决定登哪个账号）。
+- **手动**：`credits.claimAll`（面板「一键领取积分」，能力位 `dailyCheckin`，force 跳闸门）。
+  ⚠️ **刻意不挂 `daily-bonus`**：那是 OfficeAce「服务端自动发放」的手动兜底，语义不同，
+  且两者汇总形状不同（`totalPoints` vs `totalCredit`、`skipped` vs `inactive`），
+  混用只会多一处字段漂移面。
 
 **测试**：来源 `tests/unit/` 的 84 个文件经 `scripts/port-tests.mjs` 移植，
 加上本项目自写的（`llm` / `account-pool` / `gateway` / `divergence-gating` /
@@ -568,7 +602,8 @@ provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organiz
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **159 个文件 3619 条用例，全绿**（2026-10-30 实测）。
+当前 **161 个文件 3657 条用例，全绿**（2026-10-30 实测；较上次登记 +2 文件 +38 条，
+含新增 `magicrew-daily-checkin.spec.ts`）。
 ⚠️ 之前登记的那 4 条「时间相关的既有失败」（`buddy-oauth.spec.ts` 1 条 +
 `officeace-expiry-selector.spec.ts` 3 条，fixture 锚在 2026-10-15）**已修**：
 把锚点改成「相对真实时钟」（`officeace` 的 `NOW` 取当前分钟、`buddy` 的促销

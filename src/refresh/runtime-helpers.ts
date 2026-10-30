@@ -13,6 +13,7 @@ import { RefreshCoordinator } from '../pool/refresh-coordinator.js'
 import { refreshAccountOnce } from './refresh-account.js'
 import { isExpiring, type OfficeAceCredential } from '../providers/officeace-auth.js'
 import { maybeClaimOfficeAceBonus } from '../providers/officeace-credits.js'
+import { maybeClaimMagicrewDaily } from '../providers/magicrew-credits.js'
 
 /** 临期阈值：距过期不足该时长就触发静默刷新。 */
 const REFRESH_AHEAD_MS = 24 * 60 * 60 * 1000
@@ -262,6 +263,162 @@ function parseOfficeAceCredential(raw: string): OfficeAceCredential | undefined 
     const candidate = parsed as Partial<OfficeAceCredential>
     if (typeof candidate.access !== 'string' || typeof candidate.securityToken !== 'string') return undefined
     return candidate as OfficeAceCredential
+  } catch {
+    return undefined
+  }
+}
+
+// ───────────────────── Magicrew 每日登录积分的周期领取 ─────────────────────
+
+/** {@link claimMagicrewDailyPoints} 的依赖。 */
+export interface MagicrewCheckinSweepDeps {
+  pool: AccountPool
+  credentials: CredentialStore
+  logger: Pick<Logger, 'info' | 'warn' | 'error'>
+  /** 注入的 fetch（测试替身用）。 */
+  fetcher?: typeof fetch
+  /** 当前时间（测试用）。 */
+  now?: () => number
+  /** **手动补领**：跳过去重闸门（见 `maybeClaimMagicrewDaily`）。 */
+  force?: boolean
+}
+
+/** 单账号的领取结果（面板逐条显示）。 */
+export interface MagicrewCheckinAccountResult {
+  accountId: string
+  nickname: string
+  /**
+   * `claimed` 本次领到；`already-claimed` 今天早已领过；
+   * `ineligible` 账号不符合活动条件；`failed` 失败（下一轮重试）；`skipped` 未参与。
+   */
+  kind: 'claimed' | 'already-claimed' | 'ineligible' | 'failed' | 'skipped'
+  points: number
+  error?: string
+}
+
+/** 一轮「全员领当日登录积分」的汇总。 */
+export interface MagicrewCheckinSweepResult {
+  claimed: number
+  totalPoints: number
+  alreadyClaimed: number
+  /** 上游明确说「不符合条件」的账号数（不是错误，重试也无益）。 */
+  ineligible: number
+  failed: number
+  skipped: number
+  results: MagicrewCheckinAccountResult[]
+}
+
+/**
+ * 为全部 **启用中** 的 Magicrew 账号领取当日登录积分（200 分/天）。
+ *
+ * ## 为什么必须有这一支
+ *
+ * 上游的签到分是**当日 23:59:59 作废**的（`expire_type: 1`，前端文案
+ * 「奖励的积分在今日内有效，明天登录还能领取新的积分哦！」）⇒ 不开面板就白丢
+ * 200 分。这与 OfficeAce「每日福利」同型，故实现结构刻意对齐
+ * {@link claimOfficeAceDailyBonuses}（定时 + 手动共用一条）。
+ *
+ * ## 与 OfficeAce 的三处差异（都是本家的实测性质，别照抄）
+ *
+ * 1. **不需要续期**。Magicrew 的 jwt 是网页登录态（30 天），刷新它要重新走浏览器
+ *    登录 —— 那条路绝不能在定时任务里自动触发（要开 Chromium）。故这里只读凭据、
+ *    不调 `refreshAccountOnce`。jwt 过期时领取自然失败，UI 会显示原因。
+ * 2. **不需要预检状态**。上游对重复领取**幂等**（实测同一账号连打两次都回
+ *    `granted:false` + 「今日已领取登录积分」且余额零变化）⇒ 不必先查余额再领，
+ *    也就没有 OfficeAce 那种「预检与领取之间状态被改」的竞态。
+ * 3. **`ineligible` 是独立状态**。实测账号 `3615D785` 回「当前账号暂不符合活动
+ *    参与条件」——它不是失败（重试无益），也不是「已领」。混进任一边都会误导：
+ *    算失败 ⇒ 每小时打一次必然是同样结果的上游；算已领 ⇒ 用户以为领到了 200 分。
+ *
+ * 失败一律「记录 + 继续」，绝不抛错（同 `refreshDueAccounts`）。
+ */
+export async function claimMagicrewDailyPoints(deps: MagicrewCheckinSweepDeps): Promise<MagicrewCheckinSweepResult> {
+  const summary: MagicrewCheckinSweepResult = {
+    claimed: 0, totalPoints: 0, alreadyClaimed: 0, ineligible: 0, failed: 0, skipped: 0, results: [],
+  }
+  const fetcher = deps.fetcher ?? fetch
+  const now = deps.now ?? Date.now
+  const force = deps.force === true
+  const accounts = (await deps.pool.listAllAccounts())
+    .filter((entry) => entry.provider === 'magicrew')
+
+  for (const entry of accounts) {
+    // 停用账号不参与（与 OfficeAce 同：对用户明确弃用的账号发写请求是越界）。
+    if (!entry.enabled) {
+      summary.skipped += 1
+      summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'skipped', points: 0, error: '账号已停用' })
+      continue
+    }
+    try {
+      const resolved = await deps.credentials.resolve(entry.credentialRef)
+      if (resolved === undefined) {
+        summary.skipped += 1
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'skipped', points: 0, error: '凭据不可读' })
+        deps.logger.warn(`[magicrew] 账号 ${entry.id} 领取登录积分跳过：凭据不可读（${entry.credentialRef}）`)
+        continue
+      }
+      const credential = parseMagicrewCredential(resolved.value)
+      if (credential === undefined) {
+        summary.skipped += 1
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'skipped', points: 0, error: '凭据不是合法 JSON' })
+        deps.logger.warn('[magicrew] 账号领取登录积分跳过：凭据不是合法 JSON')
+        continue
+      }
+      const result = await maybeClaimMagicrewDaily({
+        jwt: credential.jwt,
+        organizationCode: credential.organizationCode,
+        ref: entry.credentialRef,
+        fetchImpl: fetcher,
+        now,
+        ...(force ? { force } : {}),
+      })
+      if (result === undefined) {
+        summary.skipped += 1
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'skipped', points: 0, error: '今天已领过（未重复请求上游）' })
+        continue
+      }
+      if (result.kind === 'claimed') {
+        summary.claimed += 1
+        summary.totalPoints += result.points
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'claimed', points: result.points })
+        deps.logger.info(`[magicrew] 账号 ${entry.id} 领取登录积分成功：+${result.points} 分（当日 23:59:59 到期）`)
+      } else if (result.kind === 'already-claimed') {
+        summary.alreadyClaimed += 1
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'already-claimed', points: 0, ...(result.message === undefined ? {} : { error: result.message }) })
+      } else if (result.kind === 'ineligible') {
+        summary.ineligible += 1
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'ineligible', points: 0, ...(result.message === undefined ? {} : { error: result.message }) })
+        deps.logger.info(`[magicrew] 账号 ${entry.id} 不符合登录积分活动条件：${result.message ?? ''}`)
+      } else {
+        summary.failed += 1
+        summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'failed', points: 0, ...(result.message === undefined ? {} : { error: result.message }) })
+        deps.logger.warn(`[magicrew] 账号 ${entry.id} 领取登录积分失败（下一轮重试）：${result.message ?? ''}`)
+      }
+    } catch (error) {
+      summary.failed += 1
+      const message = error instanceof Error ? error.message : String(error)
+      summary.results.push({ accountId: entry.id, nickname: entry.nickname, kind: 'failed', points: 0, error: message })
+      deps.logger.warn(`[magicrew] 账号 ${entry.id} 领取登录积分异常: ${message}`)
+    }
+  }
+
+  if (summary.claimed > 0) {
+    deps.logger.info(`[magicrew] 本轮领取登录积分：${summary.claimed} 个账号共 +${summary.totalPoints} 分`)
+  }
+  return summary
+}
+
+/** 把凭据存储里的 JSON 文本解析成 Magicrew 凭据；不合形返回 undefined。 */
+function parseMagicrewCredential(raw: string): { jwt: string, organizationCode: string } | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const candidate = parsed as { jwt?: unknown, organizationCode?: unknown }
+    if (typeof candidate.jwt !== 'string' || candidate.jwt.length === 0) return undefined
+    return {
+      jwt: candidate.jwt,
+      organizationCode: typeof candidate.organizationCode === 'string' ? candidate.organizationCode : '',
+    }
   } catch {
     return undefined
   }

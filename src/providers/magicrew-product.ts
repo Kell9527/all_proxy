@@ -82,6 +82,14 @@ export const MAGICREW_GATEWAY_TOKENS_PATH = '/api/v1/model-gateway/tokens'
 export const MAGICREW_MODELS_PATH = '/api/v1/flows/models'
 export const MAGICREW_MODEL_POINTS_PATH = '/api/v1/products/model-points'
 export const MAGICREW_POINTS_PATH = '/api/v1/quota/points/total'
+/**
+ * 每日登录积分（签到）领取端点。
+ *
+ * ⚠️ **只认 POST 且无请求体**（`GET` 实测回 `405 Allow: POST`）。
+ * 前端实现：`claimFreePoints(){ return e.post('/api/v1/login-gift', void 0, …) }`。
+ * 响应 `data.granted` 才是成功判据，HTTP 恒 200（详见 `magicrew-credits.ts`）。
+ */
+export const MAGICREW_LOGIN_GIFT_PATH = '/api/v1/login-gift'
 export const MAGICREW_CHAT_PATH = '/v1/chat/completions'
 
 /** 账号池凭据 ref 前缀（`jet-hub-store.ts` 的前缀表必须同步）。 */

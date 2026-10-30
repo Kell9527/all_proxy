@@ -149,18 +149,27 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // ⚠️ 限流能力**保持默认 true**（见下方 RATE_LIMIT_CAPABILITIES）：SenseNova
   // 确实会返回 429（tpm/rpm 限流），「重测 / 重置」按钮对它有效。
   sensenova: Object.freeze({ balance: false, dailyCheckin: false }),
-  // Magicrew（超级麦吉）：**只有余额**，没有签到。
+  // Magicrew（超级麦吉）：余额 + **每日登录积分（签到）**。
   //
   // 余额：`GET {host}/api/v1/quota/points/total`（JWT + organization-code 两个头），
   // 见 `src/providers/magicrew-credits.ts` 的 `fetchMagicrewBalance`。
   //
-  // ⚠️ `dailyCheckin: false` 的依据：上游**没有**签到端点 —— 积分是「购买 +
-  // 活动发放」，且来源实测里唯一的写操作是 `bonus/claim`（那是 OfficeAce 的，
-  // 不是本家）。别照抄 OfficeAce 的「拉余额时自动领」：本家没有那个端点。
+  // 签到：`POST {host}/api/v1/login-gift`（**无请求体**，`GET` 实测 `405 Allow: POST`）。
+  // 见 `maybeClaimMagicrewDaily`。
+  //
+  // ⚠️ **每日 200 分，且当天 23:59:59 作废、不累计**（`expire_type: 1`；前端文案
+  //    「奖励的积分在今日内有效，明天登录还能领取新的积分哦！」）。故这个按钮
+  //    的语义比其他家更强：不领就是真丢 200 分，而不只是「少触发一次」。
+  //
+  // ⚠️ 历史教训：这里曾写 `dailyCheckin: false`，依据是「上游没有签到端点」——
+  //    **那是错的**（2026-10-30 实测端点存在）。原先的探测只翻了 `app.asar`，
+  //    而客户端 `Magic.exe` 只是加载 `https://www.letsmagic.cn/super` 的壳，
+  //    业务逻辑全在网页端 chunk 里 ⇒ 在 exe 里搜「签到」必然一无所获。
+  //    以后核实某家有没有某端点，**先确认客户端是不是远程网页壳**。
   //
   // ⚠️ 本家**无请求级换号**（不写 `modelRateLimits`）⇒ 见下方
   // `RATE_LIMIT_CAPABILITIES` 的登记，不要在这里顺手打开。
-  magicrew: Object.freeze({ balance: true, dailyCheckin: false }),
+  magicrew: Object.freeze({ balance: true, dailyCheckin: true }),
   // OfficeAce（华为云 ModelArts MaaS）：**只有余额**，没有签到。
   //
   // 余额：V11-HMAC-SHA256 签名云侧直读 `GET {defaultBaseUrl}/v1/subscription`

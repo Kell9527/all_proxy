@@ -59,6 +59,7 @@ import { isExpiring, type OfficeAceCredential } from '../providers/officeace-aut
 import { fetchOfficeAceBalanceDetailed } from '../providers/officeace-credits.js'
 import { fetchMagicrewBalance } from '../providers/magicrew-credits.js'
 import { MAGICREW } from '../providers/magicrew-product.js'
+import { maybeClaimMagicrewDaily } from '../providers/magicrew-credits.js'
 import { parseMagicrewCredential } from '../providers/magicrew-auth.js'
 import { credentialRef } from '../providers/credential-ref.js'
 import type { CreditsBalanceExtra } from '../providers/credits.js'
@@ -402,8 +403,14 @@ async function fetchBalancesInner(provider: string, deps: CreditsEndpointDeps): 
   if (provider === 'magicrew') {
     // Magicrew（超级麦吉）：`GET /api/v1/quota/points/total`（JWT + organization-code）。
     //
-    // ⚠️ **不自动领任何东西**：本家没有签到 / 领奖端点（与 OfficeAce 不同）。
-    //    照抄 OfficeAce 的「拉余额前自动领」会得到一条必然 404 的写请求。
+    // ⚠️ **本分支不自动领**（与 OfficeAce 的 `fetchOfficeAceBalanceDetailed` 不同）：
+    //    Magicrew 的签到**有端点**（`POST /api/v1/login-gift`，见 `claimAll` 的
+    //    magicrew 分支），但它由**定时任务** `claimMagicrewDailyPoints` 每小时
+    //    兜底领取 —— 不在「拉余额」这条读路径上顺手发写请求。
+    //    理由：面板刷新余额是高频动作，把写请求塞进读路径会让余额接口的失败
+    //    原因变得不可分辨（是查不到、还是领取失败？）。
+    //    ⚠️ 历史注释曾写「本家没有签到 / 领奖端点」——**那是错的**，
+    //    2026-10-30 实测 `GET` 该路径回 `405 Allow: POST`，端点确实存在。
     //
     // ⚠️ 余额里的 `total_points` 是**全部积分**（含长期），而批次只给临期的
     //    ⇒ `fetchMagicrewBalance` 会合成一个「长期积分」包，使 sum === total。
@@ -580,6 +587,47 @@ export async function claimAll(provider: string, deps: CreditsEndpointDeps): Pro
   if (provider === LOOMY.id) {
     // Loomy 的「签到」= 触发每日赠送额度（自带幂等判据，不做额外预检）。
     return collect((credential) => claimLoomyDailyQuota(credential as unknown as LoomyCredential, LOOMY, fetcher))
+  }
+  if (provider === MAGICREW.id) {
+    // Magicrew（超级麦吉）：`POST /api/v1/login-gift`（无请求体，JWT + organization-code）。
+    //
+    // ⚠️ 上游对重复领取**幂等**（实测同一账号连打两次都回 `granted:false` +
+    //    「今日已领取登录积分」且余额零变化）⇒ **不需要**像 Buddy / Trae 那样
+    //    先查状态再领，直接领即可。
+    // ⚠️ 成功判据是 `data.granted === true`，**不是** HTTP 200 也不是 `code`
+    //    （三种情形全是 200 + code:1000）。见 `parseMagicrewClaim`。
+    // ⚠️ 这里的 `force` 语义：面板按钮就是「现在就试一次」，故跳过去重表；
+    //    定时任务走 `claimMagicrewDailyPoints`（不 force）。
+    return collect(async (credential, entry) => {
+      const parsed = parseMagicrewCredential(credential)
+      if (parsed === undefined) return { kind: 'failed', code: -1, message: '凭据缺少 jwt' }
+      const result = await maybeClaimMagicrewDaily({
+        jwt: parsed.jwt,
+        organizationCode: parsed.organizationCode,
+        ref: entry.credentialRef,
+        product: MAGICREW,
+        fetchImpl: fetcher,
+        force: true,
+      })
+      // `undefined` 只会在「非 force 且今天已领」时出现；这里恒 force，故不会发生。
+      // 真发生时按已领处理（宁可少报也不虚报积分）。
+      if (result === undefined) return { kind: 'already-claimed', message: '今天已领过' }
+      switch (result.kind) {
+        case 'claimed':
+          // ⚠️ `streakDays` / `isStreakDay` 是 `ClaimOutcome` 的必需字段（Buddy 系的
+          //    连续签到概念）。Magicrew **没有**连续签到奖励（每日固定 200 分、
+          //    当天到期），故如实填 0 / false，不编造连签天数。
+          return { kind: 'claimed', credit: result.points, streakDays: 0, isStreakDay: false, ...(result.message === undefined ? {} : { message: result.message }) }
+        case 'already-claimed':
+          return { kind: 'already-claimed', message: result.message ?? '今天已领取登录积分' }
+        case 'ineligible':
+          // 上游明确说「不符合活动条件」：不是错误，但也不是领到 —— 报 inactive
+          // （面板据此显示「活动未开启」而不是红色失败，重试无益）。
+          return { kind: 'inactive', message: result.message ?? '当前账号不符合登录积分活动条件' }
+        default:
+          return { kind: 'failed', code: -1, message: result.message ?? '领取失败' }
+      }
+    })
   }
   if (provider === CLINE.id) {
     throw new Error('Cline 不支持每日签到（其后端没有签到接口）')
