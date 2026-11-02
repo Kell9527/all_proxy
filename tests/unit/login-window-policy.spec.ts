@@ -228,3 +228,40 @@ describe('登录失败必须停损并显示（源码级断言）', () => {
     expect(afterFail).toContain('新建账号')
   })
 })
+
+/**
+ * 前端**跨作用域引用**回归（2026-11-02 真实故障：设置页整个白屏，Web 进不去）。
+ *
+ * 起因：`EXPIRY_TIER_PROVIDERS` 定义在 `CreditBalanceRow` 函数内部，而面板级的
+ * 「三档图例」在 `ProviderPanel` 作用域里引用了它 ⇒ 渲染时抛 `ReferenceError`
+ * ⇒ 整个 React 组件树渲染失败 ⇒ 白屏。
+ *
+ * ⚠️ **这类缺陷 `tsc` 与 `vite build` 都拦不住**（前者不检查这个 .js 文件，
+ * 后者只做打包不做作用域分析），而单元测试也跑不到浏览器 —— 只能靠源码级断言。
+ */
+describe('前端：跨组件共用的常量必须在模块级', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const src = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+
+  it('`EXPIRY_TIER_PROVIDERS` 定义在**模块顶层**，不在任何函数体内', () => {
+    const lines = src.split('\n')
+    const defLine = lines.findIndex((line) => /^(?:const|let)\s+EXPIRY_TIER_PROVIDERS\b/.test(line))
+    expect(defLine, '必须在模块顶层定义（缩进 0）').toBeGreaterThan(-1)
+    // 顶层常量的行首没有缩进；写在函数体内一定会有 2+ 空格。
+    expect(lines[defLine]?.startsWith('const EXPIRY_TIER_PROVIDERS')).toBe(true)
+    // 且**只能定义一次**（两份副本就是第二次白屏）
+    const defs = lines.filter((line) => /(?:const|let)\s+EXPIRY_TIER_PROVIDERS\b/.test(line))
+    expect(defs).toHaveLength(1)
+  })
+
+  it('面板级图例用的是 `expiryWindowDays`，不是 `windowDays`', () => {
+    // `windowDays` 只是 `CreditBalanceRow` 的 props；在 `ProviderPanel` 里写它会
+    // 渲染出「还有 undefined 天以上」（不白屏，但文案是假的）。
+    const idx = src.indexOf('三档口径图例')
+    expect(idx).toBeGreaterThan(-1)
+    const block = src.slice(idx, idx + 1600)
+    expect(block).toContain('expiryWindowDays')
+    // 该块内不得出现「裸 `windowDays ??`」（后面跟 `??` 才是 props 用法的特征）
+    expect(block).not.toContain('windowDays ??')
+  })
+})
