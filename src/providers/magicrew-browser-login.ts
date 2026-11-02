@@ -181,18 +181,83 @@ function hostnameOf(url: string): string {
 /**
  * 页面里的取值表达式。
  *
- * ⚠️ 四个值一次取完（**不是**四次 `Runtime.evaluate`）：来回四次会让「读到 jwt 之后、
- * 读组织码之前用户换了账号」这种情况出现窗口，而错配的 jwt × org 在上游是
- * HTTP 200 + `code:403`（见 `magicrew-local-browser.ts` 头部的配对纪律）。
+ * ## ⚠️⚠️ 两个真机事实（2026-11-02 报障「一直处于等待状态」）
+ *
+ * ### ① 键名带 `MAGIC:user:` 前缀
+ *
+ * 上游网页（两站同一个前端）把登录态写在**加了前缀**的键下：
+ *
+ * ```
+ * MAGIC:user:authorization
+ * MAGIC:user:organizationCode
+ * MAGIC:user:teamshareOrganizationCode
+ * ```
+ *
+ * 真机实测（真实登录态，22 个键）：授权相关的三个键**全部**带前缀，
+ * 裸名**零命中**。而本函数原先读的是裸 `localStorage.getItem('authorization')`
+ * —— 那个键**根本不存在**。
+ *
+ * ### ② 值本身又是一层 JSON
+ *
+ * `localStorage` 里存的不直接是 JWT，而是**上游自己再包一层的信封**：
+ *
+ * ```
+ * localStorage['MAGIC:user:authorization']
+ *   = {"key":"authorization","value":"eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.sig"}
+ * ```
+ *
+ * ⇒ 取出来必须再 `JSON.parse` 一次拿 `.value`。直接拿整串去 `isJwtShaped`
+ * 会因为开头是 `{` 而判否 ⇒ **即使键名修好了，仍然读不到**。
+ *
+ * ## 症状为什么最难查
+ *
+ * **登录完全成功**（用户已在 workspace 里，右上角显示 150 积分），页面一直在、
+ * CDP 通道也通，但 `evaluate` 回 `{"a":null}` ⇒ 每 500ms 判一次「还没登完」
+ * ⇒ 干等到超时并报「CDP 与磁盘都没读到凭据（CDP 尝试 426 次）」。
+ * 两个事实任缺其一都读不到，而报错**完全看不出**是键名或信封的错。
+ *
+ * ## 三道兼容
+ *
+ * 1. **前缀优先、裸名兜底**：旧版 `letsmagic.cn` 的磁盘数据里裸名形态确实存在。
+ *    顺序不能反 —— 裸名读到的若是陈旧值，会与组织码错配（上游回
+ *    HTTP 200 + `code:403`，极难归因）。
+ * 2. **信封与裸值都认**：有的写入路径可能直接存 JWT（不套 JSON）。
+ *    判据是「能不能解析出 `.value`」，不能就当裸值用 —— 不写死某一种形态。
+ * 3. **四个值一次取完**（**不是**四次 `Runtime.evaluate`）：来回四次会让
+ *    「读到 jwt 之后、读组织码之前用户换了账号」出现窗口。
  *
  * `n` 是 `localStorage.length`：**空 = 还没登完**（见下面的判据）。
+ * `ak` / `ok` 是实际命中的键名 —— 超时诊断里用它区分「用户没登」与「键名又变了」。
  */
-const CDP_CREDENTIAL_EXPRESSION = `JSON.stringify({
-  a: localStorage.getItem('authorization'),
-  o: localStorage.getItem('organizationCode'),
-  t: localStorage.getItem('teamshareOrganizationCode'),
-  n: localStorage.length,
-})`
+const CDP_CREDENTIAL_EXPRESSION = `JSON.stringify((() => {
+  var unwrap = function (raw) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    try {
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && typeof parsed.value === 'string') {
+        return parsed.value === '' ? null : parsed.value;
+      }
+    } catch (e) { /* 不是 JSON ⇒ 当裸值用 */ }
+    return raw;
+  };
+  var pick = function (prefixed, bare) {
+    var keys = [prefixed, bare];
+    for (var i = 0; i < keys.length; i++) {
+      var v = unwrap(localStorage.getItem(keys[i]));
+      if (v !== null && v !== '') return { v: v, k: keys[i] };
+    }
+    return { v: null, k: '' };
+  };
+  var a = pick('MAGIC:user:authorization', 'authorization');
+  var o = pick('MAGIC:user:organizationCode', 'organizationCode');
+  var t = pick('MAGIC:user:teamshareOrganizationCode', 'teamshareOrganizationCode');
+  return {
+    a: a.v, ak: a.k,
+    o: o.v, ok: o.k,
+    t: t.v,
+    n: localStorage.length,
+  };
+})())`
 
 /**
  * 单条 CDP 命令的上限。
