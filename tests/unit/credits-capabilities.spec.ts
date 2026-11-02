@@ -212,17 +212,24 @@ describe('积分能力矩阵', () => {
   })
 
   /**
-   * 「锁定永久积分」按 provider 白名单（Loomy / OfficeAce）。
+   * 「锁定永久积分」按 provider 白名单。
    *
-   * 白名单必须与后端 `permanentLocked(provider)` 支持的集合一致：前端给了
-   * 按钮、后端不认，会得到一个必然失败的开关。
+   * 白名单必须与后端 `permanentLocked(provider)` **真正被读到**的集合一致：
+   * 前端给了按钮、后端不认，会得到一个必然失败的开关（假开关）。后端的接线
+   * 在 `wiring.ts` 各 provider 的 `resolveCredential` 闭包里，由
+   * `permanent-lock-wiring.spec.ts` 逐家钉住。
    */
-  it('锁定永久积分只对 Loomy 与 OfficeAce 为 true', () => {
-    expect(supportsPermanentLock('loomy')).toBe(true)
-    expect(supportsPermanentLock('officeace')).toBe(true)
-    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon', 'accio', 'sensenova']) {
+  it('锁定永久积分对 7 个渠道为 true（loomy / officeace / magicrew 两站 / qoder 两站 / trae）', () => {
+    for (const id of ['loomy', 'officeace', 'magicrew', 'magicrewintl', 'qoder', 'qodercn', 'trae']) {
+      expect(supportsPermanentLock(id), `${id} 应支持锁定永久积分`).toBe(true)
+    }
+    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'cline', 'raccoon', 'accio', 'sensenova']) {
       expect(supportsPermanentLock(id), `${id} 不应支持锁定永久积分`).toBe(false)
     }
+  })
+
+  it('未登记的 provider 一律视为不支持（默认关闭）', () => {
+    expect(supportsPermanentLock('unknown-provider')).toBe(false)
   })
 })
 

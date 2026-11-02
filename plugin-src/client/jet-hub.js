@@ -376,12 +376,32 @@ function formatCreditCoefficient(value) {
  *
  * 与 {@link permanentLockCopy}（结果文案）分开：按钮要讲清「是什么 + 点下去
  * 会发生什么」，而结果文案只说「发生了什么」。
+ *
+ * ⚠️ **三套口径不可共用**（写错口径会让用户以为锁的是另一种额度）：
+ *
+ * | 口径 | provider | 「临时池」是什么 |
+ * |---|---|---|
+ * | `daily` | loomy | 每日赠送额度（当天作废） |
+ * | `expiry` | officeace / magicrew 两站 / trae | 有到期时间的积分批次（长期/临期） |
+ * | `unknown-expiry` | qoder 两站 | **逐包到期拿不到** ⇒ 通常没有可用的临时额度 |
+ *
+ * ⚠️ `qoder` 必须单独一套：它的临期桶**恒为 0**（`addOnQuota` 没有任何日期字段、
+ * `userQuota.expiresAt` 是永久哨兵）。若套用 `expiry` 那套文案，用户会以为
+ * 「等几天就有临期额度可用」—— 那是**不可能发生**的事，唯一的下步是解锁。
  */
 function permanentLockTitle(provider, locked) {
-  if (provider === 'officeace') {
+  if (provider === 'qoder' || provider === 'qodercn') {
+    const name = provider === 'qodercn' ? 'Qoder (中国版)' : 'Qoder';
     return locked
-      ? '当前已锁定永久积分：只消耗有到期时间的积分桶（长期/临期），永久桶不参与。只剩永久桶时将没有可用账号。点此解锁。'
-      : '锁定永久积分后只消耗有到期时间的积分桶（长期/临期），可保住永久积分。只剩永久桶时将没有可用账号。点此锁定。';
+      ? `当前已锁定永久积分：只消耗有到期时间的额度。⚠️ ${name} 的积分通常拿不到逐包到期时间，`
+        + '故锁定期间多半会显示「没有可用账号」。点此解锁。'
+      : `锁定永久积分后只消耗有到期时间的额度，可保住永久积分。⚠️ ${name} 的积分通常拿不到逐包到期时间，`
+        + '锁定期间多半没有可用账号。点此锁定。';
+  }
+  if (provider === 'officeace' || provider === 'magicrew' || provider === 'magicrewintl' || provider === 'trae') {
+    return locked
+      ? '当前已锁定永久积分：只消耗有到期时间的积分批次（长期/临期），永久批次不参与。只剩永久批次时将没有可用账号。点此解锁。'
+      : '锁定永久积分后只消耗有到期时间的积分批次（长期/临期），可保住永久积分。只剩永久批次时将没有可用账号。点此锁定。';
   }
   return locked
     ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
@@ -391,16 +411,21 @@ function permanentLockTitle(provider, locked) {
 /**
  * 「锁定永久积分」按钮的**结果文案**（按 provider 的临时池口径）。
  *
- * ⚠️ 两个渠道的临时池不是一回事，文案不能共用：Loomy 是「每日赠送」，
- * OfficeAce 是「有到期时间的桶（长期/临期）」。写错口径会让用户以为
- * 锁的是另一种额度。
+ * ⚠️ 三个渠道的临时池不是一回事，文案不能共用：Loomy 是「每日赠送」，
+ * OfficeAce / Magicrew / TRAE 是「有到期时间的批次（长期/临期）」，
+ * Qoder 两站则是「通常没有」—— 详见 {@link permanentLockTitle} 的口径表。
  *
  * @param locked - 变更**后**的状态。
  */
 function permanentLockCopy(provider, locked) {
-  if (provider === 'officeace') {
+  if (provider === 'qoder' || provider === 'qodercn') {
     return locked
-      ? '已锁定永久积分：只消耗有到期时间的积分桶（长期/临期），永久桶不参与。只剩永久桶时将无可用账号。'
+      ? '已锁定永久积分：只消耗有到期时间的额度。⚠️ Qoder 的积分通常拿不到逐包到期时间，故多半会显示「没有可用账号」—— 那是该开关的预期效果，不是故障。'
+      : '已解锁永久积分：永久积分重新参与消耗。';
+  }
+  if (provider === 'officeace' || provider === 'magicrew' || provider === 'magicrewintl' || provider === 'trae') {
+    return locked
+      ? '已锁定永久积分：只消耗有到期时间的积分批次（长期/临期），永久批次不参与。只剩永久批次时将无可用账号。'
       : '已解锁永久积分：永久积分重新参与消耗。';
   }
   return locked
@@ -466,9 +491,28 @@ function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays
       })()
     : null;
 
-  // ── officeace：永久 / 长期 / 临期三档 ──
+  /**
+   * 走「永久 / 长期 / 临期三档」分桶的 provider 白名单。
+   *
+   * ⚠️ **必须与后端选号同一份口径**：面板显示「临期 N」而选号不认它，用户会
+   * 以为功能坏了。后端的分档实现在 `src/providers/credit-expiry-rank.ts`
+   * （`splitCreditPackagesByExpiry`），前端的 {@link splitCreditsByExpiry}
+   * 与它逐行同构 —— 两者都吃 `packages[].{active, remaining, expiredTime}`。
+   *
+   * ⚠️ **新增渠道必须同时改三处**（漏任一处症状都是静默的）：
+   * ① 本处；② `credits-capabilities.js` 的 `PERMANENT_LOCK_PROVIDERS`；
+   * ③ 后端 `wiring.ts` 的选号闭包（真正读 `pool.permanentLocked`）。
+   * 只改 ① 会让面板画出三档行、但锁定按钮仍不渲染；
+   * 只改 ② 会渲染按钮、但**后端不拦**（= 假开关）。
+   *
+   * ⚠️ 为什么 `accio` 不在名单里：它的三个包是**不同类型**的额度
+   * （每日/每月/推荐），不是「同一批额度的不同到期时间」。
+   */
+  const EXPIRY_TIER_PROVIDERS = ['officeace', 'magicrew', 'magicrewintl', 'trae', 'qoder', 'qodercn'];
+
+  // ── 三档分桶：永久 / 长期 / 临期 ──
   // windowDays 由后端随余额下发（缺省用前端常量，两端默认值一致故不会漂移）。
-  const expiryParts = provider === 'officeace'
+  const expiryParts = EXPIRY_TIER_PROVIDERS.includes(provider)
     ? expirySplitParts(
         splitCreditsByExpiry(all, windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS, Date.now()),
         formatCredits,
@@ -491,7 +535,7 @@ function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays
     accioNamedPools !== null && accioNamedPools !== undefined
       ? React.createElement('span', { className: 'dim-jh-creditPools' }, accioNamedPools)
       : null,
-    // officeace 三档分桶（带色调；段间用 · 分隔）
+    // 三档分桶（带色调；段间用 · 分隔）。名单见上面的 EXPIRY_TIER_PROVIDERS。
     expiryParts.length > 0
       ? React.createElement('span', { className: 'dim-jh-creditPools' },
           expiryParts.map((part, index) =>
@@ -2386,7 +2430,8 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void runLimitAction('resetAll'),
             }, '重置所有')
           : null,
-        // 锁定永久积分（Loomy / OfficeAce）：只消耗临时/临期额度，保住永久积分。
+        // 锁定永久积分（Loomy / OfficeAce / Magicrew 两站 / Qoder 两站 / TRAE）：
+        // 只消耗临时/临期额度，保住永久积分。名单见 `credits-capabilities.js`。
         canLockPermanent
           ? React.createElement('button', {
               className: 'dim-jh-btn',

@@ -224,17 +224,91 @@ function readString(source: unknown, key: string): string | undefined {
 }
 
 /**
+ * 「永久」哨兵值：**9999-12-31** 的毫秒时间戳。
+ *
+ * 上游 `qoderUsage.expiresAt` 在个人版下发的恒是这个值 —— 它的语义是
+ * **「不会到期」**（= 永久积分），但**不是**一个真实的到期时刻。
+ *
+ * ⚠️ 取证的完整结论见 {@link isPermanentSentinelMs}：若把这个哨兵当成真实
+ * 到期时间写进 `expiredTime`，包会落进 **longTerm** 桶（≈290 万天后，远超
+ * 15 天窗口），而**锁定永久积分时 `longTerm` 仍然可选** ⇒ 锁住的永久积分
+ * 在这一路径上照样被烧，锁定形同虚设。
+ *
+ * ## ⚠️⚠️ 「`addOnQuota` 没有日期字段」是**本端点的**限制，不是平台的
+ *
+ * 别据此断言「Qoder 的积分永不 expires」—— 拿不到的只是**逐包到期时刻**：
+ * 领取响应（本文件头）明写 `validity: {mode: RELATIVE_DAYS, days: 30}`，
+ * 即活动赠送的额度**30 天后过期**。`/sash/api/v2/me/usage` 只回两个聚合标量
+ * （`userQuota` / `addOnQuota`）与一个 `expiresAt` 哨兵，**没有任何逐包到期字段**
+ * ⇒ 结构上无法把「30 天有效的那一批」与「真正永久的那一批」分开。
+ *
+ * 因此锁定永久积分时对这类账号的解释只能是「**无法证明**它不会近期作废」
+ * （见 `credit-expiry-rank.ts` 的 `creditLockedError`），不能写成
+ * 「这些额度永远不会过期」—— 那是**错的**，也可能是用户额度被白白放掉的原因。
+ */
+export const QODER_PERMANENT_EXPIRY_MS = 253402214400000
+
+/**
+ * 判定一个毫秒时间戳是否是「永久」哨兵。
+ *
+ * 三条判据（**必须全部实现，少一条就有漏**）：
+ *
+ * 1. **非有限值 / ≤ 0** ⇒ 不是哨兵（那是「没有到期时间」，调用方另行处理）；
+ * 2. `>= QODER_PERMANENT_EXPIRY_MS`；
+ * 3. **年份 >= 9999** —— 兜住 `9999-01-01`~`9999-12-30` 这些**小于常量**
+ *    但同样是哨兵的取值（上游若发 `"9999-12-31"` 这种纯日期串，
+ *    `Date.parse` 仍能解析，落到同一条判据上）。
+ *
+ * ⚠️ 两条支路（数字 `expiresAtMs` 与字符串 `expiredTime`）**共用本函数**
+ * —— 本仓库红线：同一语义只留一处判据。来源侧正是因为只给一条支路加了识别，
+ * 另一条支路把「即将消灭」的荒谬文案原样漏了出去。
+ */
+export function isPermanentSentinelMs(ms: number): boolean {
+  if (!Number.isFinite(ms) || ms <= 0) return false
+  if (ms >= QODER_PERMANENT_EXPIRY_MS) return true
+  return new Date(ms).getUTCFullYear() >= 9999
+}
+
+/**
  * 把一个 quota 对象转成 `CreditPackage`。
  *
  * `remaining` 优先取服务端字段；缺失时按 `total - used` 计算
  * （对齐源码 `tVe` 的 `Math.max(0, total - used)`）。
  * 负值一律 clamp 到 0：服务端在超额扣费/计量回滚下可能下发负值，
  * 原样透出会让卡片显示「-12.5 积分」。
+ *
+ * ## 到期时间的两条**互不重叠**支路（2026-11-02 从来源 `bd73592` 前序修订补齐）
+ *
+ * | 支路 | 来源与调用点 | 命中条件 | 动作 |
+ * |---|---|---|---|
+ * | A | `options.expiresAtMs` = `qoderUsage.expiresAt`，**只给 `userQuota` 传** | 有限值 > 0 且**不是**哨兵 | 写 `expiredTime`（ISO 串）⇒ 真实日期 |
+ * | A | 同上 | 哨兵 / 非有限 / ≤ 0 | **不写** ⇒ 永久桶 |
+ * | B | `options.expiredTime` = 逐包 ISO 串（`dedicatedResourcePackages[].expiresAt`） | `Date.parse` 有限且**不是**哨兵 | 原样透出 |
+ * | B | 同上 | 缺失 / 解析失败 / **哨兵** | `''` ⇒ 永久桶 |
+ *
+ * ⚠️ **「不写」是保守方向**：本项目 `splitCreditPackagesByExpiry` 对
+ * `expiredTime === ''` 的包按**永久桶**处理 ⇒ 锁定时会被拦下（宁可少用一个号，
+ * 也不把未知到期当成长期积分烧掉）。
+ *
+ * ⚠️ **哨兵命中时 `expiredTime` 也必须清空**（来源对抗审计 P1）：前端
+ * `credit-expiry.js` 的 `packageExpiryMs` 只读 `expiredTime`，留着原串会让
+ * hover 里渲染出「9999-12-31（2912150 天后）」，与三档行说「永久」自相矛盾。
  */
 function toPackage(
   name: string,
   quota: unknown,
-  options: { active?: boolean; expiredTime?: string } = {},
+  options: {
+    active?: boolean
+    expiredTime?: string
+    /**
+     * `qoderUsage.expiresAt`（**数字毫秒**）。
+     *
+     * ⚠️ **只有 `userQuota` 那一条传它** —— `expiresAt` 的语义归属就是套餐额度。
+     * `addOnQuota`（只给聚合标量、**没有任何日期字段**）与
+     * `dedicatedResourcePackages`（逐包自带 `expiresAt` 字符串，走支路 B）都不传。
+     */
+    expiresAtMs?: number
+  } = {},
 ): CreditPackage | undefined {
   const total = readNumber(quota, 'total')
   const used = readNumber(quota, 'used')
@@ -245,6 +319,19 @@ function toPackage(
   const remaining = remainingRaw !== undefined
     ? Math.max(0, remainingRaw)
     : Math.max(0, totalValue - usedValue)
+
+  const explicitMs = options.expiresAtMs
+  const explicitUsable = typeof explicitMs === 'number'
+    && Number.isFinite(explicitMs)
+    && explicitMs > 0
+    && !isPermanentSentinelMs(explicitMs)
+  const rawExpired = options.expiredTime ?? ''
+  const parsedMs = rawExpired.length > 0 ? Date.parse(rawExpired) : Number.NaN
+  const expiredTime = explicitUsable
+    ? new Date(explicitMs).toISOString()
+    // 支路 B：解析失败（NaN）不是哨兵，但同样不能当到期时间 ⇒ 一律空串。
+    : (Number.isFinite(parsedMs) && !isPermanentSentinelMs(parsedMs) ? rawExpired : '')
+
   return {
     name,
     unit: readString(quota, 'unit') ?? 'credits',
@@ -254,7 +341,7 @@ function toPackage(
     active: options.active ?? true,
     cycleStartTime: '',
     cycleEndTime: '',
-    expiredTime: options.expiredTime ?? '',
+    expiredTime,
   }
 }
 
@@ -307,7 +394,14 @@ export async function fetchQoderCreditBalance(
 
   const packages: CreditPackage[] = []
   // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包。
-  const userQuota = toPackage('套餐额度', (usage as Record<string, unknown>).userQuota)
+  //
+  // ⚠️ **只有 `userQuota` 传 `expiresAtMs`**：`qoderUsage.expiresAt` 的语义归属
+  //    就是套餐额度（个人版下发恒为永久哨兵，见 `QODER_PERMANENT_EXPIRY_MS`）。
+  //    `addOnQuota` 没有任何日期字段 —— 于是它**恒落永久桶**，锁定永久积分时
+  //    该账号一定被判不可用。这是**如实**的结论：我们确实只能证明它不会近期作废。
+  const userQuota = toPackage('套餐额度', (usage as Record<string, unknown>).userQuota, {
+    expiresAtMs: readNumber(usage, 'expiresAt'),
+  })
   if (userQuota !== undefined) packages.push(userQuota)
   const addOnQuota = toPackage('资源包', (usage as Record<string, unknown>).addOnQuota)
   if (addOnQuota !== undefined) packages.push(addOnQuota)

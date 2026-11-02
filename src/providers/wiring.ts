@@ -370,7 +370,12 @@ import { MAGICREW, MAGICREW_PRODUCTS } from './magicrew-product.js'
 import { fetchMagicrewCatalogModels } from './magicrew-catalog.js'
 import { fetchMagicrewBalance } from './magicrew-credits.js'
 import { MagicrewExpirySelector } from './magicrew-expiry-rank.js'
+import {
+  CreditExpirySelector, creditExpiryTier, creditLockedError, CREDIT_EXPIRY_TIER,
+} from './credit-expiry-rank.js'
 import { parseMagicrewCredential } from './magicrew-auth.js'
+import { fetchQoderCreditBalance } from './qoder-credits.js'
+import { fetchTraeCreditBalance } from './trae-credits.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
@@ -405,6 +410,88 @@ async function firstUsableCodeArtsCredential(pool: AccountPool): Promise<CodeArt
     if (credential?.access_key_id && credential.secret_access_key) return credential
   }
   return undefined
+}
+
+/**
+ * 把账号池解析出来的**未知形状**对象收窄成 Qoder 凭据。
+ *
+ * ⚠️ 必须先校验再交给 `fetchQoderCreditBalance`：那个函数内部直接读
+ * `qoderUsage`，而池里的凭据是 `JSON.parse` 出来的 `Record<string, unknown>`
+ * —— 缺字段时会在构造请求头时抛错，把一次「查不到余额」升级成选号崩溃。
+ *
+ * ⚠️ 与本仓库 `firstUsableQoderCredential` 的三条判据同源：`access_token`
+ * 必需，`uid` 与 `machine_id` 用于 WASM 签名（缺了余额查询会被上游拒）。
+ */
+function asQoderCredential(raw: unknown): QoderCredential | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const credential = raw as Partial<QoderCredential>
+  const hasToken = typeof credential.access_token === 'string' && credential.access_token.length > 0
+  const hasUid = typeof credential.uid === 'string' && credential.uid.length > 0
+  const hasMachine = typeof credential.machine_id === 'string' && credential.machine_id.length > 0
+  return hasToken && hasUid && hasMachine ? credential as QoderCredential : undefined
+}
+
+/** 把账号池解析出来的**未知形状**对象收窄成 TRAE 凭据。 */
+function asTraeCredential(raw: unknown): TraeCredential | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const credential = raw as Partial<TraeCredential>
+  if (typeof credential.access_token !== 'string' || credential.access_token.length === 0) return undefined
+  return credential as TraeCredential
+}
+
+/**
+ * 按 `enabled` + **模型级限流**筛出候选账号（顺序 = 用户手动优先级）。
+ *
+ * ⚠️ 判据必须与 `AccountPool.getAvailableAccount` **逐字一致**（含「空 modelId
+ * 不过滤」与「`resetAt` 为 0 / 已过期都算不受限」）：余额分档只在这批候选**内部**
+ * 进行 —— 不能因为某个号积分多就绕开限流标记（否则「换号」形同虚设）。
+ *
+ * ⚠️ 与 loomy / officeace / magicrew 三处既有闭包里的同名逻辑**同一条判据**。
+ * 本函数是把它收成一份的入口；那三处暂未改造（改动面与收益不成比例），
+ * 但**新增的接线必须走这里**，不要再复制第四份。
+ */
+function balanceGateCandidates(
+  pool: AccountPool,
+  provider: string,
+  modelId: string | undefined,
+): Array<{ id: string, credentialRef: string }> {
+  const key = modelId ?? ''
+  return pool.listAccountsByProvider(provider)
+    .filter((account) => account.enabled)
+    .filter((account) => {
+      if (key.length === 0) return true
+      if (account.modelRateLimits === undefined) return true
+      const resetAt = account.modelRateLimits[key]
+      return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+    })
+    .map((account) => ({ id: account.id, credentialRef: account.credentialRef }))
+}
+
+/**
+ * 「锁定永久积分且没有可用账号」的报错。
+ *
+ * ⚠️ **必须把「查不到」与「确实用尽」分开报**：把一次网络抖动说成「额度用尽」
+ * 会让用户去解锁，而解锁会**不可撤回地**消耗永久积分。
+ *
+ * 判据：把候选逐个问一遍（**走同一个选择器实例的 60 秒缓存**，因此这里不会
+ * 重新发网络请求 —— `select` 刚刚已经查过）。任一账号 `unknown`（查不到）
+ * 即按「无法确认」报；全部 `ok` 才是「确实用尽」。
+ */
+async function lockedNoAccountError(
+  displayName: string,
+  selector: CreditExpirySelector,
+  candidates: readonly { id: string, credentialRef: string }[],
+): Promise<Error> {
+  const expiries = await Promise.all(candidates.map(async (candidate) => await selector.expiryOf(candidate)))
+  const unknownIds = expiries
+    .filter((expiry) => creditExpiryTier(expiry) === CREDIT_EXPIRY_TIER.unknown)
+    .map((expiry) => expiry.id)
+  if (unknownIds.length === 0) return creditLockedError(displayName, 'exhausted')
+  return creditLockedError(
+    displayName,
+    'unknown',
+    unknownIds.map((id) => `${id}: 积分查询失败`),
+  )
 }
 
 /**
@@ -676,79 +763,205 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
   // 目录请求是周期性的，若走 `ctx.resolveCredential`，它会在一次聊天选号之后
   // 把那个记录改写成目录用的账号 ⇒ 额度标记落到无辜账号上。
   for (const product of [QODER, QODER_CN]) {
+    /**
+     * 按积分到期分档选号 + **锁定永久积分**（2026-11-02 用户要求）。
+     *
+     * ## ⚠️ 改前这里是**假开关**
+     *
+     * 面板早有「锁定永久积分」按钮（`credits-capabilities.js` 的白名单只要加上
+     * 就渲染），后端 `pool.permanentLocked(provider)` 也早已通用 —— 但 Qoder
+     * 两站的 `resolveCredential` 是**纯池选号**，一次都没读过它。用户点了锁定
+     * 之后行为完全不变，永久积分照样被烧，且**没有任何提示**。
+     *
+     * ## 判据取自共享层（不要在本处另写一份）
+     *
+     * 分桶 / 分档 / 可用性一律走 `credit-expiry-rank.ts`（与 Magicrew 同一份
+     * 实现）：`permanent`（没有到期时间的桶）、`unknown`（查不到）在锁定时
+     * **一律不可用** —— `unknown` 若可用，锁定就成了一次网络抖动即可绕过的装饰。
+     *
+     * ## ⚠️ 免费模型必须豁免
+     *
+     * 免费模型（`is_free`）既不扣临时也不扣永久积分，走余额门会被拦下并报出
+     * 「额度都属于永久」这种**与事实相反**的错误（来源 2026-10-21 报障）。
+     * 判据在适配器里（远端 ∪ 静态表），本处只透传 —— **不要在这里再判一次**。
+     */
+    const qoderExpirySelector = new CreditExpirySelector({
+      label: product.id,
+      fetchBalance: async (candidate) => {
+        const raw = await ctx.pool.resolveCredentialByRef(candidate.credentialRef)
+        const credential = asQoderCredential(raw)
+        if (credential === undefined) return undefined
+        // 查余额要 WASM 头（`withQoderMachineHeadersAsync`），与适配器同源。
+        return await fetchQoderCreditBalance(credential, product, fetcher) ?? undefined
+      },
+      logger: (message) => ctx.logger.info(message),
+    })
+    /**
+     * 适配器实例先声明、后赋值：选号闭包里的 `isFreeModel` 需要引用它。
+     *
+     * ⚠️ 闭包只在**注册完成后**才执行（首次请求时），故不存在 TDZ 问题 ——
+     * 与来源 `index.ts` 里 `qoderAdapter` 自引用的写法同因。
+     */
+    let qoderAdapter: QoderAdapter
+    qoderAdapter = new QoderAdapter({
+      credentialRef: `${product.id.toUpperCase()}_ACCESS_TOKEN` as never,
+      // ⚠️ 必须透传 modelId：空串会让模型级限流过滤整体短路，刚用完额度的
+      // 账号下次仍被选中 ⇒ 每个请求都先打一次必然失败的账号再换号
+      //（与 trae 的同名接线同因，见 `qoder-adapter.ts` 的选项注释）。
+      resolveCredential: async (modelId?: string) => {
+        const allowPermanent = !ctx.pool.permanentLocked(product.id)
+        /**
+         * 未锁定，或本次是**免费模型**（不扣任何积分）⇒ 逐字走旧路径。
+         *
+         * ⚠️ 免费模型必须豁免余额门：否则锁定期间它会被 `allowPermanent=false`
+         * 一并拦下，报出「额度都属于永久」这种**与事实相反**的错误
+         * （来源 2026-10-21 的真实报障）。判据在适配器里，本处只透传。
+         */
+        const skipBalanceGate = allowPermanent || qoderAdapter.isFreeModel(modelId ?? '')
+        if (skipBalanceGate) return await ctx.resolveCredential(product.id, modelId) as never
+
+        const candidates = balanceGateCandidates(ctx.pool, product.id, modelId)
+        if (candidates.length > 0) {
+          const picked = await qoderExpirySelector.select(candidates, { allowPermanent })
+          if (picked !== undefined) {
+            const credential = asQoderCredential(
+              await ctx.pool.resolveCredentialByRef(picked.account.credentialRef),
+            )
+            if (credential !== undefined) {
+              // 登记实际选中的账号：定向续期与用量记录都以它为准。
+              recordCurrentAccount(product.id, picked.account.id)
+              return credential as never
+            }
+            /**
+             * ⚠️ 分档选中但**凭据读不出来**：锁定态下**不得**落到下面的池兜底
+             * —— 池的 `getAvailableAccount` 会跳过坏凭据账号、选一个
+             * 「凭据好但只剩永久积分」的号，于是锁定被绕过、永久积分照样被烧。
+             * 这正是「锁定形同虚设」的第二种形态（第一种是 select 返回 undefined）。
+             */
+            throw creditLockedError(
+              product.displayName,
+              'broken-credential',
+              [`${picked.account.id}: 凭据读不出来`],
+            )
+          }
+          // ⚠️ 锁定时**绝不回落池**（同上，池兜底会绕过锁定）。
+          throw await lockedNoAccountError(product.displayName, qoderExpirySelector, candidates)
+        }
+        // 池里一个候选都没有（未登录 / 全部被限流 / 全部停用）⇒ 交给池报它自己的错。
+        return await ctx.resolveCredential(product.id, modelId) as never
+      },
+      refresh: () => ctx.refresh(product.id),
+      accountPool: ctx.pool,
+      product,
+      currentAccountId: () => currentAccountIdFor(product.id),
+      readImage: ctx.readImage,
+      warn: (message) => ctx.logger.warn(message),
+      fetchRemoteModels: () => fetchRemoteCatalog(product.id, async () => {
+        const credential = await firstUsableQoderCredential(ctx.pool, product.id)
+        if (credential === undefined) return []
+        return fetchQoderRemoteModels(credential, product, { fetcher })
+      }),
+    })
     registry.register(
       descriptorFor(product.id, product.displayName, product.encryptedInferBase, {
         authKind: 'qoder-wasm',
         // 目录需要 WASM 签名，现已接上（`qoder-catalog.ts`）。
         catalogSource: 'remote-first',
       }),
-      new QoderAdapter({
-        credentialRef: `${product.id.toUpperCase()}_ACCESS_TOKEN` as never,
-        // ⚠️ 必须透传 modelId：空串会让模型级限流过滤整体短路，刚用完额度的
-        // 账号下次仍被选中 ⇒ 每个请求都先打一次必然失败的账号再换号
-        //（与 trae 的同名接线同因，见 `qoder-adapter.ts` 的选项注释）。
-        resolveCredential: (modelId?: string) => ctx.resolveCredential(product.id, modelId) as never,
-        refresh: () => ctx.refresh(product.id),
-        accountPool: ctx.pool,
-        product,
-        currentAccountId: () => currentAccountIdFor(product.id),
-        readImage: ctx.readImage,
-        warn: (message) => ctx.logger.warn(message),
-        fetchRemoteModels: () => fetchRemoteCatalog(product.id, async () => {
-          const credential = await firstUsableQoderCredential(ctx.pool, product.id)
-          if (credential === undefined) return []
-          return fetchQoderRemoteModels(credential, product, { fetcher })
-        }),
-      }),
+      qoderAdapter,
     )
   }
 
   // ── TRAE：SOLO 协议转换 ──
+  //
+  // ⚠️ **2026-11-02：`trae-credits.ts` 补读条目级 `expire_time`**（此前每个包
+  // 的 `expiredTime` 都是空串 ⇒ 全部落「永久」桶）。那是本家能按到期分档的前提：
+  // 不补这一句，下面这个选号器在锁定时会把**所有账号**判成不可用。
+  const traeExpirySelector = new CreditExpirySelector({
+    label: TRAE.id,
+    fetchBalance: async (candidate) => {
+      const raw = await ctx.pool.resolveCredentialByRef(candidate.credentialRef)
+      const credential = asTraeCredential(raw)
+      if (credential === undefined) return undefined
+      return await fetchTraeCreditBalance(credential, TRAE, fetcher) ?? undefined
+    },
+    logger: (message) => ctx.logger.info(message),
+  })
+  let traeAdapter: TraeAdapter
+  traeAdapter = new TraeAdapter({
+    credentialRef: 'TRAE_ACCESS_TOKEN' as never,
+    // ⚠️ 必须透传 modelId：空串会让模型级限流过滤整体短路，换号形同虚设
+    //（见 TraeAdapterOptions.resolveCredential 的说明）。
+    resolveCredential: async (modelId?: string) => {
+      const allowPermanent = !ctx.pool.permanentLocked(TRAE.id)
+      // 未锁定，或本次是免费模型（`credits_rate === 0`，不扣积分）⇒ 走旧路径。
+      // 免费模型的判据在适配器里（`isFreeModel`），本处只透传。
+      if (allowPermanent || traeAdapter.isFreeModel(modelId ?? '')) {
+        return await ctx.resolveCredential('trae', modelId) as never
+      }
+      const candidates = balanceGateCandidates(ctx.pool, TRAE.id, modelId)
+      if (candidates.length > 0) {
+        const picked = await traeExpirySelector.select(candidates, { allowPermanent })
+        if (picked !== undefined) {
+          const credential = asTraeCredential(
+            await ctx.pool.resolveCredentialByRef(picked.account.credentialRef),
+          )
+          if (credential !== undefined) {
+            recordCurrentAccount(TRAE.id, picked.account.id)
+            return credential as never
+          }
+          // ⚠️ 分档选中但凭据读不出来 ⇒ **不得**回落池（池会跳到只剩永久积分的
+          // 账号上，锁定被绕过）—— 与 qoder 那一支同因。
+          throw creditLockedError(TRAE.displayName, 'broken-credential', [`${picked.account.id}: 凭据读不出来`])
+        }
+        // ⚠️ 锁定时**绝不回落池**（池兜底会绕过锁定、照样烧永久积分）。
+        throw await lockedNoAccountError(TRAE.displayName, traeExpirySelector, candidates)
+      }
+      return await ctx.resolveCredential('trae', modelId) as never
+    },
+    refresh: () => ctx.refresh('trae'),
+    accountPool: ctx.pool,
+    product: TRAE,
+    readImage: ctx.readImage,
+    // 远端目录：batch_get_detail_param 一次拉全 22 个 function 的模型目录
+    // （含 creditsRate 倍率，displayName 会拼成「模型名 · x1.5」）。
+    fetchRemoteModels: () => fetchRemoteCatalog('trae', async () => {
+      const account = await ctx.pool.getAvailableAccount('trae', '')
+      const credential = asTraeCredential(account?.credential)
+      if (credential === undefined || credential.access_token.length === 0) return []
+      // ⚠️ 与单通道 get_detail_param 不同：真实 IDE 传全部 22 个 function，
+      // 只传聊天通道会让条目错位/被解析器跳过（照抄 TraeAuth.fetchModelsUncached）。
+      const response = await fetcher(`${TRAE.agentHost}${TRAE_BATCH_MODELS_PATH}`, {
+        method: 'POST',
+        headers: traeSOLOHeaders(credential, TRAE, false),
+        body: JSON.stringify({
+          functions: [
+            'ui_builder_v2', 'solo_coder', 'chat_v3', 'solo_builder',
+            'builder_v3', 'builder', 'chat', 'inline_chat', 'git_ai',
+            'custom_agent_generation', 'utils', 'code_reviewer',
+            'code_review_summary', 'solo_agent', 'solo_agent_remote',
+            'solo_work_remote', 'solo_agent_lite', 'solo_work_lite',
+            'solo_design_lite', 'solo_design_remote', 'multimodal',
+            'system_diagnosis',
+          ],
+          agent_type: '',
+          current_config_info: { config_name: '', is_custom_model: false },
+          mode_type: 0,
+          access_type: 0,
+          ab_force_vids: '',
+          ab_autotest_advanced_mode: 0,
+          show_custom_model: true,
+        }),
+        signal: AbortSignal.timeout(TRAE_REQUEST_TIMEOUT_MS),
+      })
+      if (!response.ok) throw new Error(`trae 远端目录 HTTP ${response.status}`)
+      return parseTraeBatchModelList(await response.json() as unknown)
+    }),
+  })
+  // ⚠️ 注册在适配器实例之后（自引用选号闭包需要它，见上）。
   registry.register(
     descriptorFor('trae', TRAE.displayName, TRAE.agentHost),
-    new TraeAdapter({
-      credentialRef: 'TRAE_ACCESS_TOKEN' as never,
-      // ⚠️ 必须透传 modelId：空串会让模型级限流过滤整体短路，换号形同虚设
-      //（见 TraeAdapterOptions.resolveCredential 的说明）。
-      resolveCredential: (modelId?: string) => ctx.resolveCredential('trae', modelId) as never,
-      refresh: () => ctx.refresh('trae'),
-      accountPool: ctx.pool,
-      product: TRAE,
-      readImage: ctx.readImage,
-      // 远端目录：batch_get_detail_param 一次拉全 22 个 function 的模型目录
-      // （含 creditsRate 倍率，displayName 会拼成「模型名 · x1.5」）。
-      fetchRemoteModels: () => fetchRemoteCatalog('trae', async () => {
-        const credential = (await ctx.pool.getAvailableAccount('trae', ''))!.credential as TraeCredential
-        if (credential.access_token.length === 0) return []
-        // ⚠️ 与单通道 get_detail_param 不同：真实 IDE 传全部 22 个 function，
-        // 只传聊天通道会让条目错位/被解析器跳过（照抄 TraeAuth.fetchModelsUncached）。
-        const response = await fetcher(`${TRAE.agentHost}${TRAE_BATCH_MODELS_PATH}`, {
-          method: 'POST',
-          headers: traeSOLOHeaders(credential, TRAE, false),
-          body: JSON.stringify({
-            functions: [
-              'ui_builder_v2', 'solo_coder', 'chat_v3', 'solo_builder',
-              'builder_v3', 'builder', 'chat', 'inline_chat', 'git_ai',
-              'custom_agent_generation', 'utils', 'code_reviewer',
-              'code_review_summary', 'solo_agent', 'solo_agent_remote',
-              'solo_work_remote', 'solo_agent_lite', 'solo_work_lite',
-              'solo_design_lite', 'solo_design_remote', 'multimodal',
-              'system_diagnosis',
-            ],
-            agent_type: '',
-            current_config_info: { config_name: '', is_custom_model: false },
-            mode_type: 0,
-            access_type: 0,
-            ab_force_vids: '',
-            ab_autotest_advanced_mode: 0,
-            show_custom_model: true,
-          }),
-          signal: AbortSignal.timeout(TRAE_REQUEST_TIMEOUT_MS),
-        })
-        if (!response.ok) throw new Error(`trae 远端目录 HTTP ${response.status}`)
-        return parseTraeBatchModelList(await response.json() as unknown)
-      }),
-    }),
+    traeAdapter,
   )
 
   // ── Cline ──

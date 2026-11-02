@@ -256,6 +256,8 @@ export function supportsRateLimit(provider) {
  * | `loomy` | 每日赠送 | 今日赠送用尽即无可用账号 |
  * | `officeace` | 有到期时间的积分桶 | 只消耗会过期的桶，永久桶不参与 |
  * | `magicrew` / `magicrewintl` | 有到期时间的批次 | 同上（合成出的「永久积分」包不参与） |
+ * | `qoder` / `qodercn` | **只有**有到期时间的包 | Qoder 的临期桶通常为 0（逐包到期拿不到）⇒ 锁定期间多半「无可用账号」 |
+ * | `trae` | 条目级 `expire_time` 分出的临期/长期包 | 永久包不参与 |
  *
  * 为 false 时面板**不得**渲染该按钮，也不得发起 `permanentLock` 请求
  * （对不支持的 provider 发会拿到 bad-request，并在控制台留下必然失败的报错）。
@@ -268,6 +270,16 @@ const PERMANENT_LOCK_PROVIDERS = Object.freeze([
   // 而锁定要保护的正是它。分档口径见 `magicrew-expiry-rank.ts`。
   'magicrew',
   'magicrewintl',
+  // Qoder 两站（2026-11-02 用户要求）：**锁的正是「未知到期」那一桶**。
+  // `userQuota` 的 `expiresAt` 在个人版下发的恒是永久哨兵（253402214400000），
+  // `addOnQuota` 根本没有任何日期字段 ⇒ 两桶都落「永久」。故锁定后**几乎必然**
+  // 没有可用账号 —— 那是如实结论（我们确实只能证明它不会近期作废），
+  // 不是故障。分档见 `credit-expiry-rank.ts`，哨兵识别见 `qoder-credits.ts`。
+  'qoder',
+  'qodercn',
+  // TRAE（2026-11-02 用户要求）：条目级 `expire_time`（秒级 Unix）给出**真实**
+  // 逐包到期 ⇒ 锁定后仍可能有名副其实的临期包可用（与 Qoder 的关键差异）。
+  'trae',
 ])
 
 export function supportsPermanentLock(provider) {

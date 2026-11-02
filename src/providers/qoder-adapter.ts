@@ -572,6 +572,27 @@ export class QoderAdapter extends LlmAdapter {
     return this.catalogSource().map((model) => ({ id: model.id, name: qoderDisplayName(model) }))
   }
 
+  /**
+   * 该模型是否**不扣积分**（远端目录 `is_free === true`，如 `dfmodel` / `qfmodel`）。
+   *
+   * ## 为什么选号需要它（2026-11-02 用户要求「补齐锁定永久积分」）
+   *
+   * 锁定永久积分时，选号只允许「有会到期额度」的账号 —— 而**免费模型既不扣
+   * 临时额度也不扣永久积分**。不豁免的话，免费模型会和付费模型走同一条余额
+   * 分档路，锁定期间被一并拦下，报出「额度都属于永久」这种**与事实相反**的
+   * 错误（来源 2026-10-21 的真实报障，`credential-resolver.ts:359` 的长注释）。
+   *
+   * ⚠️ **判据取「远端 ∪ 静态表」**（{@link catalogModel}），与
+   * `inputModalitiesFor` 同源：远端目录是**按账号**下发的（免费号只给 2 条），
+   * 只查远端会把静态表里已知的免费模型判成付费 ⇒ 锁定期间误拦。
+   *
+   * ⚠️ 未声明 `isFree` 的条目**一律当付费**（保守方向：宁可少放一个号，
+   * 也不要因为「目录没说」而放开可能烧永久积分的请求）。
+   */
+  isFreeModel(modelId: string): boolean {
+    return this.catalogModel(modelId)?.isFree === true
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
     // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。

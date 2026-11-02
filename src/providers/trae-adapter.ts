@@ -711,6 +711,26 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   /**
+   * 该模型是否**不扣积分**（远端目录 `credits_rate === 0`）。
+   *
+   * ## 为什么选号需要它（2026-11-02 用户要求「补齐锁定永久积分」）
+   *
+   * 锁定永久积分时，选号只允许「有会到期额度」的账号 —— 而免费模型根本不扣
+   * 积分。不豁免的话，免费模型会被余额门一并拦下，报出「积分都已用尽」这种
+   * **与事实相反**的错误（来源 2026-10-21 的真实报障）。
+   *
+   * ⚠️ **`0` 是合法倍率（免费），必须与「没有倍率」区分开**（见
+   * `readConsumptionRate`：`enable: false` 时返回 `undefined`）。
+   * 判据是 `creditsRate === 0`，**不是** `<= 0` 之类的宽松比较 —— `undefined`
+   * 表示「上游没说」，那种模型一律当付费（保守方向）。
+   *
+   * ⚠️ 远端目录**没拉到时一律当付费**：此时无法判定，放开可能烧永久积分。
+   */
+  isFreeModel(modelId: string): boolean {
+    return this.remoteMeta.get(modelId)?.creditsRate === 0
+  }
+
+  /**
    * 该模型所属的聊天通道（`function`）。
    *
    * ⚠️ **模型只在列出它的通道里可调用**：发错通道上游会回流内

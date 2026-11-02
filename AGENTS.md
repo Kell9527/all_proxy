@@ -638,7 +638,13 @@ claimAll 分支、claimOnboarding、签到 sweep（`runtime-helpers`）、续期
    不过 HTTP 腿 ⇒ 一路判成功 ⇒ 静默漏领。
    ⚠️ 用 `DECIMAL_LITERAL_RE` 而不是裸 `Number()`：`Number('0x3E8') === 1000`。
 
-### 三档积分 + 永久锁（`magicrew-expiry-rank.ts`）
+### 三档积分 + 永久锁（`credit-expiry-rank.ts`，共享层；`magicrew-expiry-rank.ts` 只是薄转发）
+
+⚠️ **2026-11-02 起分档实现只有一份**：`src/providers/credit-expiry-rank.ts`。
+`magicrew-expiry-rank.ts` 保留历史导出名并转发（`MagicrewExpirySelector` 那一层壳
+只多一个 `product` 维度：两站的 host / 组织码要求不同，查余额必须按站取数）。
+**新增渠道一律走共享层，不要再复制第三、第四份判据** —— 任何一处改了窗口或边界，
+其余几家就静默分家，症状是「面板显示临期 N，选号却不认它」。
 
 上游余额 = **所有带到期时间的批次**（`expiring_quota_details`，含 2027 年的远期批次）
 **+ 一个没有到期时间的残差**（实测国内 2661/1661/**1000**、国际 347/247/**100**）。
@@ -646,6 +652,39 @@ claimAll 分支、claimOnboarding、签到 sweep（`runtime-helpers`）、续期
 
 ⚠️ **原名「长期积分」是命名错误**：前端判据是「有没有到期时间」⇒ 没有就到 `permanent`
 （绿）桶，名字却叫「长期」（黄），名字与落桶自相矛盾。已改名。
+
+🔑 **「锁定永久积分」的四处必须同改**（漏任一处症状都是**静默**的）：
+① `wiring.ts` 该 provider 的 `resolveCredential` 闭包（**真正读 `pool.permanentLocked`**）；
+② 前端 `credits-capabilities.js` 的 `PERMANENT_LOCK_PROVIDERS`（决定按钮是否渲染）；
+③ 前端 `jet-hub.js` 的 `EXPIRY_TIER_PROVIDERS`（决定面板是否画三档行）；
+④ 该渠道余额归一化**必须把到期时间写进 `expiredTime`**。
+⚠️ **只做 ②③ 就是假开关**（改前 qoder / qodercn / trae 正是这个状态：按钮能点、
+后端一次都没读过那个标志 ⇒ 永久积分照样被烧且无任何提示，2026-11-02 修复）。
+⚠️ **锁定态下有两处绝不能回落通用池**：`select` 返回 `undefined` 时，以及分档选中
+但**凭据读不出来**时 —— 池的 `getAvailableAccount` 会跳到「凭据好但只剩永久积分」
+的账号上，锁定被绕过。两处都直接抛 `creditLockedError`（三支文案
+`unknown` / `exhausted` / `broken-credential` 语义不可混用：把网络抖动说成「额度用尽」
+会让用户去解锁，而解锁**不可撤回地**烧积分）。
+⚠️ **免费模型必须豁免余额门**（Qoder 的 `is_free`、TRAE 的 `credits_rate === 0`）：
+它们既不扣临时也不扣永久积分，走余额门会在锁定期间被拦下并报「额度都属于永久」
+—— 与事实相反（来源 2026-10-21 真实报障）。判据各自留在适配器
+（`QoderAdapter.isFreeModel` / `TraeAdapter.isFreeModel`，均取「远端 ∪ 静态表」），
+wiring 只透传，**不要在那里再判一次**。
+
+🤡 **Qoder 的永久哨兵**（`QODER_PERMANENT_EXPIRY_MS = 253402214400000` = 9999-12-31）：
+`userQuota.expiresAt` 在个人版下发的恒是它，`addOnQuota` 根本没有日期字段 ⇒ 两桶都落
+「永久」。**若把哨兵当真实到期写进 `expiredTime`**，包会落进 `longTerm`（约 290 万天后）
+—— 而 `longTerm` 在锁定时**仍然可选** ⇒ 锁住的永久积分照样被烧。识别函数
+`isPermanentSentinelMs` 必须覆盖两条支路（数字 `expiresAt` 与字符串 `expiresAt`），
+且命中年份 ≥ 9999 也要认（兜住 `9999-01-01`~`12-30`）。
+⚠️ 由此可知 **Qoder 锁定后「多半没有可用账号」是如实结论，不是故障**：我们确实只能
+证明它不会近期作废（逐包到期端点实测不可用）。前端文案必须单独写这一支，
+**不得**套用「等几天就有临期额度」那套（那是**不可能发生**的事）。
+
+🤡 **TRAE 的 `expire_time` 曾被整段漏移植**（2026-11-02 修复）：来源在条目级读
+`expire_time`（**秒级** Unix，须 ×1000），而本项目移植时每个包的 `expiredTime` 都是
+空串 ⇒ 全体落「永久」桶 ⇒ 锁定时**所有账号**被判不可用。这是「本家锁定后还能有
+名副其实的临期包」与 Qoder 的关键差异。
 
 选号按「临期 → 长期 → 永久 → 未知 → 空」分档、**档内保持手动顺序**
 （`rankMagicrewAccountsByExpiry` 稳定排序）。锁定永久积分时
@@ -695,9 +734,10 @@ claimAll 分支、claimOnboarding、签到 sweep（`runtime-helpers`）、续期
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **163 个文件 3698 条用例，全绿**（2026-11-02 实测；较上次登记 +2 文件 +41 条，
-含新增 `magicrew-onboarding-expiry.spec.ts`（27 条）与 `magicrew-login-page.spec.ts`（11 条），
-以及 `magicrew-import.spec`（+2）/ `dsh-import.spec`（+1）/ `provider-wiring.spec` / `runtime-refresh.spec`（改 15 个 provider 与续期清单）。
+当前 **164 个文件 3729 条用例，全绿**（2026-11-02 实测；较上次登记 +1 文件 +31 条，
+新增 `permanent-lock-wiring.spec.ts`（30 条：共享分档层 / Qoder 哨兵 / TRAE `expire_time` /
+选择器锁定与降级 / 「假开关」源码级回归），`credits-capabilities.spec.ts` 的白名单断言
+同步改成 7 家（+1 条）。
 ⚠️ 之前登记的那 4 条「时间相关的既有失败」（`buddy-oauth.spec.ts` 1 条 +
 `officeace-expiry-selector.spec.ts` 3 条，fixture 锚在 2026-10-15）**已修**：
 把锚点改成「相对真实时钟」（`officeace` 的 `NOW` 取当前分钟、`buddy` 的促销

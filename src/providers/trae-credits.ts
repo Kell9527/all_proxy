@@ -349,8 +349,28 @@ export async function fetchTraeCreditBalance(
       ? readNumber(usage, 'credits_amount')
       : 0
 
+    /**
+     * 到期时间（2026-11-02 从来源 `bd73592` 的 `trae-credits.ts` 补齐 ——
+     * 本项目移植时**漏掉了这一整段**，于是每个包都落进「永久」桶）。
+     *
+     * 来源取证：服务端在**条目级**直接下发 `expire_time` —— **秒级** Unix
+     * 时间戳（实测 `1790783999` = 2026-09-30 23:59:59，与官方 UI
+     * 「2026/09/30 23:59 到期」逐条吻合）。`entitlement_base_info.end_time`
+     * 与它同值（备用来源）。`yearly_expire_time` 实测恒 0，**不取**。
+     *
+     * ⚠️ **秒 → 毫秒必须 ×1000**：不乘会让日期落在 1970 年。
+     * ⚠️ 拿不到（0 / 缺失）就写空串 ⇒ 归「永久」桶（**不编造日期**）。
+     * ⚠️ 本项目 `CreditPackage` 只有 `expiredTime`（ISO 串）一个出口，
+     * 没有来源的数值字段 `deductionEndTime` —— 归一化**必须在这里**完成，
+     * 否则 `credit-expiry-rank.ts` 分档恒把整包判成永久。
+     */
+    const expireSec = readNumber(entry, 'expire_time')
+    const expiredTime = expireSec > 0 ? new Date(expireSec * 1000).toISOString() : ''
+
     const pkg: CreditPackage = {
-      name: readString(base, 'name') || '资源包',
+      // ⚠️ 包名优先 `display_desc`（实测「每月登录赠送」/「签到奖励」/「免费」），
+      // 不是 `base.name` —— 后者实测为 undefined，旧代码全部回退成「资源包」。
+      name: readString(base, 'display_desc') || readString(entry, 'display_desc') || readString(base, 'name') || '资源包',
       unit: 'credits',
       remaining: creditsLimit - used,
       total: creditsLimit,
@@ -358,7 +378,7 @@ export async function fetchTraeCreditBalance(
       active: true,
       cycleStartTime: '',
       cycleEndTime: '',
-      expiredTime: '',
+      expiredTime,
     }
     packages.push(pkg)
     total += pkg.remaining
