@@ -286,6 +286,66 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
       const method = typeof body.value['method'] === 'string' ? body.value['method'].trim() : undefined
       // region 目前只对 accio 有意义：登录区域（cn/global）。其余 provider 忽略。
       const region = typeof body.value['region'] === 'string' ? body.value['region'].trim() : undefined
+      /**
+       * ⚠️ `mode` 目前只对 Magicrew 两站有意义（来源 `account.create` 的 `mode`）：
+       *
+       * | `mode` | 语义 | 门槛 | 时长 | 返回 |
+       * |---|---|---|---|---|
+       * | `browser`（缺省） | 服务端 spawn 干净窗口，用户在里面登 | 低 | 2–5 分钟 | `sessionId` + `loginUrl`，前端轮询 |
+       * | `local-browser` | 读**服务端本机**浏览器已登录态 | 零 | 毫秒级 | `done: true` + 账号，**不轮询** |
+       *
+       * 两者**不可合并**（来源记过这条）：「导入」读不到时（用户从没在本机浏览器
+       * 登过 / 用的是另一个 profile）不是「没登录」，而是「这个入口看不见那份凭据」
+       * ⇒ 必须有一条能**自己登一次**的路。逐字保留两条腿。
+       *
+       * ⚠️ 其余 provider 传了 `mode` 一律**忽略**（不报错）：前端只对 magicrew 两家
+       * 渲染这个选择，多传不该让别人的登录失败。
+       */
+      const requestedMode = typeof body.value['mode'] === 'string' ? body.value['mode'].trim() : ''
+      if (requestedMode === 'local-browser') {
+        if (!isMagicrewProvider(provider)) {
+          sendJson(res, 400, {
+            error: {
+              code: 'invalid_request_error',
+              message: `provider "${provider}" 不支持读本机浏览器登录态（仅 magicrew / magicrewintl）`,
+            },
+          })
+          return true
+        }
+        const site = magicrewProductOf(provider)
+        if (site === undefined) {
+          sendJson(res, 400, { error: { code: 'invalid_request_error', message: `未知 provider "${provider}"` } })
+          return true
+        }
+        /**
+         * ⚠️ **同步建号并直接返回 `done`**（与来源 `local-browser` 分支同语义）：
+         * RPC 返回时凭据已落库，调用方只要刷新账号列表即可，**不得**再去轮询
+         * —— 那会用一个永远 pending 的 session 把「毫秒级」这条路拖成 4 分钟。
+         */
+        let settled: unknown
+        await runWrite('login-start', provider, async () => {
+          const result = await importMagicrewFromLocalBrowser({
+            pool,
+            credentials,
+            product: site,
+            nickname: '',
+            ...options.fetcher === undefined ? {} : { fetcher: options.fetcher },
+            warn: (message) => logger.warn(message),
+          })
+          if ('kind' in result && result.kind === 'not-found') {
+            throw new Error(
+              `未在本机浏览器里找到${site.displayName}的登录态。`
+              + `请先在**运行本服务的这台机器**的 Edge / Chrome 里登录 `
+              + `${site.webOrigin.replace(/^https?:\/\//, '')}，再重试；`
+              + '若本服务跑在远程/容器里、本机没有你的浏览器，此路不通 —— '
+              + '请改用「网页登录」让服务端开窗。',
+            )
+          }
+          settled = result
+        })
+        sendJson(res, 200, { done: true, account: settled })
+        return true
+      }
       await runWrite('login-start', provider, () => options.login!.start(provider, method, region === undefined ? undefined : { region }))
       return true
     }

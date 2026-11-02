@@ -69,11 +69,23 @@ export function createRpcBridge() {
         // 两步式：start **立即**返回 loginUrl；结果由 login.poll 收割。
         // method（可选）：loomy 默认手机号验证码（主路径），传 'wechat' 走扫码。
         // region（可选）：accio 的登录区域（cn/global），其余 provider 忽略。
+        //
+        // mode（可选，**仅 Magicrew 两站有意义**，对齐来源 `account.create` 的 `mode`）：
+        //   · 缺省 / `'browser'`：服务端 spawn 干净窗口，用户在窗口里登（2–5 分钟）；
+        //   · `'local-browser'`：读**服务端本机**浏览器已登录态（毫秒级）。
+        //
+        // ⚠️ `local-browser` 是**同步建号**：后端回 `{ done: true, account }`，
+        // 调用方**不得**再轮询 —— 此时没有登录会话，拿 undefined 的 sessionId
+        // 去 poll 只会得到一个永远 pending 的请求，把毫秒级的路拖成超时。
         const r = await post('/api/login/start', {
           provider: payload.provider,
           ...(payload.method ? { method: payload.method } : {}),
           ...(payload.region ? { region: payload.region } : {}),
+          ...(payload.mode ? { mode: payload.mode } : {}),
         }, signal)
+        if (payload.mode === 'local-browser') {
+          return { done: r.done === true, account: r.account }
+        }
         return { accountId: r.sessionId, loginUrl: r.loginUrl ?? '', userCode: r.userCode }
       }
       case 'account.addKey': {

@@ -12,13 +12,28 @@ import { describe, expect, it } from 'vitest'
 import { importMagicrewFromLocalBrowser } from '../../src/admin/magicrew-import.js'
 import { MAGICREW_INTL } from '../../src/providers/magicrew-product.js'
 
-/** 最小池替身：只记 addAccount 收到的条目。 */
-function stubPool() {
+/** 最小池替身：记 addAccount 收到的条目，并支持判重所需的只读遍历。 */
+function stubPool(preexisting: Record<string, unknown>[] = []) {
   const added: Record<string, unknown>[] = []
+  const all = [...preexisting]
   return {
     added,
+    all,
     pool: {
-      addAccount: async (entry: unknown) => { added.push(entry as Record<string, unknown>) },
+      addAccount: async (entry: unknown) => {
+        added.push(entry as Record<string, unknown>)
+        all.push(entry as Record<string, unknown>)
+      },
+      /**
+       * 判重会遍历该 provider 的既有条目。
+       *
+       * ⚠️ 返回的是 `preexisting` 里 provider 匹配的那些 —— 与真实池一致，
+       * **不按 ref 形态过滤**（判据是凭据内容，不是 ref 名）。
+       */
+      listAccountsByProvider: (provider: string) =>
+        all.filter((entry) => entry.provider === provider),
+      resolveCredentialByRef: async () => undefined,
+      updateAccount: async () => {},
     } as never,
   }
 }
@@ -198,5 +213,102 @@ describe('importMagicrewFromLocalBrowser', () => {
     })
     expect((added[0] as { provider: string }).provider).toBe('magicrew')
     expect([...store.keys()][0]).toMatch(/^MAGICREW_ACCOUNT_[0-9A-F]+$/)
+  })
+
+  /**
+   * ⚠️ **判重**（来源 `findMagicrewAccountByFingerprint` 的语义）：同一个上游账号
+   * 反复导入（导入 → 网页登录 → 再导入）拿到的是**同一份 jwt** ⇒ 不得堆出多张卡。
+   */
+  describe('判重：按 sha256(jwt) 指纹', () => {
+    /** 造一个「池里已有一条同 jwt 账号」的替身（凭据真的能解出来）。 */
+    function stubPoolWithExisting(preexistingJwt: string, provider = 'magicrew') {
+      const added: Record<string, unknown>[] = []
+      const existing = {
+        id: `${provider}-existing`, provider, nickname: '老账号',
+        enabled: true, credentialRef: 'MAGICREW_ACCOUNT_EXISTING',
+      }
+      const patches: Record<string, unknown>[] = []
+      const written: Record<string, string> = {}
+      return {
+        added,
+        patches,
+        written,
+        pool: {
+          listAccountsByProvider: (p: string) => (p === provider ? [existing] : []),
+          resolveCredentialByRef: async (ref: string) =>
+            ref === 'MAGICREW_ACCOUNT_EXISTING' ? { jwt: preexistingJwt } : undefined,
+          addAccount: async (entry: unknown) => { added.push(entry as Record<string, unknown>) },
+          updateAccount: async (_id: string, patch: unknown) => {
+            patches.push(patch as Record<string, unknown>)
+          },
+        } as never,
+        credentials: {
+          set: async (ref: string, value: string) => { written[ref] = value },
+        } as never,
+      }
+    }
+
+    it('命中既有账号 ⇒ **不新建**，返回原 id 并标 reused', async () => {
+      const { pool, added, written } = stubPoolWithExisting('same-jwt')
+      const result = await importMagicrewFromLocalBrowser({
+        pool,
+        credentials: { set: async (ref: string, value: string) => { written[ref] = value } } as never,
+        nickname: '',
+        readCreds: () => ({ jwt: 'same-jwt', organizationCode: 'org' }),
+        issueKey: async () => ({ apiKey: 'mgw_new' }),
+        profileFetcher: async () => ({ nickname: '', realName: '', phone: '' }),
+        warn: () => {},
+      })
+      expect(added).toHaveLength(0)
+      expect(result).toMatchObject({ id: 'magicrew-existing', reused: true })
+    })
+
+    it('⚠️ 命中时**必须**把新凭据写回**既有账号自己的 ref**（新 api_key 会吊销旧 key）', async () => {
+      // 不写回 ⇒ 那条账号手里是刚被吊销的死 key ⇒ 每个请求 401。
+      const { pool, written } = stubPoolWithExisting('same-jwt')
+      await importMagicrewFromLocalBrowser({
+        pool,
+        credentials: { set: async (ref: string, value: string) => { written[ref] = value } } as never,
+        nickname: '',
+        readCreds: () => ({ jwt: 'same-jwt', organizationCode: 'org' }),
+        issueKey: async () => ({ apiKey: 'mgw_new' }),
+        profileFetcher: async () => ({ nickname: '', realName: '', phone: '' }),
+        warn: () => {},
+      })
+      expect(Object.keys(written)).toEqual(['MAGICREW_ACCOUNT_EXISTING'])
+      expect(written['MAGICREW_ACCOUNT_EXISTING']).toContain('mgw_new')
+    })
+
+    it('jwt 不同 ⇒ 正常新建（重新登录会拿到新 jwt，这种拦不住，各成一张卡）', async () => {
+      const { pool, added, written } = stubPoolWithExisting('other-jwt')
+      const result = await importMagicrewFromLocalBrowser({
+        pool,
+        credentials: { set: async (ref: string, value: string) => { written[ref] = value } } as never,
+        nickname: '',
+        readCreds: () => ({ jwt: 'new-jwt', organizationCode: 'org' }),
+        issueKey: async () => ({ apiKey: 'mgw_new' }),
+        profileFetcher: async () => ({ nickname: '', realName: '', phone: '' }),
+        warn: () => {},
+      })
+      expect(added).toHaveLength(1)
+      expect(result).toMatchObject({ reused: false })
+    })
+
+    it('两站互不可见：国际站导入不会命中池里的国内站账号', async () => {
+      const { pool, added } = stubPoolWithExisting('same-jwt', 'magicrew')
+      const result = await importMagicrewFromLocalBrowser({
+        pool,
+        credentials: { set: async () => {} } as never,
+        product: MAGICREW_INTL,
+        nickname: '',
+        readCreds: () => ({ jwt: 'same-jwt', organizationCode: 'org' }),
+        issueKey: async () => ({ apiKey: 'mgw_new' }),
+        profileFetcher: async () => ({ nickname: '', realName: '', phone: '' }),
+        warn: () => {},
+      })
+      // 国际站按 `provider: 'magicrewintl'` 遍历，那份池替身只认同 provider ⇒ 不命中。
+      expect(added).toHaveLength(1)
+      expect(result).toMatchObject({ reused: false })
+    })
   })
 })

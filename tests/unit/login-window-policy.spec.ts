@@ -131,17 +131,39 @@ describe('登录开窗接线（源码级断言）', () => {
     expect(hubSource).toContain("provider !== 'magicrew' && loginUrlForManual")
   })
 
-  it('Magicrew 的两条腿都在：主按钮服务端开窗、次按钮从本机浏览器导入', () => {
+  it('Magicrew 的两条腿都在（2026-11-02 起：**同一个弹窗里的二选一**）', () => {
     // ⚠️⚠️ 两条腿的**失败条件互补**，缺一条就让某类部署彻底没法加账号：
-    //    · 主按钮（createAccount → 服务端 spawn 窗口）：要求服务端**有桌面**；
-    //    · 次按钮（importLocalBrowserAccount → 读本机浏览器）：要求那台机器的
+    //    · 「网页登录」（createAccount → 服务端 spawn 窗口）：要求服务端**有桌面**；
+    //    · 「导入」（importLocalBrowserAccount → 读本机浏览器）：要求那台机器的
     //      浏览器里已登录过。
     //
     //    历史：第一版只有链接（两条都不通，用户点链接没反应）；第二版只有导入
-    //    （服务端开窗那条被误删了，而它本是主路径）。两条都要留。
-    expect(hubSource).toContain("provider === 'magicrew') void createAccount()")
-    // 次按钮：仅 magicrew 渲染，且调导入而不是 createAccount
-    expect(hubSource).toContain("onClick: () => void importLocalBrowserAccount()")
+    //    （服务端开窗那条被误删了，而它本是主路径）；第三版把两条做成**两个并列
+    //    按钮** —— 用户不知道该点哪个，且那个按钮只判 `=== 'magicrew'` ⇒ 国际站
+    //    根本没有这个入口。现改为「一个入口 + 弹窗二选一」（对齐来源
+    //    `MagicrewImportModal`）。
+    expect(hubSource).toContain("else if (isMagicrewProvider(provider)) setAskMagicrewMode({ error: '' })")
+    // 「导入」腿：调 importLocalBrowserAccount
+    expect(hubSource).toContain('onClick: () => void importLocalBrowserAccount()')
+    // 「网页登录」腿：复用 createAccount 的整条开窗 + 轮询链路
+    expect(hubSource).toContain('onClick: () => void startMagicrewBrowserLogin()')
+    expect(hubSource).toContain('await createAccount()')
+  })
+
+  it('⚠️ magicrew 的入口覆盖两家（国际站曾因写死 `=== magicrew` 而没有入口）', () => {
+    // 后端 `isMagicrewProvider` 早就支持两站，前端漏了 ⇒ 国际站点「新建账号」
+    // 只能走开窗那条路，读本机浏览器的能力等于不存在（真实接线缺口）。
+    expect(hubSource).toContain('function isMagicrewProvider(provider)')
+    expect(hubSource).toContain("return provider === 'magicrew' || provider === 'magicrewintl';")
+  })
+
+  it('弹窗按 provider 取站名与域名（写死国内站会把国际站用户引导去 letsmagic.cn）', () => {
+    expect(hubSource).toContain('function magicrewSiteOf(provider)')
+    expect(hubSource).toContain("'MagiCrew (国际版)'")
+    expect(hubSource).toContain("'www.magicrew.ai'")
+    // 弹窗用 `siteDisplayNameOf` / `siteWebHostOf` 取，而不是写死字符串。
+    expect(hubSource).toContain('siteDisplayNameOf(provider)')
+    expect(hubSource).toContain('siteWebHostOf(provider)')
   })
 
   it('判重命中时前端提示「已在池中」并指引如何加新账号（reused 一路透传）', () => {

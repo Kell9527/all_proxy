@@ -372,6 +372,45 @@ function formatCreditCoefficient(value) {
 }
 
 /**
+ * 该 provider 是否属于 Magicrew 家族（`magicrew` 国内 / `magicrewintl` 国际）。
+ *
+ * ⚠️ **前端也要收成一份判据**：散落写 `provider === 'magicrew'` 会让国际站
+ * **静默漏掉**渲染（症状是「国际站点新建账号还是一条老路」，而不是报错）。
+ * 与后端 `src/providers/magicrew-product.ts` 的 `isMagicrewProvider` 同名单、
+ * 同语义 —— 两边都改才算改完。
+ */
+function isMagicrewProvider(provider) {
+  return provider === 'magicrew' || provider === 'magicrewintl';
+}
+
+/**
+ * Magicrew 两站的展示名与网页域名。
+ *
+ * ⚠️ 与 `src/providers/magicrew-product.ts` 的 `displayName` / `webOrigin`
+ * **必须一致**（客户端无法直接 import TS 常量，故这里是**唯一**的复制点，
+ * 两处改其一都要同步）。
+ *
+ * ⚠️ **必须按 provider 取，不能写死国内站**：写死会让国际站用户被引导去登
+ * `letsmagic.cn`，而读取器找的是 `magicrew.ai` 的登录态 ⇒ 必然失败，而错误文案
+ * 又反过来让他去登 `magicrew.ai` ⇒ **引导自相矛盾的死循环**（来源 2026-11-01 记过）。
+ */
+function magicrewSiteOf(provider) {
+  return provider === 'magicrewintl'
+    ? { name: 'MagiCrew (国际版)', webHost: 'www.magicrew.ai' }
+    : { name: '超级麦吉', webHost: 'www.letsmagic.cn' };
+}
+
+/** 该 provider 的展示名（仅 magicrew 两家有意义）。 */
+function siteDisplayNameOf(provider) {
+  return magicrewSiteOf(provider).name;
+}
+
+/** 该 provider 的网页域名（仅 magicrew 两家有意义）。 */
+function siteWebHostOf(provider) {
+  return magicrewSiteOf(provider).webHost;
+}
+
+/**
  * 「锁定永久积分」按钮的 hover 文案（按 provider 的临时池口径）。
  *
  * 与 {@link permanentLockCopy}（结果文案）分开：按钮要讲清「是什么 + 点下去
@@ -1390,6 +1429,36 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const [importingLocal, setImportingLocal] = React.useState(false);
   const [importNotice, setImportNotice] = React.useState(null);
+  /**
+   * Magicrew 的「怎么加账号」选择弹窗（`null` | `{ error }`）。
+   *
+   * ## ⚠️ 为什么是**一个入口 + 弹窗二选一**，而不是两个并列按钮
+   *
+   * 2026-11-02 对齐来源（`bd73592` 的 `MagicrewImportModal`）：两条腿的门槛**完全不同**，
+   * 并列摆着会让用户不知道该点哪个，而它们**不是**互斥能力、是「先试哪个」的顺序：
+   *
+   * | 入口 | 后端 `mode` | 门槛 | 时长 |
+   * |---|---|---|---|
+   * | 「导入」 | `local-browser` | 零（日常浏览器里已登过） | 毫秒级 |
+   * | 「网页登录」 | `browser` | 低（服务端开干净窗口，用户自己登） | 2–5 分钟 |
+   *
+   * ⚠️ **两条都必须留**：「导入」读不到时（用户从没在本机浏览器登过这个站 /
+   * 用的是另一个 profile）**不是**「没登录」，而是「这个入口看不见那份凭据」⇒
+   * 必须有一条能**自己登一次**的路。「网页登录」在服务端没有桌面（远程/容器）时
+   * 又用不了 ⇒ 反过来只能靠「导入」。删任一条都会让某类部署彻底没法加账号。
+   *
+   * ⚠️ 错误**留在弹窗内**（不清空、不切列表）：把整个账号列表切成错误态会让用户
+   * 刚看的说明与失败原因一起消失，只能刷新重试。
+   */
+  const [askMagicrewMode, setAskMagicrewMode] = React.useState(null);
+  /**
+   * Magicrew 的**在途闸门**（防双击建出两个账号）。
+   *
+   * ⚠️ 不能用 `creating`（`useState`）当守卫：`setCreating(true)` 是异步的，同一
+   * tick 内连点两次时第二次读到的仍是 `false`，而按钮 `disabled` 也要等 re-render
+   * 才生效 ⇒ 两轮建号并发跑，池里凭空多出一条账号。**用 ref 做同步闸门。**
+   */
+  const magicrewInFlightRef = React.useRef(false);
   const [apiKeyInput, setApiKeyInput] = React.useState('');
   const [apiKeyNickname, setApiKeyNickname] = React.useState('');
   const [addingKey, setAddingKey] = React.useState(false);
@@ -2011,42 +2080,117 @@ function ProviderPanel({ provider, rpcCall }) {
    * 后端会如实报「未读到登录态」而不是伪装成功。
    */
   const importLocalBrowserAccount = async () => {
+    // ⚠️ 同步闸门（理由见 `magicrewInFlightRef` 的声明处）：两条腿都会建号，
+    //    同时跑会让池里多出两条指向同一个上游账号的卡。
+    if (magicrewInFlightRef.current) return;
+    magicrewInFlightRef.current = true;
     setImportingLocal(true);
     setImportNotice(null);
     try {
-      const res = await rpcCall('account.importLocalBrowser', { provider });
+      /**
+       * ⚠️ 走 `login/start` + `mode: 'local-browser'`，与「网页登录」**共用同一个入口**
+       * （来源 `account.create` 的 `mode` 分流）。
+       *
+       * 为什么不再用 `account.importLocalBrowser`：那个端点仍在（旧的直连路径），
+       * 但两条路各有一套「建号 + 判重 + 报错」会漂移。现在统一到 login/start，
+       * 判重与文案只有后端一份。
+       *
+       * ⚠️ 本腿**同步返回**（`done: true`），**不得**再去轮询：轮询会用一个永远
+       * pending 的 session 把「毫秒级」拖成 4 分钟。
+       */
+      const res = await rpcCall('account.create', { provider, mode: 'local-browser' });
       if (!mounted.current) return;
+      if (res && res.done !== true) {
+        setAskMagicrewMode((m) => (m ? { ...m, error: '后端未返回建号结果，请重试' } : m));
+        return;
+      }
       const account = res && res.account;
+      const siteName = siteDisplayNameOf(provider);
       const details = [];
       if (account && account.hasApiKey === false) {
         details.push(
           '⚠️ 未能签发推理用的 api_key：账号已建好，能查目录与积分，'
-          + '但**发消息会报「未登录」**。请稍后点该账号的「重测」，或重新导入一次。');
+          + '但发消息会报「未登录」。请稍后点该账号的「重测」，或重新导入一次。');
       }
       if (account && account.hasPhone === true) {
         details.push('已读到手机号，会显示在账号卡片的「凭据」一栏。');
       }
-      details.push(
-        '要再添加一个账号：换一个浏览器或无痕窗口登录 www.letsmagic.cn，再点一次本按钮。'
-        + '一个浏览器只能存一份登录态，同一窗口登第二个会覆盖第一个。');
+      if (account && account.reused === true) {
+        // ⚠️ 判重命中必须说清楚：列表里**没有**新卡，不说一句用户会以为导入失败了。
+        details.push('该账号已在池中，本次只刷新了它的凭据与昵称，未重复添加。');
+      } else {
+        details.push(
+          '要再添加一个账号：换一个浏览器或无痕窗口登录 '
+          + siteWebHostOf(provider) + '，再导入一次。'
+          + '一个浏览器只能存一份登录态，同一窗口登第二个会覆盖第一个。');
+      }
+      if (mounted.current) setAskMagicrewMode(null);
       setImportNotice({
         tone: account && account.hasApiKey === false ? 'warn' : 'info',
-        text: '已从本机浏览器导入账号' + (account && account.nickname ? '：' + account.nickname : ''),
+        text: (account && account.reused === true
+          ? '该账号已在账号池中：'
+          : '已从本机浏览器导入账号：')
+          + (account && account.nickname ? account.nickname : siteName),
         details,
       });
       await loadAccounts();
     } catch (caught) {
       if (!mounted.current) return;
-      setImportNotice({
-        tone: 'error',
-        text: (caught && caught.message) || '从本机浏览器导入失败',
+      /**
+       * ⚠️ 失败**留在弹窗内**（与来源同纪律）：把整个列表切成错误态会让用户
+       * 刚看的说明与失败原因一起消失，只能刷新重试。
+       */
+      setAskMagicrewMode((m) => ({
+        error: (caught && caught.message) || '从本机浏览器导入失败',
+        ...(m === null ? {} : { hint: m.hint }),
+      }));
+    } finally {
+      // ⚠️ 闸门**无条件释放**（不能 `if (mounted.current)`）：它是普通 ref，
+      //    跟着判会让卸载后闸门永久停在 true。
+      magicrewInFlightRef.current = false;
+      if (mounted.current) setImportingLocal(false);
+    }
+  };
+
+  /**
+   * Magicrew 的**网页登录腿**：让**服务端**开一个一次性 profile 的干净窗口。
+   *
+   * ⚠️ 与「导入」的等待语义完全不同：「导入」毫秒级返回；本腿后端只是**开了窗口**，
+   * 用户还要在里面登 2–5 分钟 ⇒ 必须走既有那一个轮询（`login.poll`），
+   * **不能**在这里自己再写一个 `while` 循环（第二份「先判 done 还是先判 success」
+   * 的判据必然漂移）。
+   */
+  const startMagicrewBrowserLogin = async () => {
+    // ⚠️ 同步闸门（同上）。
+    if (magicrewInFlightRef.current) return;
+    magicrewInFlightRef.current = true;
+    setImportingLocal(true);
+    try {
+      // ⚠️ **复用 `createAccount` 的整条「开窗 + 轮询 + 停损 + 判重提示」链路**
+      //    （它内部调 `account.create` → 后端 `login/start`，magicrew 走
+      //    `shouldAutoOpenLoginWindow` 开窗，再按既有的唯一一份 `login.poll`
+      //    轮询收割）。本函数**只**负责「关掉弹窗 + 给一句该看哪里」。
+      //
+      //    ⚠️ **不要**在这里再写一个 `while`/`setInterval`：本文件只允许一份轮询
+      //    实现，第二份「先判 done 还是先判 failed」的判据必然漂移回
+      //    「静默转圈」那类缺陷。
+      if (mounted.current) setAskMagicrewMode(null);
+      setProbeNotice({
+        tone: 'info',
+        text: '正在让服务端打开一个干净的浏览器窗口，请在那个窗口里完成登录。',
         details: [
-          '本按钮读的是**运行本服务那台机器**的浏览器登录态。',
-          '若本服务跑在远程/容器里，那里没有你的浏览器 —— 请改在有桌面的机器上',
-          '运行本服务，或用「+ 新建账号」让服务端开窗登录。',
+          '⚠️ 那个窗口不带你日常浏览器的登录态，可能需要在里面重新登一次。',
+          '⚠️ 本服务跑在远程 / 容器里时，你看不见那个窗口 —— 请改用「导入」。',
         ],
       });
+      await createAccount();
+    } catch (caught) {
+      if (!mounted.current) return;
+      setAskMagicrewMode((m) => (m
+        ? { ...m, error: (caught && caught.message) || '无法启动网页登录' }
+        : { error: (caught && caught.message) || '无法启动网页登录' }));
     } finally {
+      magicrewInFlightRef.current = false;
       if (mounted.current) setImportingLocal(false);
     }
   };
@@ -2443,20 +2587,12 @@ function ProviderPanel({ provider, rpcCall }) {
               ? '处理中…'
               : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
           : null,
-        // Magicrew 的**第二条腿**：从本机浏览器读已登录态（不需要窗口）。
-        //
-        // ⚠️ 为什么两条腿都要留（不是冗余）：
-        //    · 主按钮（服务端开窗）要求服务端**有桌面**，能 spawn 出可见窗口；
-        //    · 本按钮要求「**运行本服务那台机器**的浏览器里已登录过」。
-        //    两者的失败条件互补，删任一条都会让某类部署彻底没法加账号。
-        provider === 'magicrew'
-          ? React.createElement('button', {
-              className: 'dim-jh-btn',
-              title: '从**运行本服务这台机器**的浏览器里读取已登录的超级麦吉账号（适合服务端没有桌面、看不到登录窗口的场景）。⚠️ 一个浏览器只能存一份登录态：加新账号要换浏览器或无痕窗口各登一次。',
-              disabled: creating || importingLocal,
-              onClick: () => void importLocalBrowserAccount(),
-            }, importingLocal ? '正在读取本机浏览器…' : '从本机浏览器导入')
-          : null,
+        // ⚠️ **Magicrew 的「从本机浏览器导入」原本是这里的第二个并列按钮**，
+        //    2026-11-02 已并入「+ 新建账号」的二选一弹窗（见 `askMagicrewMode`）。
+        //    两个并列按钮会让用户不知道该点哪个，而它们不是互斥能力、是
+        //    「先试哪个」的顺序；且那个按钮只判 `=== 'magicrew'`，国际站因此
+        //    **根本没有**这个入口（真实的接线缺口）。
+        //    ⇒ **不要再把它加回来**：入口唯一，选择在弹窗内做。
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
@@ -2473,19 +2609,23 @@ function ProviderPanel({ provider, rpcCall }) {
             if (supportsStaticKey(provider)) setAskApiKey(true);
             // Accio 先选登录区域（中国版/国际版），其余 provider 直接开登。
             else if (provider === 'accio') setAskAccioRegion(true);
-            // ⚠️ Magicrew（超级麦吉）：**走 createAccount，让「服务端」开窗**。
-            //
-            //    它没有 OAuth 回调，凭据只存在于浏览器 localStorage ⇒「登录」=
-            //    起一个浏览器让用户在里面登，再由后端把凭据读回来。那条腿由**后端**
-            //    spawn（`magicrew-browser-login.ts`），所以这里必须调 createAccount。
-            //
-            //    ⚠️ 但**不能**把它的 loginUrl 展示给用户（见下方链接区的判据）：
-            //    链接对它是死路 —— 在用户**自己**浏览器里登，服务端读的是另一个
-            //    一次性 profile ⇒ 永远读不到（用户 2026-10-30 报障「点了没反应」）。
-            //
-            //    ⚠️ 这条腿要求服务端**有桌面**（能 spawn 出可见窗口）。远程/容器
-            //    部署时看不到那个窗口 ⇒ 用旁边的「从本机浏览器导入」按钮。
-            else if (provider === 'magicrew') void createAccount();
+            /**
+             * ⚠️⚠️ Magicrew 两站：开**二选一弹窗**（对齐来源 `MagicrewImportModal`），
+             * 而不是直接开登、也不是靠旁边的另一个按钮。
+             *
+             * 它没有 OAuth 回调，凭据只存在于浏览器 localStorage ⇒ 有两条门槛完全
+             * 不同的路（见 `askMagicrewMode` 的声明处那张表）：
+             * · 「导入」读**服务端本机**浏览器已登录态（毫秒级、零门槛）；
+             * · 「网页登录」让**服务端开窗**、用户在里面登（2–5 分钟）。
+             *
+             * 两条的失败条件互补，删任一条都会让某类部署彻底没法加账号 ⇒ 用
+             * 一个入口 + 弹窗二选一，让用户知道**先试哪个**。
+             *
+             * ⚠️ **两家都要进这个弹窗**（先天这里只判 `=== 'magicrew'`，
+             * 国际站因此**没有**任何「读本机浏览器」的入口 —— 而后端早已支持，
+             * 属真实的接线缺口）。
+             */
+            else if (isMagicrewProvider(provider)) setAskMagicrewMode({ error: '' });
             else void createAccount();
           },
           disabled: creating || addingKey || importingLocal,
@@ -2638,6 +2778,50 @@ function ProviderPanel({ provider, rpcCall }) {
           target: '_blank',
           rel: 'noopener noreferrer',
         }, loginUrlForManual))
+      : null,
+    // Magicrew 两站的「怎么加账号」二选一弹窗（对齐来源 `MagicrewImportModal`）。
+    //
+    // ⚠️ 与 Accio 的区域预选同款：内联块 + 两个按钮，不引入新模态层。
+    // ⚠️ **必须传/按 provider 取站名与域名**（见 `magicrewSiteOf` 的注释）。
+    askMagicrewMode
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'dialog',
+          'aria-label': `添加${siteDisplayNameOf(provider)}账号`,
+        },
+        React.createElement('div', null, `添加${siteDisplayNameOf(provider)}账号：选择方式`),
+        React.createElement('p', { className: 'dim-jh-modelInfo' },
+          `「导入」：先用 Edge / Chrome 打开 ${siteWebHostOf(provider)} 登录，`
+          + '然后回到这里点「导入」。会直接读取该浏览器的登录态，不需要再输一次密码。'),
+        React.createElement('p', { className: 'dim-jh-modelInfo' },
+          '「网页登录」：服务端会另开一个干净的浏览器窗口，你在里面完成登录即可'
+          + '（可能需要在那个窗口里重新登一次 —— 它不带你日常浏览器的登录态）。'),
+        askMagicrewMode.error
+          ? React.createElement('p', { className: 'dim-jh-error', role: 'alert' }, askMagicrewMode.error)
+          : null,
+        React.createElement('div', null,
+          React.createElement('button', {
+            type: 'button',
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            disabled: creating || importingLocal,
+            onClick: () => void importLocalBrowserAccount(),
+          }, importingLocal ? '正在读取本机浏览器…' : '导入'),
+          React.createElement('button', {
+            type: 'button',
+            className: 'dim-jh-btn',
+            // ⚠️ 两按钮共用 `importingLocal` 禁用：两条腿都会建号，同时跑会让
+            //    池里多出两条指向同一个上游账号的卡。
+            disabled: creating || importingLocal,
+            onClick: () => void startMagicrewBrowserLogin(),
+          }, creating ? '处理中…' : '网页登录'),
+          React.createElement('button', {
+            type: 'button',
+            className: 'dim-jh-btn',
+            disabled: creating || importingLocal,
+            onClick: () => setAskMagicrewMode(null),
+          }, '取消')))
       : null,
     // Accio 区域预选（中国版/国际版，登录页域名不同；gateway 两区域共用）。
     askAccioRegion

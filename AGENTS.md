@@ -618,6 +618,37 @@ claimAll 分支、claimOnboarding、签到 sweep（`runtime-helpers`）、续期
 （`expire_type: 1`；前端文案「奖励的积分在今日内有效，明天登录还能领取新的积分哦！」）。
 领取端点 `POST /api/v1/login-gift`（**无请求体**，`GET` 回 `405 Allow: POST`）。
 
+### 建号入口：**一个按钮 + 弹窗二选一**（2026-11-02 对齐来源 `MagicrewImportModal`）
+
+本家没有 OAuth 回调、也**不信手机号+密码**（上游 `phone_password` 端点存在，但参考实现里
+那个 `login()` 零调用者，是未采用的探索代码；真实入口是短信，要先解旋转验证码）。
+⇒ 只有两条「无门槛」的路，**门槛完全不同、必须都留**：
+
+| 按钮 | 后端 | 门槛 | 时长 | 返回 |
+|---|---|---|---|---|
+| 「导入」 | `login/start` + `mode: 'local-browser'` | 零（日常浏览器里已登过） | 毫秒级 | `{done:true, account}` |
+| 「网页登录」 | `login/start`（缺省 mode） | 低（服务端开干净窗口） | 2–5 分钟 | `sessionId`，前端轮询 |
+
+三条纪律：
+1. **入口唯一**（「+ 新建账号」→ 弹窗），不要再做成两个并列按钮 —— 用户不知道点哪个，
+   而它们不是互斥能力、是「先试哪个」的顺序。
+2. **`local-browser` 是同步建号**：拿 undefined 的 sessionId 去 poll 会让「毫秒级」
+   变成 4 分钟超时。前端 `rpc-bridge` 已按 `mode` 分流（`done` / `sessionId`）。
+3. **前端判据用 `isMagicrewProvider(provider)`**（`jet-hub.js` 也有一份同名单的同名判据）：
+   改前只写 `provider === 'magicrew'` ⇒ **国际站没有这个入口**，而后端早就支持
+   （真实接线缺口）。弹窗的站名 / 域名必须按 provider 取（`magicrewSiteOf`），
+   写死国内站会把国际站用户引导去 `letsmagic.cn` ⇒ 必然读不到，且错误文案反过来
+   让他去 `magicrew.ai` ⇒ **引导自相矛盾的死循环**。
+
+**建号前必须判重**（`src/admin/magicrew-dedupe.ts` 的 `findExistingMagicrewAccount`，
+来源 `findMagicrewAccountByFingerprint`）：判据是 `sha256(jwt)` 前 16 位
+（`magicrewCredentialFingerprint`）—— **不能用 `apiKey`**（2 小时一换，同一账号会被
+认成新账号）。⚠️ 命中时**必须把新凭据写回既有条目自己的 ref**：本次导入会**新签一把
+api_key**，而签发会吊销旧 key ⇒ 不写回的话那条账号手里是刚被吊销的死 key，每个请求 401。
+⚠️ 已知边界：同一账号**重新登录会拿到新 jwt**，指纹拦不住，会各成一张卡（需上游稳定
+账号标识才能真正闭合）。⚠️ 判重失败**绝不能挡住建号**（池缺遍历能力时退化为「不判重」，
+抛错会让一次正常导入变成「导入失败」而用户无从理解）。
+
 ### 新人奖励（`magicrew-checkin.ts`，2026-11-02 从来源 `bd73592` 补齐）
 
 `GET /api/v1/onboarding/tasks` + `PUT …/<code>/completion`。国内站 8 项、7 项可 PUT；
@@ -734,10 +765,9 @@ wiring 只透传，**不要在那里再判一次**。
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **164 个文件 3729 条用例，全绿**（2026-11-02 实测；较上次登记 +1 文件 +31 条，
-新增 `permanent-lock-wiring.spec.ts`（30 条：共享分档层 / Qoder 哨兵 / TRAE `expire_time` /
-选择器锁定与降级 / 「假开关」源码级回归），`credits-capabilities.spec.ts` 的白名单断言
-同步改成 7 家（+1 条）。
+当前 **165 个文件 3744 条用例，全绿**（2026-11-02 实测；较上次登记 +1 文件 +15 条：
+`magicrew-dedupe.spec.ts`（9 条）+ `magicrew-import.spec.ts` 增 4 条判重用例 +
+`login-window-policy.spec.ts` 增 2 条入口覆盖断言）。
 ⚠️ 之前登记的那 4 条「时间相关的既有失败」（`buddy-oauth.spec.ts` 1 条 +
 `officeace-expiry-selector.spec.ts` 3 条，fixture 锚在 2026-10-15）**已修**：
 把锚点改成「相对真实时钟」（`officeace` 的 `NOW` 取当前分钟、`buddy` 的促销

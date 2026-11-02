@@ -38,10 +38,11 @@ import { randomBytes } from 'node:crypto'
 
 import type { AccountPool } from '../pool/account-pool.js'
 import type { CredentialStore, ProviderAccountEntry } from '../pool/types.js'
-import { issueMagicrewGatewayKey } from '../providers/magicrew-auth.js'
+import { issueMagicrewGatewayKey, magicrewCredentialFingerprint } from '../providers/magicrew-auth.js'
 import { readMagicrewLocalCreds } from '../providers/magicrew-local-browser.js'
 import { MAGICREW, MAGICREW_INTL } from '../providers/magicrew-product.js'
 import { fetchMagicrewProfile } from '../providers/magicrew-profile.js'
+import { findExistingMagicrewAccount } from './magicrew-dedupe.js'
 
 /** 一次导入的结果（对外只回这几个字段，**绝不回显 jwt**）。 */
 export interface MagicrewImportedAccount {
@@ -57,6 +58,13 @@ export interface MagicrewImportedAccount {
    * 时恒抛 `AUTH`）。UI 应当如实提示，而不是让用户以为已经可用。
    */
   readonly hasApiKey: boolean
+  /**
+   * 本次是否**复用了池里已有的那条账号**（判重命中）。
+   *
+   * ⚠️ 与「新建」必须让用户分得清：命中时**没有**新卡出现在列表里，若不说一句
+   * 「该账号已在池中」，用户会以为导入失败了（来源 2026-10-29 报障）。
+   */
+  readonly reused: boolean
 }
 
 /** 导入失败的原因分类（调用方据此给不同文案，别压成一句「失败」）。 */
@@ -171,6 +179,50 @@ export async function importMagicrewFromLocalBrowser(params: {
   if (phone !== undefined) credential = { ...credential, phone }
   if (profileNickname !== undefined) credential = { ...credential, nickname: profileNickname }
 
+  /**
+   * ⚠️⚠️ **建号之前先判重**（来源 `bd73592` 的纪律，用户 2026-10-29 明确要求）。
+   *
+   * 判据是 `sha256(jwt)` 指纹（`findExistingMagicrewAccount`，全仓唯一一份实现）：
+   * 「导入」与「网页登录」拿到的是**同一份 jwt** ⇒ 指纹相同 ⇒ 不判就会攒出
+   * 两张指向同一上游账号的卡片（选号反复命中同一个号，面板却显示「2 个账号」）。
+   *
+   * 命中时的动作：**只把新凭据写回它自己的 ref**（同一个 ref、同一个 id），
+   * 并回填昵称 / 有效期 —— 而不是先造一张卡、再靠读取侧或 UI 去滤重。
+   *
+   * ⚠️ 必须写回：本次导入**新签发了一把 api_key**，而签发会吊销旧 key
+   * （模块头硬约束）⇒ 不写回的话那条既有账号手里是刚被吊销的死 key，
+   * 每个请求都会 401。这是「不建新账号」之外**不可省**的一半。
+   */
+  const existing = await findExistingMagicrewAccount(
+    params.pool,
+    product.id,
+    magicrewCredentialFingerprint(found.jwt),
+  )
+  if (existing !== undefined) {
+    // ⚠️ 写回**既有条目自己的** ref（不是新建一个 ref，否则凭据成了孤儿）。
+    await params.credentials.set(existing.credentialRef, JSON.stringify(credential))
+    const expiresAtOfReuse = credential['apiKeyExpiresAt']
+    await params.pool.updateAccount(existing.id, {
+      // 昵称只在用户显式给了、或既有条目还是渠道名时才覆盖：不要用一次
+      // 「取不到 profile」的结果把用户自己改过的昵称冲掉。
+      ...params.nickname.length > 0
+        ? { nickname: params.nickname }
+        : profileNickname === undefined ? {} : { nickname: profileNickname },
+      ...typeof expiresAtOfReuse === 'number' && Number.isFinite(expiresAtOfReuse)
+        ? { expiresAt: expiresAtOfReuse } : {},
+    })
+    return {
+      id: existing.id,
+      provider: existing.provider,
+      nickname: params.nickname.length > 0
+        ? params.nickname
+        : profileNickname ?? existing.nickname,
+      hasPhone: phone !== undefined,
+      hasApiKey,
+      reused: true,
+    }
+  }
+
   // ⚠️ ref 前缀**按站区分**（`MAGICREW_ACCOUNT_*` / `MAGICREWINTL_ACCOUNT_*`）：
   //    `dsh-import.ts` 的 `ACCOUNT_REF_RE` 用它反查 provider，前缀写错会让
   //    导入来的账号"看起来建好了但归属到错误的站"。
@@ -199,5 +251,6 @@ export async function importMagicrewFromLocalBrowser(params: {
     nickname: entry.nickname,
     hasPhone: phone !== undefined,
     hasApiKey,
+    reused: false,
   }
 }
