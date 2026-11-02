@@ -58,7 +58,7 @@ import type { RaccoonCredential } from '../providers/raccoon.js'
 import { fetchAccioUserInfo } from '../providers/accio-credits.js'
 import type { AccioCredential } from '../providers/accio.js'
 import { fetchMagicrewProfile } from '../providers/magicrew-profile.js'
-import { MAGICREW } from '../providers/magicrew-product.js'
+import { MAGICREW, isMagicrewProvider, magicrewProductOf } from '../providers/magicrew-product.js'
 import { parseMagicrewCredential } from '../providers/magicrew-auth.js'
 
 /** 取到过的手机号：几乎不变，缓存 6 小时。 */
@@ -162,7 +162,7 @@ export class AccountPhoneResolver {
         const info = await fetchAccioUserInfo(credential as unknown as AccioCredential, { fetcher })
         return normalizePhone(info?.maskedMobile)
       }
-      if (provider === 'magicrew') {
+      if (isMagicrewProvider(provider)) {
         // ⚠️ 走**共享**的 `parseMagicrewCredential`（jwt 是唯一必需字段，与适配器 /
         //    池同一条口径），不在这里另判一次凭据形状。
         const parsed = parseMagicrewCredential(credential)
@@ -170,7 +170,9 @@ export class AccountPhoneResolver {
         const profile = await fetchMagicrewProfile({
           jwt: parsed.jwt,
           organizationCode: parsed.organizationCode,
-          product: MAGICREW,
+          // ⚠️ 按 provider 取站：国际站的 host 与国内站不同，写死 MAGICREW
+          //    会让国际站账号的查询打到错误的域名（表现为查询失败而不是手机号缺失）。
+          product: magicrewProductOf(provider) ?? MAGICREW,
           fetchImpl: fetcher,
         })
         // ⚠️ 上游给的是**本地号码（10 位）**，原样展示 —— **不补国家码**：

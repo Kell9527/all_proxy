@@ -169,7 +169,20 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //
   // ⚠️ 本家**无请求级换号**（不写 `modelRateLimits`）⇒ 见下方
   // `RATE_LIMIT_CAPABILITIES` 的登记，不要在这里顺手打开。
-  magicrew: Object.freeze({ balance: true, dailyCheckin: true }),
+  magicrew: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
+  // MagiCrew 国际站（`www.magicrew.ai`）：与国内站**逐格同构**。
+  //
+  // 两站是同一个 Go 服务的两个数据面：路径、方法、返回结构完全一样，只有
+  // 金额与 host 不同（国内 +200/天、国际 +50/天；API host 也不同）。
+  //
+  // ⚠️⚠️ **新人奖励在国际站预期拿不到**：`GET /api/v1/onboarding/tasks` 恒返回
+  //    `{participant_type: null, tasks: []}` —— 那是「该账号没被登记进引导计划」，
+  //    **不是**「已经领完了」。前端据此显示「无任务可领」（如实，不是失败）。
+  //    能力位照登记，因为「万一登记了就能领」。
+  //
+  // ⚠️ 两站**必须各写一行**（不能靠国内版继承）：能力表是按字面量查的，
+  //    漏一站的症状是「那一站没有签到/新人奖励按钮」，静默。
+  magicrewintl: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
   // OfficeAce（华为云 ModelArts MaaS）：**只有余额**，没有签到。
   //
   // 余额：V11-HMAC-SHA256 签名云侧直读 `GET {defaultBaseUrl}/v1/subscription`
@@ -242,11 +255,20 @@ export function supportsRateLimit(provider) {
  * |---|---|---|
  * | `loomy` | 每日赠送 | 今日赠送用尽即无可用账号 |
  * | `officeace` | 有到期时间的积分桶 | 只消耗会过期的桶，永久桶不参与 |
+ * | `magicrew` / `magicrewintl` | 有到期时间的批次 | 同上（合成出的「永久积分」包不参与） |
  *
  * 为 false 时面板**不得**渲染该按钮，也不得发起 `permanentLock` 请求
  * （对不支持的 provider 发会拿到 bad-request，并在控制台留下必然失败的报错）。
  */
-const PERMANENT_LOCK_PROVIDERS = Object.freeze(['loomy', 'officeace'])
+const PERMANENT_LOCK_PROVIDERS = Object.freeze([
+  'loomy',
+  'officeace',
+  // Magicrew 两站（2026-11-02）：上游确有「没有到期时间」的永久积分
+  // （实测国内 2661 总额 / 批次 1661 / 残差 1000；国际 347 / 247 / 100），
+  // 而锁定要保护的正是它。分档口径见 `magicrew-expiry-rank.ts`。
+  'magicrew',
+  'magicrewintl',
+])
 
 export function supportsPermanentLock(provider) {
   return PERMANENT_LOCK_PROVIDERS.includes(provider);

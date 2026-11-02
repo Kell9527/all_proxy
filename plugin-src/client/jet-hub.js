@@ -246,6 +246,13 @@ const PROVIDERS = Object.freeze([
   // ⚠️ label 用『超级麦吉』而不是『Magicrew』：与 `MAGICREW.displayName` 一致，
   // 且用户认的是中文名（上游站点就叫这个）。长度也在不换行范围内。
   { id: 'magicrew', label: '超级麦吉', icon: MAGICREW_ICON, logoClass: 'magicrew' },
+  // MagiCrew 国际站（`www.magicrew.ai`）：与国内站**共用同一份图标资产**
+  // （同一个 Go 服务、同一个品牌的两个站点）。
+  //
+  // ⚠️ 账号体系**物理隔离**：同一个上游服务的两个数据面，凭据不互通。
+  // 合并成一个 provider 会让选号器与余额按错误的 host 取数（表现为「国际站
+  // 账号查不到积分 / 签到总是失败」）。
+  { id: 'magicrewintl', label: 'MagiCrew (国际版)', icon: MAGICREW_ICON, logoClass: 'magicrew' },
 ]);
 
 /**
@@ -1558,12 +1565,28 @@ function ProviderPanel({ provider, rpcCall }) {
         parts.push(`本次领取 ${res.claimed.length} 个任务（+${gained} 积分）`);
       }
       if (res.skipped.length > 0) parts.push(`${res.skipped.length} 个此前已完成`);
+      /**
+       * ⚠️ **`manualRequired` 必须单独提示，不能混进 `skipped`**：
+       * 它的语义是「服务端拒绝自动完成，必须你亲自发一条消息」。
+       * 混进 skipped 会被渲染成「N 个此前已完成」⇒ 用户以为已经没事了，
+       * 而那一项**既没完成也没领到分**（把没做写成做过）。
+       *
+       * ⚠️ `errors`（本次做了但失败）同样要单独说：部分成功**不上抛**
+       * （上抛会让整轮报成"失败"，而实际已领到大部分分）。
+       */
+      const manual = Array.isArray(res.manualRequired) ? res.manualRequired : [];
+      const failures = Array.isArray(res.errors) ? res.errors : [];
+      if (manual.length > 0) parts.push(`${manual.length} 个需手动完成`);
+      if (failures.length > 0) parts.push(`${failures.length} 个领取失败`);
+      const hasIssue = manual.length > 0 || failures.length > 0;
       setOnboardingNotice({
-        tone: 'ok',
+        tone: hasIssue ? 'warn' : 'ok',
         text: parts.length > 0 ? parts.join('，') : '没有可领取的任务',
         details: [
           `累计已领 ${res.earned} / ${res.total}`,
           ...res.claimed.map((item) => `${item.title} +${item.points}`),
+          ...manual.map((key) => `需手动完成：${key}（要真在该账号上发一条消息才会置位）`),
+          ...failures.map((line) => `失败：${line}`),
         ],
       });
       setOnboarding({ earned: res.earned, total: res.total, skipped: res.skipped });

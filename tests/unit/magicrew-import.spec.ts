@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { importMagicrewFromLocalBrowser } from '../../src/admin/magicrew-import.js'
+import { MAGICREW_INTL } from '../../src/providers/magicrew-product.js'
 
 /** 最小池替身：只记 addAccount 收到的条目。 */
 function stubPool() {
@@ -157,5 +158,45 @@ describe('importMagicrewFromLocalBrowser', () => {
       warn: () => {},
     })
     expect((added[0] as { refreshable: boolean }).refreshable).toBe(true)
+  })
+  it('国际站：按 `product` 读**国际站**的 origin，且落成 magicrewintl 账号 + 独立 ref 前缀', async () => {
+    // ⚠️ 用国内站 host 去读国际站的 localStorage 会**恒读不到**且完全静默
+    //    （症状与「用户没登录」同形）—— 所以这里断言读到的 hostname 与 provider/ref。
+    const { pool, added } = stubPool()
+    const { credentials, store } = stubCredentials()
+    const seenHosts: string[] = []
+    await importMagicrewFromLocalBrowser({
+      pool,
+      credentials,
+      product: MAGICREW_INTL,
+      nickname: '',
+      readCreds: (hostname) => {
+        seenHosts.push(hostname)
+        return { jwt: 'jwt', organizationCode: 'org' }
+      },
+      issueKey: async () => ({ apiKey: 'mgw_x' }),
+      profileFetcher: async () => ({ nickname: '', realName: '', phone: '' }),
+      warn: () => {},
+    })
+    expect(seenHosts).toEqual(['www.magicrew.ai'])
+    expect((added[0] as { provider: string }).provider).toBe('magicrewintl')
+    // ⚠️ ref 前缀必须与 dsh-import 的 ACCOUNT_REF_RE 一致，否则账号会被判不可识别。
+    expect([...store.keys()][0]).toMatch(/^MAGICREWINTL_ACCOUNT_[0-9A-F]+$/)
+  })
+
+  it('国内站：provider 与 ref 前缀保持 magicrew / MAGICREW_ACCOUNT_', async () => {
+    const { pool, added } = stubPool()
+    const { credentials, store } = stubCredentials()
+    await importMagicrewFromLocalBrowser({
+      pool,
+      credentials,
+      nickname: '',
+      readCreds: () => ({ jwt: 'jwt', organizationCode: 'org' }),
+      issueKey: async () => ({ apiKey: 'mgw_x' }),
+      profileFetcher: async () => ({ nickname: '', realName: '', phone: '' }),
+      warn: () => {},
+    })
+    expect((added[0] as { provider: string }).provider).toBe('magicrew')
+    expect([...store.keys()][0]).toMatch(/^MAGICREW_ACCOUNT_[0-9A-F]+$/)
   })
 })

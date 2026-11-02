@@ -45,6 +45,8 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { registeredBrowserUserDataRoots } from './chromium-session.js'
+
 /**
  * 窗口宽度。
  *
@@ -100,6 +102,15 @@ export function magicrewBrowserRoots(): readonly MagicrewBrowserRoot[] {
       { browser: 'Brave', root: join(local, 'BraveSoftware', 'Brave-Browser', 'User Data') },
       { browser: 'Chromium', root: join(local, 'Chromium', 'User Data') },
       { browser: 'Vivaldi', root: join(local, 'Vivaldi', 'User Data') },
+      // Windows App Paths 会登记便携版 Chrome；其 `<install>/Data` 不在上面的固定目录里。
+      // ⚠️ 便携版 **不注册** App Paths（那是安装器的行为）⇒ 这条腿在最需要它的
+      //    场景下恒不产出；真兜底是下面的 `MAGICREW_CHROME_USER_DATA`。
+      //    仍保留它：① 少数工具确实会登记；② `registeredBrowserUserDataRoots`
+      //    对**已注册**的绿色版软件仍然有效。
+      ...registeredBrowserUserDataRoots().map((root) => ({ browser: '已登记浏览器（含便携版）', root })),
+      ...process.env.MAGICREW_CHROME_USER_DATA?.trim()
+        ? [{ browser: 'Chrome 便携版', root: process.env.MAGICREW_CHROME_USER_DATA.trim() }]
+        : [],
       // ── 国产 Chromium 系 ──
       // ⚠️ 参考实现 2026-10-28 实测：用户日常用的是 360 极速浏览器 X（360ChromeX），
       //   它的 localStorage 里确实有 www.letsmagic.cn 的记录。不加这一行，

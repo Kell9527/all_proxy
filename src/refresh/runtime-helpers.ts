@@ -14,6 +14,7 @@ import { refreshAccountOnce } from './refresh-account.js'
 import { isExpiring, type OfficeAceCredential } from '../providers/officeace-auth.js'
 import { maybeClaimOfficeAceBonus } from '../providers/officeace-credits.js'
 import { maybeClaimMagicrewDaily } from '../providers/magicrew-credits.js'
+import { isMagicrewProvider, magicrewProductOf } from '../providers/magicrew-product.js'
 
 /** 临期阈值：距过期不足该时长就触发静默刷新。 */
 const REFRESH_AHEAD_MS = 24 * 60 * 60 * 1000
@@ -339,8 +340,11 @@ export async function claimMagicrewDailyPoints(deps: MagicrewCheckinSweepDeps): 
   const fetcher = deps.fetcher ?? fetch
   const now = deps.now ?? Date.now
   const force = deps.force === true
+  // ⚠️ 两站都领（`isMagicrewProvider` 是**全仓唯一**判据）：
+  // 漏掉国际站会让它每天静默少领 50 分（而日志里看起来"一切正常"，
+  // 因为它根本不在这条 sweep 的候选集里）。
   const accounts = (await deps.pool.listAllAccounts())
-    .filter((entry) => entry.provider === 'magicrew')
+    .filter((entry) => isMagicrewProvider(entry.provider))
 
   for (const entry of accounts) {
     // 停用账号不参与（与 OfficeAce 同：对用户明确弃用的账号发写请求是越界）。
@@ -364,10 +368,14 @@ export async function claimMagicrewDailyPoints(deps: MagicrewCheckinSweepDeps): 
         deps.logger.warn('[magicrew] 账号领取登录积分跳过：凭据不是合法 JSON')
         continue
       }
+      // ⚠️ **必须传 `product`**：国际站的 host 与 `needsOrgOnGateway` 都不同，
+      //    漏传会让国际站账号打到国内站的 host（症状是 401/组织码错误，
+      //    在签到结果里表现为"失败"而不是"打错了站"）。
       const result = await maybeClaimMagicrewDaily({
         jwt: credential.jwt,
         organizationCode: credential.organizationCode,
         ref: entry.credentialRef,
+        product: magicrewProductOf(entry.provider),
         fetchImpl: fetcher,
         now,
         ...(force ? { force } : {}),

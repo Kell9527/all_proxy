@@ -58,7 +58,10 @@ import { fetchAccioBalanceDetailed } from '../providers/accio-credits.js'
 import { isExpiring, type OfficeAceCredential } from '../providers/officeace-auth.js'
 import { fetchOfficeAceBalanceDetailed } from '../providers/officeace-credits.js'
 import { fetchMagicrewBalance } from '../providers/magicrew-credits.js'
-import { MAGICREW } from '../providers/magicrew-product.js'
+import {
+  MAGICREW, MAGICREW_INTL, isMagicrewProvider, magicrewProductOf,
+} from '../providers/magicrew-product.js'
+import { claimMagicrewOnboardingTasks } from '../providers/magicrew-checkin.js'
 import { maybeClaimMagicrewDaily } from '../providers/magicrew-credits.js'
 import { parseMagicrewCredential } from '../providers/magicrew-auth.js'
 import { credentialRef } from '../providers/credential-ref.js'
@@ -400,8 +403,13 @@ async function fetchBalancesInner(provider: string, deps: CreditsEndpointDeps): 
     }
     return { accounts: out }
   }
-  if (provider === 'magicrew') {
-    // Magicrew（超级麦吉）：`GET /api/v1/quota/points/total`（JWT + organization-code）。
+  if (isMagicrewProvider(provider)) {
+    // Magicrew（超级麦吉 / MagiCrew）：`GET /api/v1/quota/points/total`
+    // （JWT + organization-code）。
+    //
+    // ⚠️ **两站走同一分支，按 `provider` 取各自的 `product`**：
+    // 国际站（`magicrewintl`）的 host 与 `needsOrgOnGateway` 都不同，写死
+    // `MAGICREW` 会让国际站账号打到国内站的 host ⇒ 凭据失效/组织码错误。
     //
     // ⚠️ **本分支不自动领**（与 OfficeAce 的 `fetchOfficeAceBalanceDetailed` 不同）：
     //    Magicrew 的签到**有端点**（`POST /api/v1/login-gift`，见 `claimAll` 的
@@ -409,12 +417,12 @@ async function fetchBalancesInner(provider: string, deps: CreditsEndpointDeps): 
     //    兜底领取 —— 不在「拉余额」这条读路径上顺手发写请求。
     //    理由：面板刷新余额是高频动作，把写请求塞进读路径会让余额接口的失败
     //    原因变得不可分辨（是查不到、还是领取失败？）。
-    //    ⚠️ 历史注释曾写「本家没有签到 / 领奖端点」——**那是错的**，
-    //    2026-10-30 实测 `GET` 该路径回 `405 Allow: POST`，端点确实存在。
     //
-    // ⚠️ 余额里的 `total_points` 是**全部积分**（含长期），而批次只给临期的
-    //    ⇒ `fetchMagicrewBalance` 会合成一个「长期积分」包，使 sum === total。
+    // ⚠️ 余额里的 `total_points` 是**全部积分**（含带到期时间的批次 + 永久），
+    //    `expiring_quota_details` 只给「所有带到期时间的批次」
+    //    ⇒ `fetchMagicrewBalance` 会合成一个「永久积分」包，使 sum === total。
     //    少了那一层，hover 列的合计会比卡片少一截（用户以为丢了积分）。
+    const site = provider === MAGICREW_INTL.id ? MAGICREW_INTL : MAGICREW
     for (const entry of accounts) {
       let balance: CreditBalance | null = null
       let error: string | undefined
@@ -427,7 +435,7 @@ async function fetchBalancesInner(provider: string, deps: CreditsEndpointDeps): 
           const result = await fetchMagicrewBalance({
             jwt: parsed.jwt,
             organizationCode: parsed.organizationCode,
-            product: MAGICREW,
+            product: site,
             fetchImpl: fetcher,
           })
           balance = result ?? null
@@ -588,7 +596,7 @@ export async function claimAll(provider: string, deps: CreditsEndpointDeps): Pro
     // Loomy 的「签到」= 触发每日赠送额度（自带幂等判据，不做额外预检）。
     return collect((credential) => claimLoomyDailyQuota(credential as unknown as LoomyCredential, LOOMY, fetcher))
   }
-  if (provider === MAGICREW.id) {
+  if (isMagicrewProvider(provider)) {
     // Magicrew（超级麦吉）：`POST /api/v1/login-gift`（无请求体，JWT + organization-code）。
     //
     // ⚠️ 上游对重复领取**幂等**（实测同一账号连打两次都回 `granted:false` +
@@ -601,11 +609,13 @@ export async function claimAll(provider: string, deps: CreditsEndpointDeps): Pro
     return collect(async (credential, entry) => {
       const parsed = parseMagicrewCredential(credential)
       if (parsed === undefined) return { kind: 'failed', code: -1, message: '凭据缺少 jwt' }
+      // ⚠️ **按 provider 传 product**：国际站的 host 与 `needsOrgOnGateway` 都不同。
+      //    漏传会让国际站账号打到国内站 host —— 症状是「国际站签到总是失败」。
       const result = await maybeClaimMagicrewDaily({
         jwt: parsed.jwt,
         organizationCode: parsed.organizationCode,
         ref: entry.credentialRef,
-        product: MAGICREW,
+        product: magicrewProductOf(provider) ?? MAGICREW,
         fetchImpl: fetcher,
         force: true,
       })
@@ -650,9 +660,31 @@ export async function claimOnboarding(
   provider: string,
   accountId: string,
   deps: CreditsEndpointDeps,
-): Promise<{ claimed: Array<{ key: string; title: string; points: number }>; skipped: string[]; earned: number; total: number }> {
+): Promise<{
+  claimed: Array<{ key: string; title: string; points: number }>
+  skipped: string[]
+  earned: number
+  total: number
+  /**
+   * 本次**尝试了但失败**的任务（`"<key>: <原因>"`）。
+   *
+   * ⚠️ 与 `skipped` 语义**不同**，不得混用：
+   * - `skipped` = 「**此前已完成**」（前端渲染成「N 个此前已完成」）
+   * - `errors`  = 「本次做了但没成功」⇒ 用户需要知道并可能重试
+   */
+  errors?: string[]
+  /**
+   * 需要用户**手动操作**才能完成的任务 key（服务端拒绝自动完成）。
+   *
+   * ⚠️ magicrew 的 `first_ai_work` 固定回 9303「该新人引导任务不支持手动完成」
+   * —— 必须真发一条消息才置位。塞进 `skipped` 会让前端显示「1 个此前已完成」，
+   * 而它**既没完成也没领到分**（把没做写成做过）。
+   */
+  manualRequired?: string[]
+}> {
   const fetcher = deps.fetcher ?? fetch
-  if (provider !== LOOMY.id && provider !== RACCOON.id) {
+  const isMagicrew = provider === MAGICREW.id || provider === MAGICREW_INTL.id
+  if (provider !== LOOMY.id && provider !== RACCOON.id && !isMagicrew) {
     throw new Error(`provider ${provider} 没有新手任务`)
   }
   const account = deps.pool.findAccount(accountId)
@@ -661,6 +693,25 @@ export async function claimOnboarding(
     ? resolveFreshCredential(deps, account)
     : resolveJson(deps, account))
   if (credential === undefined) throw new Error('凭据未配置或已损坏')
+
+  if (isMagicrew) {
+    /**
+     * Magicrew 新人奖励：8 项新手引导任务，7 项可 PUT 完成。
+     *
+     * ⚠️ 两站共用同一套原语，只有产品常量不同（`MAGICREW_INTL` 的 host /
+     * `needsOrgOnGateway` 不同）。漏传 `product` 会让国际站打到国内站的 host
+     * （或反之）—— 症状是 401/组织码错误，而不是「没有任务」。
+     */
+    const product = provider === MAGICREW_INTL.id ? MAGICREW_INTL : MAGICREW
+    const parsed = parseMagicrewCredential(credential)
+    if (parsed === undefined) throw new Error('凭据未配置或已损坏')
+    return claimMagicrewOnboardingTasks({
+      jwt: parsed.jwt,
+      organizationCode: parsed.organizationCode,
+      product,
+      fetchImpl: fetcher,
+    })
+  }
 
   if (provider === RACCOON.id) {
     // 领取端点幂等：已领过返回 granted:false。

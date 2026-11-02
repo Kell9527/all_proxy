@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-`all_proxy` 把 **14 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API**，
+`all_proxy` 把 **15 个 AI 平台**的账号聚合成一套标准 **OpenAI + Anthropic 兼容 API**，
 并自带一个网页管理端。目标形态是**独立 HTTP 服务**，不依赖 DeepSeek Harness 运行时。
 
 单进程同时提供：对外 API（`/v1/*`）、管理 API（`/api/*`）、管理端页面。
@@ -34,7 +34,7 @@
 | 项 | 来源（DSH 插件） | 本项目 | 原因 |
 |---|---|---|---|
 | 模型开关语义 | **仅目录过滤**：关闭的模型仍可被解析、仍能收发请求 | **硬拦截**：调用被关闭的模型返回 `404 model_not_found` 且不发上游请求 | 对外提供 API 时，调用方知道模型名就能绕过开关，开关将形同虚设 |
-| 模型寻址 | 裸模型 id（provider 由适配器路由隐含） | **强制 provider 前缀** `<provider>/<model>` | 14 个 provider 之间重名严重（`deepseek-v4-flash`、`glm-5.2` 等多处重复） |
+| 模型寻址 | 裸模型 id（provider 由适配器路由隐含） | **强制 provider 前缀** `<provider>/<model>` | 15 个 provider 之间重名严重（`deepseek-v4-flash`、`glm-5.2` 等多处重复） |
 | 凭据存储 | `ctx.credentials`（`$DSH_HOME/.credentials.yaml`） | 自持 JSON 凭据文件（可读写、可自由刷新回写） | 规避与 DSH 两边同时刷新导致一次性 `refresh_token` 互相作废 |
 | 目录门控 `providerCatalogVisible` | 用于隐藏无账号的 provider 分组 | **整体删除** | 它只影响 DSH 模型选择器的分组显示，不改路由；对外 API 无此概念 |
 | 续期调度 | 由 DSH 插件生命周期驱动 | 由本服务自己的定时器驱动 | 无 DSH 运行时 |
@@ -477,13 +477,39 @@ UTC+8 当日 24:00）。
   （`orchestrator.start(provider, method, { region })`），管理端「+ 新建账号」先弹区域
   预选；缺省与非法值归一成 `cn`。
 
-**第 14 个 provider —— Magicrew（超级麦吉，`i-magic-service.letsmagic.cn`）**
-（2026-10-30 从来源 `392d370` 移植）：本项目**第一个必须借本机 Chromium 登录**的
+**第 14、15 个 provider —— Magicrew（超级麦吉）+ MagiCrew（国际版）**
+（2026-11-02 从来源 `bd73592` 补齐）：本项目**第一个必须借本机 Chromium 登录**的
 provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organizationCode`）只存在于
 浏览器的 localStorage 里。文件：`magicrew-product.ts` / `magicrew-auth.ts` /
-`magicrew-catalog.ts` / `magicrew-credits.ts` / `magicrew-profile.ts` /
-`magicrew-adapter.ts` / `magicrew-local-browser.ts` / `magicrew-browser-login.ts` /
-**`chromium-session.ts`**（浏览器设施，1636 行，零第三方依赖）+ `src/login/magicrew-login.ts`。
+`magicrew-catalog.ts` / `magicrew-credits.ts` / **`magicrew-checkin.ts`**（新人奖励）/
+**`magicrew-expiry-rank.ts`**（三档分档 + 选号）/ **`magicrew-number.ts`**（数值解析，
+签到与积分共用一份）/ `magicrew-profile.ts` / `magicrew-adapter.ts` /
+`magicrew-local-browser.ts` / `magicrew-browser-login.ts` /
+**`chromium-session.ts`**（浏览器设施，零第三方依赖）+ `src/login/magicrew-login.ts`。
+
+### ⚠️ 两站是一个 provider 家族，不是「国际站是参数」
+
+| 判据 | `magicrew`（超级麦吉） | `magicrewintl`（MagiCrew） |
+|---|---|---|
+| 网页 | `www.letsmagic.cn` | `www.magicrew.ai` |
+| API host | `i-magic-service.letsmagic.cn` | **`magic-service.magicrew.ai`** |
+| 每日签到 | +200 / 天 | **+50 / 天** |
+| 强制 org | 否（缺了仍 200） | **是**（业务 API 回 `code 2182`；聊天网关形态**未定**） |
+| 新人奖励 | 8 项、7 项可 PUT | **恒返回 `tasks: []`**（没被登记进引导计划，**不是**「已领完」） |
+
+两站是**同一个 Go 服务的两个数据面**、账号体系物理隔离 ⇒ **必须各自登记一个
+provider**（合并会让选号器与余额按错误的 host 取数）。实现**零复制**：适配器 /
+目录 / 积分 / 签到 / 新人奖励全部共用，只有产品常量不同。
+
+⚠️ **`isMagicrewProvider()` 是全仓唯一判据**（`magicrew-product.ts`）：散落写
+`provider === 'magicrew'` 会让国际站**静默漏掉**（余额「查询失败」、签到不跑、
+导入读错 host —— 症状全是「功能没生效」而不是报错）。已收口的七处：余额分支、
+claimAll 分支、claimOnboarding、签到 sweep（`runtime-helpers`）、续期
+（`provider-refresher`）、手机号查询（`account-phone`）、导入白名单（`router`）。
+
+⚠️⚠️ **`dsh-import.ts` 的 `ACCOUNT_REF_RE` 里 `MAGICREWINTL` 必须排在 `MAGICREW`
+之前**：正则交替最左优先，反了会让 `MAGICREWINTL_ACCOUNT_…` 匹配失败 ⇒ 国际站账号
+在导入时被**静默丢弃**。
 
 ### ⚠️⚠️ 多账号的根本前提：**每次登录一个一次性 profile**
 
@@ -508,6 +534,38 @@ provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organiz
 网页在 `www.letsmagic.cn`、API 在 `i-magic-service.letsmagic.cn`。打开 API 子域会得到
 一个没有页面的域名，且 localStorage 也不在那个 origin 下 ⇒ **恒读不到且完全静默**。
 **不带邀请码**：`?invitation=` 会把新注册的号挂在某个邀请码下，不代用户决定归属。
+
+### ⚠️ 只导航「空白页」，且失败**不抛**（2026-11-02 从来源 `bd73592` 补齐）
+
+`ensureMagicrewLoginPage`（`magicrew-browser-login.ts`）把「CDP 就绪时首屏还是空白」的
+窗口导航到登录页。三条必守点：
+
+1. **空白页判据是「前缀」而不是「全等」**：真机实测形态远不止三种 ——
+   `chrome://new-tab-page-third-party/`、`chrome-search://local-ntp/…`、
+   `edge://newtab/`、`chrome://new-tab-page/?foo=1`、`about:blank#x` 全都会漏。
+2. **没有空白页就**不**导航**：旧实现 `pages.find(about:blank) ?? pages[0]` 会拿第一个
+   页面开刀，而 `chrome://newtab/` 的 `hostname` 是 **`'newtab'`**（非空、非同站点）
+   ⇒ 它被当成普通页面 ⇒ **用户的标签页被劫**。
+3. **导航失败只记诊断，不抛**：抛了会冒泡到登录层 ⇒ 删掉占位账号 ⇒ 用户看到
+   「登录失败」却明明有个窗口在。**唯一例外**：`cdp === undefined`（通道没就绪）
+   仍然抛 —— 那时连「窗口开着」都不成立。
+
+### ⚠️ 本机浏览器导入：注册表 App Paths + 便携版（2026-11-02 补齐）
+
+`chromium-session.ts` 新增 `windowsRegisteredBrowserPaths` 一族，
+`magicrew-local-browser.ts` 把它们拼进 `magicrewBrowserRoots()`。四条必守点：
+
+1. **`reg.exe` 输出是系统 OEM 代码页，不是 UTF-8**（中文 Windows = GBK/936）。
+   写死 `utf8` 会把中文路径解成 U+FFFD（**不可逆**）⇒ 拼出不存在的目录 ⇒
+   整条腿**静默失效**。故取 `encoding: 'buffer'` 再按代码页解码。
+2. **代码页的权威来源是注册表 `HKLM\…\Nls\CodePage` 的 `OEMCP`，不是 `Intl` 的 locale**：
+   ja/ko/zh-TW 的 OEMCP 分别是 932/949/**950(Big5)**，按 locale 猜「CJK ⇒ GBK」会全错。
+3. **`spawnSync` 必须带 `timeout`**：`reg` 卡住（网络路径上的 App Paths）会无限期
+   冻结事件循环。同仓库 `taskkill` 早就带了 `10_000`，这条纪律当时漏了。
+4. **必须缓存（5 分钟）**：一次查询 = 8 次 `spawnSync`、实测 399~550ms，而
+   `magicrewBrowserRoots()` 每次导入都会被调用（且两个 hostname 各一次）。
+   便携版 Chrome **不注册 App Paths** ⇒ 真兜底是环境变量
+   **`MAGICREW_CHROME_USER_DATA`**（指向它的 User Data 目录）。
 
 ### 三层凭证与两处硬约束
 
@@ -555,10 +613,45 @@ provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organiz
 
 `rotatesAccounts: false` —— 本适配器**不写** `modelRateLimits`，无请求级换号。
 
-积分：`balance: true` / `dailyCheckin: true`。**每日登录积分 200 分，当天
-23:59:59 作废、不累计**（`expire_type: 1`；前端文案「奖励的积分在今日内有效，
-明天登录还能领取新的积分哦！」）。领取端点 `POST /api/v1/login-gift`（**无请求体**，
-`GET` 回 `405 Allow: POST`）。
+积分：`balance: true` / `dailyCheckin: true` / `onboardingTasks: true`（两站同格）。
+**每日登录积分：国内 200 分 / 国际 50 分，当天 23:59:59 作废、不累计**
+（`expire_type: 1`；前端文案「奖励的积分在今日内有效，明天登录还能领取新的积分哦！」）。
+领取端点 `POST /api/v1/login-gift`（**无请求体**，`GET` 回 `405 Allow: POST`）。
+
+### 新人奖励（`magicrew-checkin.ts`，2026-11-02 从来源 `bd73592` 补齐）
+
+`GET /api/v1/onboarding/tasks` + `PUT …/<code>/completion`。国内站 8 项、7 项可 PUT；
+**每号一辈子一次**。五条必守点：
+
+1. **`first_ai_work` 归 `manualRequired`，不是 `skipped`** —— 服务端固定回 **`9303`**
+   「该新人引导任务不支持手动完成」，必须真发一条消息才置位。混进 `skipped` 会被
+   渲染成「N 个此前已完成」，而它**既没完成也没领到分**（把没做写成做过）。
+   本实现**不发那个 PUT**（省一次必然失败的请求）。
+2. **部分成功不上抛**：有 `claimed` + 有 `errors` ⇒ 返回并带 `errors`；只有
+   「零成功 + 有失败」才上抛。上抛会让整轮报成「失败」，而实际已领到大部分分。
+3. **`earned` = 领之前的累计 + 本次新增**，不重新 GET（服务端延迟写会让 UI 显示「刚领完却 0」）。
+4. **`total` 用 `max(读到的合计, earned)`** 只为不让进度条超 100%；**刻意不写死总分**
+   （参考实现 README 写「8 项合计 500」而同页逐项相加是 450，两个数字自相矛盾）。
+5. **码值判据要三腿**：数字 `code`、**十进制字符串 `code`**、HTTP 状态。
+   顺序不可颠倒（HTTP 腿必须在码值腿之后，否则 9303 会被截胡成硬失败）。
+   ⚠️ 字符串腿是来源二审的**真缺陷**：`{"code":"403"}` + HTTP 200 既不过数字腿也
+   不过 HTTP 腿 ⇒ 一路判成功 ⇒ 静默漏领。
+   ⚠️ 用 `DECIMAL_LITERAL_RE` 而不是裸 `Number()`：`Number('0x3E8') === 1000`。
+
+### 三档积分 + 永久锁（`magicrew-expiry-rank.ts`）
+
+上游余额 = **所有带到期时间的批次**（`expiring_quota_details`，含 2027 年的远期批次）
+**+ 一个没有到期时间的残差**（实测国内 2661/1661/**1000**、国际 347/247/**100**）。
+`fetchMagicrewBalance` 把残差合成为「**永久积分**」包，使 `sum(remaining) === total`。
+
+⚠️ **原名「长期积分」是命名错误**：前端判据是「有没有到期时间」⇒ 没有就到 `permanent`
+（绿）桶，名字却叫「长期」（黄），名字与落桶自相矛盾。已改名。
+
+选号按「临期 → 长期 → 永久 → 未知 → 空」分档、**档内保持手动顺序**
+（`rankMagicrewAccountsByExpiry` 稳定排序）。锁定永久积分时
+`permanent` / `unknown` / `empty` **一律不可用** —— `unknown` 若可用，锁定就是一次
+网络抖动即可绕过的装饰。三条口径必须与面板同源：窗口天数 15、`active !== true` 与
+`remaining <= 0` 不计入、到期时间读 `expiredTime`（ISO 串）。
 
 ⚠️ **曾经这里写的是 `dailyCheckin: false`，「依据上游无签到端点」—— 那是错的。**
 错因值得记住：当时只翻了 `app.asar` 找「签到」，而客户端 `Magic.exe` **只是加载
@@ -602,8 +695,9 @@ provider —— 上游没有 OAuth 回调通道，凭据（网页 JWT + `organiz
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **161 个文件 3657 条用例，全绿**（2026-10-30 实测；较上次登记 +2 文件 +38 条，
-含新增 `magicrew-daily-checkin.spec.ts`）。
+当前 **163 个文件 3698 条用例，全绿**（2026-11-02 实测；较上次登记 +2 文件 +41 条，
+含新增 `magicrew-onboarding-expiry.spec.ts`（27 条）与 `magicrew-login-page.spec.ts`（11 条），
+以及 `magicrew-import.spec`（+2）/ `dsh-import.spec`（+1）/ `provider-wiring.spec` / `runtime-refresh.spec`（改 15 个 provider 与续期清单）。
 ⚠️ 之前登记的那 4 条「时间相关的既有失败」（`buddy-oauth.spec.ts` 1 条 +
 `officeace-expiry-selector.spec.ts` 3 条，fixture 锚在 2026-10-15）**已修**：
 把锚点改成「相对真实时钟」（`officeace` 的 `NOW` 取当前分钟、`buddy` 的促销

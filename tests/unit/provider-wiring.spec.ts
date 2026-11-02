@@ -13,12 +13,18 @@ import { parseModelRef } from '../../src/providers/registry.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
-/** 全部 14 个 provider 的期望清单（与规格一致）。 */
+/**
+ * 全部 provider 的期望清单（与规格一致）。
+ *
+ * ⚠️ 现在是 **15 个**：`magicrewintl`（MagiCrew 国际站）是 Magicrew 家族的第
+ * 二站，与国内站共用同一套适配器实现、但**必须独立登记** —— 账号体系物理
+ * 隔离（同一个 Go 服务的两个数据面），合并会让选号器与余额按错误的 host 取数。
+ */
 const EXPECTED = [
-  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'officeace', 'accio', 'sensenova', 'magicrew',
+  'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'officeace', 'accio', 'sensenova', 'magicrew', 'magicrewintl',
 ]
 
-describe('14 个 provider 的装配', () => {
+describe('15 个 provider 的装配', () => {
   let dir: string
   let pool: AccountPool
   let registry: ProviderRegistry
@@ -42,9 +48,9 @@ describe('14 个 provider 的装配', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('注册了全部 14 个 provider（一个不少、一个不多）', () => {
+  it('注册了全部 15 个 provider（一个不少、一个不多）', () => {
     expect(registry.ids().sort()).toEqual([...EXPECTED].sort())
-    expect(registry.ids()).toHaveLength(14)
+    expect(registry.ids()).toHaveLength(15)
   })
 
   it('ALL_PROVIDER_IDS 与注册结果一致（防止清单漂移）', () => {

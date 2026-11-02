@@ -6,6 +6,7 @@ import { AccountPool } from '../../src/pool/account-pool.js'
 import { FileCredentialStore } from '../../src/pool/store.js'
 import {
   accountFromCredentialRef,
+  accountFromCredentialRef,
   importFromDsh,
   parseCredentialRefs,
   resolveDshPaths,
@@ -370,5 +371,17 @@ describe('importFromDsh', () => {
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
+  })
+  it('MAGICREWINTL_ACCOUNT_* 能反查到 magicrewintl（前缀交替顺序不能反）', () => {
+    // ⚠️ 正则交替是**最左优先**：把 `MAGICREW` 放在 `MAGICREWINTL` 之前，
+    //    `MAGICREWINTL_ACCOUNT_…` 会匹配失败（`MAGICREW` 后紧跟的是 `INTL`
+    //    而非 `_ACCOUNT`）⇒ 整条 ref 被判不可识别 ⇒ 国际站账号被**静默丢弃**。
+    const intl = accountFromCredentialRef('MAGICREWINTL_ACCOUNT_ABCDEF1')
+    expect(intl?.provider).toBe('magicrewintl')
+    expect(intl?.id).toBe('magicrewintl-abcdef1')
+
+    const cn = accountFromCredentialRef('MAGICREW_ACCOUNT_ABCDEF1')
+    expect(cn?.provider).toBe('magicrew')
+    expect(cn?.id).toBe('magicrew-abcdef1')
   })
 })

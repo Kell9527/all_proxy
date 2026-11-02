@@ -366,8 +366,10 @@ import { fetchOfficeAceModelTokenRates } from './officeace-credits.js'
 import { AccioAdapter } from './accio-adapter.js'
 import { SensenovaAdapter, fetchSensenovaRemoteModels } from './sensenova-adapter.js'
 import { MagicrewAdapter } from './magicrew-adapter.js'
-import { MAGICREW } from './magicrew-product.js'
+import { MAGICREW, MAGICREW_PRODUCTS } from './magicrew-product.js'
 import { fetchMagicrewCatalogModels } from './magicrew-catalog.js'
+import { fetchMagicrewBalance } from './magicrew-credits.js'
+import { MagicrewExpirySelector } from './magicrew-expiry-rank.js'
 import { parseMagicrewCredential } from './magicrew-auth.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -1004,66 +1006,128 @@ export function registerAllProviders(registry: ProviderRegistry, ctx: WiringCont
     }),
   )
 
-  // ── Magicrew（超级麦吉）：三层凭证 + 浏览器登录 ──
+  // ── Magicrew（超级麦吉 / MagiCrew）：三层凭证 + 浏览器登录 ──
   //
-  // ⚠️ 与其余 12 家的**根本差异：登录必须借本机 Chromium**。上游没有 OAuth
+  // ⚠️ 与其余 13 家的**根本差异：登录必须借本机 Chromium**。上游没有 OAuth
   // 回调通道，凭据（网页 JWT + organizationCode）只存在于浏览器的 localStorage
   // 里 ⇒ 只能「开一个独立 profile 的窗口让用户自己登，再把凭据读回来」。
-  // 这条腿的实现在 `magicrew-browser-login.ts`（移植自来源，判据逐条真机取证）。
+  // 这条腿的实现在 `magicrew-browser-login.ts`（判据逐条真机取证）。
   //
   // ⚠️ **多账号靠「每次登录一个一次性 profile」**：复用 profile 会让第二个账号
   // 一秒内读到**上一个账号**的 jwt ⇒ 建不出新账号（来源记过这条）。
   // 本项目的 `LoginOrchestrator` 每次 `start()` 一条会话，天然并发，
   // 故 profile 隔离必须在浏览器登录那一层保证（已由 `profilePrefix` 做到）。
   //
-  // 换号：**无请求级换号**（`rotatesAccounts: false`）—— 本适配器不写
-  // `modelRateLimit`，没有换号分支。如实登记，不臆造。
-  registry.register(
-    descriptorFor('magicrew', MAGICREW.displayName, MAGICREW.host, {
-      authKind: 'custom',
-      catalogSource: 'remote-first',
-      supportsImages: true,
-      rotatesAccounts: false,
-    }),
-    new MagicrewAdapter({
-      product: MAGICREW,
-      // ⚠️ 透传 modelId：本家虽无换号，但池的模型级限流过滤仍按它工作
-      // （手工在面板标记的限流也要生效）。空串会让过滤整体短路。
-      resolveCredential: (modelId?: string) => ctx.resolveCredential('magicrew', modelId) as never,
-      accountPool: ctx.pool,
-      warn: (message) => ctx.logger.warn(message),
-      // ⚠️ 读图入口的**契约差异**：`WiringContext.readImage` 返回类型不含
-      // `undefined`（缺附件服务时直接抛），而本适配器要的是「读不到返回 undefined，
-      // 由适配器统一判成 INVALID_REQUEST」。故这里包一层：抛错转成 undefined，
-      // 让「读不到」与「没配入口」两条路的文案由适配器统一给出。
-      readImage: async (attachment) => {
-        try {
-          return await ctx.readImage(attachment)
-        } catch {
-          return undefined
-        }
-      },
-      fetchRemoteModels: () => fetchRemoteCatalog('magicrew', async () => {
-        // ⚠️ 目录取号**不走 `ctx.resolveCredential`**：那条路径会按限流/积分过滤，
-        // 把「拉目录」连坐成失败（与 Loomy / Raccoon / OfficeAce 同因）。
-        const account = ctx.pool.listAccountsByProvider('magicrew')
-          .find((entry) => entry.enabled !== false)
-        if (account === undefined) return []
-        const credential = parseMagicrewCredential(await ctx.credentials.resolve(account.credentialRef))
-        if (credential === undefined) return []
-        const models = await fetchMagicrewCatalogModels({
+  // ⚠️ **两站（`magicrew` / `magicrewintl`）在这里循环注册**：
+  // 实现零复制 —— 适配器 / 目录 / 积分 / 签到 / 新人奖励全部复用，只有产品常量
+  // 不同（与 accio 的 `cn`/`global` 同纪律：复制会让同类缺陷修两遍）。
+  // 两站**必须各自登记一个 provider**：账号体系物理隔离（同一个 Go 服务的两个
+  // 数据面），合并会让选号器与余额按错误的 host 取数。
+  for (const product of MAGICREW_PRODUCTS) {
+    /**
+     * 选号按**积分到期分档**（先临期、再长期、最后永久），与 OfficeAce 同构。
+     *
+     * ⚠️ 为什么本家也要（来源侧做在泛型化 `BuddyBalanceSelector` 上）：
+     * Magicrew 的积分同样是「一组带到期时间的包 + 一个没有到期时间的永久包」。
+     * 按数组顺序取第一个会把排首位的**永久**积分先烧掉，而别的账号里的**临期**
+     * 积分到期作废。用户视角就是「积分莫名少了」。
+     *
+     * ⚠️ 查询走 `fetchMagicrewBalance`（**只读 GET**）：推理路径上不该有写操作。
+     * 签到是独立的定时任务 / 手动按钮，不在这条路径上。
+     */
+    const selector = new MagicrewExpirySelector({
+      fetchBalance: async ({ product: site, credentialRef }) => {
+        const credential = parseMagicrewCredential(await ctx.credentials.resolve(credentialRef))
+        if (credential === undefined) return undefined
+        return fetchMagicrewBalance({
           jwt: credential.jwt,
           organizationCode: credential.organizationCode,
-          product: MAGICREW,
+          product: site,
           fetchImpl: fetcher,
         })
-        // ⚠️ `fetchRemoteCatalog` 要可变数组（它会 push/slice），而目录原语返回
-        // readonly ⇒ 这里复制一次。别改成 `as` 断言：那会在真往只读数组写时
-        // 静默失败（冻结对象上 push 会抛，非冻结则悄悄改到缓存里）。
-        return [...models]
+      },
+      logger: (message) => ctx.logger.info(message),
+    })
+    // 换号：**无请求级换号**（`rotatesAccounts: false`）—— 本适配器不写
+    // `modelRateLimit`，没有换号分支。如实登记，不臆造。
+    registry.register(
+      descriptorFor(product.id, product.displayName, product.host, {
+        authKind: 'custom',
+        catalogSource: 'remote-first',
+        supportsImages: true,
+        rotatesAccounts: false,
       }),
-    }),
-  )
+      new MagicrewAdapter({
+        product,
+        /**
+         * ⚠️ **选号必须按 `product.id` 取该站自己的账号** —— 两站共用一个
+         * 适配器类但账号池是隔离的（凭据 ref 前缀不同）。
+         *
+         * ⚠️ **锁定永久积分时绝不可落到下面的通用兜底**：那会绕过锁定、
+         * 照样消耗永久积分，锁定形同虚设。直接抛明确错误（与 OfficeAce 同语义）。
+         */
+        resolveCredential: async (modelId?: string) => {
+          const allowPermanent = !ctx.pool.permanentLocked(product.id)
+          const candidates = ctx.pool.listAccountsByProvider(product.id)
+            .filter((entry) => entry.enabled)
+            .map((entry) => ({ id: entry.id, credentialRef: entry.credentialRef }))
+          if (candidates.length > 0) {
+            const picked = await selector.select(candidates, product, { allowPermanent })
+            if (picked !== undefined) {
+              const credential = parseMagicrewCredential(
+                await ctx.credentials.resolve(picked.account.credentialRef),
+              )
+              if (credential !== undefined) {
+                // 登记实际选中的账号：定向续期与用量记录都以它为准。
+                recordCurrentAccount(product.id, picked.account.id)
+                return credential as never
+              }
+            } else if (!allowPermanent) {
+              throw new Error(
+                `${product.displayName}：没有可用账号。已锁定永久积分，而所有账号都只剩永久积分桶`
+                + '（或积分查询失败）。请在管理端解锁永久积分，或等待临期/长期积分到账。',
+              )
+            }
+          }
+          // 兜底：无候选或选出的凭据不可解析时，退回通用池选号（会抛「没有可用账号」）。
+          // ⚠️ 透传 modelId：池的模型级限流过滤按它工作（手工标记的限流也要生效）。
+          return await ctx.resolveCredential(product.id, modelId) as never
+        },
+        accountPool: ctx.pool,
+        warn: (message) => ctx.logger.warn(message),
+        // ⚠️ 读图入口的**契约差异**：`WiringContext.readImage` 返回类型不含
+        // `undefined`（缺附件服务时直接抛），而本适配器要的是「读不到返回 undefined，
+        // 由适配器统一判成 INVALID_REQUEST」。故这里包一层：抛错转成 undefined，
+        // 让「读不到」与「没配入口」两条路的文案由适配器统一给出。
+        readImage: async (attachment) => {
+          try {
+            return await ctx.readImage(attachment)
+          } catch {
+            return undefined
+          }
+        },
+        fetchRemoteModels: () => fetchRemoteCatalog(product.id, async () => {
+          // ⚠️ 目录取号**不走 `ctx.resolveCredential`**：那条路径会按限流/积分过滤，
+          // 把「拉目录」连坐成失败（与 Loomy / Raccoon / OfficeAce 同因）。
+          const account = ctx.pool.listAccountsByProvider(product.id)
+            .find((entry) => entry.enabled !== false)
+          if (account === undefined) return []
+          const credential = parseMagicrewCredential(await ctx.credentials.resolve(account.credentialRef))
+          if (credential === undefined) return []
+          const models = await fetchMagicrewCatalogModels({
+            jwt: credential.jwt,
+            organizationCode: credential.organizationCode,
+            product,
+            fetchImpl: fetcher,
+          })
+          // ⚠️ `fetchRemoteCatalog` 要可变数组（它会 push/slice），而目录原语返回
+          // readonly ⇒ 这里复制一次。别改成 `as` 断言：那会在真往只读数组写时
+          // 静默失败（冻结对象上 push 会抛，非冻结则悄悄改到缓存里）。
+          return [...models]
+        }),
+      }),
+    )
+  }
 }
 
 /**
@@ -1087,4 +1151,5 @@ export const ALL_PROVIDER_IDS = [
   'accio',
   'sensenova',
   'magicrew',
+  'magicrewintl',
 ] as const

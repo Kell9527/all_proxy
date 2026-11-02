@@ -54,10 +54,13 @@ export interface MagicrewProduct {
   /** 网页 origin（`Origin` 头必带，缺了偶发 403）。 */
   readonly webOrigin: string
   /**
-   * 网关是否**强制**要求 `organization-code`。
+   * 该站是否**强制**要求 `organization-code`。
    *
-   * 实测：国内站不强制（缺了仍 200）；国际站缺了回 **HTTP 500 + 22 字节裸文本**
-   * （不是 JSON，极易被误判成「网关挂了」）。
+   * 实测：国内站不强制（缺了仍 200）；国际站缺了会被上游拒 —— 但**形态分两种**
+   *（二审更正，原注释把两者混成一句）：
+   * - 业务 API `/api/v1/*`：`{"code":2182,"message":"用户所在组织不存在"}`
+   * - 聊天网关 `/v1/*`：⚠️ **形态未定**。参考实现记的是「HTTP 500 + 22 字节裸文本」，
+   *   但 2026-11-01 用真实 apiKey 实测缺 org 时仍是 HTTP 200 + 正常 SSE ⇒ **不写死**
    */
   readonly needsOrgOnGateway: boolean
   readonly defaultCredentialRef: string
@@ -88,8 +91,31 @@ export const MAGICREW_POINTS_PATH = '/api/v1/quota/points/total'
  * ⚠️ **只认 POST 且无请求体**（`GET` 实测回 `405 Allow: POST`）。
  * 前端实现：`claimFreePoints(){ return e.post('/api/v1/login-gift', void 0, …) }`。
  * 响应 `data.granted` 才是成功判据，HTTP 恒 200（详见 `magicrew-credits.ts`）。
+ *
+ * ⚠️ 两站**逐字符同构**（同一个 Go 服务）：国内 +200/天、国际 +50/天，
+ * 只有金额不同 ⇒ 路径共享，金额由 `MagicrewProduct` 不承载（以响应
+ * `point_amount` 为准，不写死）。
  */
 export const MAGICREW_LOGIN_GIFT_PATH = '/api/v1/login-gift'
+
+/**
+ * **新人引导任务（=「新人奖励」）**：查询与完成。
+ *
+ * - 查询：`GET <host>/api/v1/onboarding/tasks`
+ * - 完成：`PUT <host>/api/v1/onboarding/tasks/<code>/completion`（body 为 `{}`）
+ *
+ * 国内站 8 项，其中 7 项 PUT 即完成；第 8 项 `first_ai_work` 服务端回
+ * **`9303`「该新人引导任务不支持手动完成」**，必须真发一条消息才置位。
+ * **每个账号一辈子一次**。
+ *
+ * ⚠️⚠️ **国际站这个接口恒返回 `{participant_type: null, tasks: []}`** ——
+ * 那是「该账号没被登记进引导计划」，**不是**「已经领完了」。别把 0 项当成功
+ * 上报「新手福利 0 项已全部完成」（magpie 0.3.7 犯过这个错）。
+ *
+ * ⚠️ 两站**逐字符同构**（同一个 Go 服务），故路径是共享常量而非产品字段。
+ */
+export const MAGICREW_ONBOARDING_TASKS_PATH = '/api/v1/onboarding/tasks'
+
 export const MAGICREW_CHAT_PATH = '/v1/chat/completions'
 
 /** 账号池凭据 ref 前缀（`jet-hub-store.ts` 的前缀表必须同步）。 */
@@ -210,10 +236,102 @@ export const MAGICREW: MagicrewProduct = Object.freeze({
   fallbackModels: MAGICREW_FALLBACK_MODELS,
 })
 
+/**
+ * **Magicrew 国际站**（MagiCrew，`www.magicrew.ai`）。
+ *
+ * ## 为什么是独立 provider 而不是 `MAGICREW` 的站点参数
+ *
+ * 判据与 `minimaxintl` / `autoclawintl` 同款：
+ *
+ * | 判据 | 国内（超级麦吉） | 国际（MagiCrew） |
+ * |---|---|---|
+ * | 展示名 | 超级麦吉 | MagiCrew |
+ * | 网页 | `www.letsmagic.cn` | `www.magicrew.ai` |
+ * | API host | `i-magic-service.letsmagic.cn` | **`magic-service.magicrew.ai`** |
+ * | 登录体系 | 手机号 / 短信验证码 | 邮箱 / OAuth |
+ * | 每日签到 | +200 / 天 | **+50 / 天** |
+ * | 强制 org | 否（缺了仍 200） | **是**（业务 API 回 `code 2182`「用户所在组织不存在」；
+ *   聊天网关 `/v1/*` 的形态**未定**，实测 apiKey 形态下仍 200） |
+ *
+ * 账号体系物理隔离（同一个 Go 服务，但数据面分开）⇒ 必须是独立 provider，
+ * 否则一个 provider 下会混进两套 host 的账号，选号器与余额全错位。
+ *
+ * ## ⚠️ `api.magicrew.ai` 不是这套 API
+ *
+ * 它是 teamshare 网关（`MAGIC_GATEWAY_ADDRESS`），对 `/v1/models`、`/api/v1/*`
+ * 一律回 `not match rule path`。真实业务 API 是 **`magic-service.magicrew.ai`**
+ * —— 来源：`GET https://www.magicrew.ai/workspace` 的 HTML 里内嵌的运行时配置
+ * `"MAGIC_SERVICE_BASE_URL":"https://magic-service.magicrew.ai"`
+ * （`MAGIC_APP_ENV: "international-prod"`）。
+ *
+ * ## ⚠️ 实现零复制
+ *
+ * `MagicrewAuth` / `MagicrewAdapter` / 目录 / 积分 / 签到 / 新人奖励
+ * 全部复用国内版那一套，**只有本常量不同**（与 `autoclawintl` 同纪律：
+ * 复制会让同类缺陷修两遍）。
+ */
+export const MAGICREW_INTL: MagicrewProduct = Object.freeze({
+  id: 'magicrewintl',
+  site: 'intl',
+  // ⚠️ 与客户端 `PROVIDER_REGISTRY` 的 label 语义一致（rail 宽度算式依赖长度）。
+  displayName: 'MagiCrew (国际版)',
+  host: 'https://magic-service.magicrew.ai',
+  webOrigin: 'https://www.magicrew.ai',
+  /**
+   * ⚠️ **必须 `true`**：国际站缺 `organization-code` 时上游会拒。
+   *
+   * ⚠️ 二审更正：**两种端点两种形态** ——
+   * - 业务 API `/api/v1/*`（签到 / 目录 / 余额 / 计费）：`{"code":2182,…}`
+   * - 聊天网关 `/v1/chat/completions`：⚠️ **形态未定** —— 参考实现记的是
+   *   「HTTP 500 + 22 字节裸文本」，但 2026-11-01 真实 apiKey 实测缺 org 时
+   *   仍 HTTP 200 + 正常出流
+   *
+   * 国内站缺了仍 200，故两家取值不同。
+   */
+  needsOrgOnGateway: true,
+  defaultCredentialRef: 'MAGICREWINTL_ACCESS_TOKEN',
+  requestTimeoutMs: 30_000,
+  chatHeaderTimeoutMs: 60_000,
+  catalogRetryMs: 60_000,
+  chunkTimeoutMs: 300_000,
+  /**
+   * ⚠️ 兜底模型表**与国内站共用**：两站是同一个 Go 服务的两个数据面，
+   * 目录端点 `/api/v1/flows/models` 逐字符同构，模型 id 集合理论上一致
+   * （实测国际站目录是同一批 id 的子集）。共表比复制一份更安全 ——
+   * 复制会让「新模型只补了一边」变成静默的能力差异。
+   * ⚠️ 本表的 ctx 值**必然腐坏**（见上方的双时间点对照），只作兜底。
+   */
+  fallbackModels: MAGICREW_FALLBACK_MODELS,
+})
+
 /** 按 id 取静态兜底条目；未登记返回 `undefined`（**不编造**）。 */
 export function magicrewFallbackModelOf(
   modelId: string,
 ): MagicrewFallbackModel | undefined {
   if (typeof modelId !== 'string' || modelId.length === 0) return undefined
   return MAGICREW_FALLBACK_MODELS.find((model) => model.id === modelId)
+}
+
+/** 按 provider id 取产品常量（两站唯一的分派点）。 */
+export function magicrewProductOf(id: string): MagicrewProduct | undefined {
+  if (id === MAGICREW.id) return MAGICREW
+  if (id === MAGICREW_INTL.id) return MAGICREW_INTL
+  return undefined
+}
+
+/** 两个 Magicrew 站点（wiring / 能力表 / 刷新调度的遍历口径）。 */
+export const MAGICREW_PRODUCTS: readonly MagicrewProduct[] = Object.freeze([
+  MAGICREW,
+  MAGICREW_INTL,
+])
+
+/**
+ * 该 provider id 是否属于 Magicrew 家族（两站之一）。
+ *
+ * ⚠️ **全仓唯一判据**：散落写 `provider === 'magicrew'` 会让国际站静默漏掉
+ * （余额面板「查询失败」、签到不跑、导入读错 host —— 症状全是「功能没生效」，
+ * 而不是报错）。新增第三站时只改这里与 {@link MAGICREW_PRODUCTS}。
+ */
+export function isMagicrewProvider(id: string): boolean {
+  return id === MAGICREW.id || id === MAGICREW_INTL.id
 }

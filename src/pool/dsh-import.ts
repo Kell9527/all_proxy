@@ -60,6 +60,9 @@ const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
   // Magicrew（超级麦吉）：浏览器登录建号时会造出 `MAGICREW_ACCOUNT_*` ref。
   // 与 SENSENOVA 同理 —— 不登记的话自建 ref 会被判为不可识别、账号被静默丢弃。
   MAGICREW: 'magicrew',
+  // MagiCrew 国际站（`www.magicrew.ai`）：与国内站是**两套账号体系**
+  // （同一个 Go 服务的两个数据面），故 ref 前缀也独立。
+  MAGICREWINTL: 'magicrewintl',
 }
 
 /**
@@ -68,7 +71,11 @@ const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
  * ⚠️ 前缀集合必须与 {@link PROVIDER_BY_REF_PREFIX} 一致 —— 少一个就会让那类
  * 账号在导入时被静默丢弃（来源正是如此漏掉了四个）。
  */
-const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|CLINE|LOOMY|RACCOON|OFFICEACE|ACCIO|SENSENOVA|MAGICREW)_ACCOUNT_([0-9A-Fa-f]{6,})$/
+// ⚠️ `MAGICREWINTL` **必须排在 `MAGICREW` 之前**：正则的交替是**最左优先**，
+//    把 `MAGICREW` 放前面会让 `MAGICREWINTL_ACCOUNT_…` 匹配失败（因为
+//    `MAGICREW` 后面紧跟的是 `INTL` 而不是 `_ACCOUNT`）⇒ 整条 ref 被判不可识别
+//    ⇒ 国际站账号在导入时被**静默丢弃**。
+const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|QODERCN|TRAE|CLINE|LOOMY|RACCOON|OFFICEACE|ACCIO|SENSENOVA|MAGICREWINTL|MAGICREW)_ACCOUNT_([0-9A-Fa-f]{6,})$/
 
 /**
  * `refresh_token` 一次性轮换的 provider。

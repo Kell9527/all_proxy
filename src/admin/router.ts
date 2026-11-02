@@ -48,6 +48,7 @@ import { claimOfficeAceDailyBonuses } from '../refresh/runtime-helpers.js'
 import { maskCredentialPath, parseCredentialRef, validateFileRefInput } from '../pool/credential-ref-kind.js'
 import { AccountPhoneResolver } from './account-phone.js'
 import { importMagicrewFromLocalBrowser } from './magicrew-import.js'
+import { isMagicrewProvider, magicrewProductOf } from '../providers/magicrew-product.js'
 
 /** 管理 API 的依赖。 */
 export interface AdminOptions {
@@ -526,15 +527,20 @@ export function createAdminHandler(options: AdminOptions): AdminHandler {
         // ⚠️ 白名单而非「所有 provider」：只有 magicrew 的凭据是「浏览器
         //    localStorage 里的 jwt + 组织码」，其余各家的凭据是 OAuth token，
         //    读浏览器没有任何意义（也读不到）。
-        if (provider !== 'magicrew') {
+        if (!isMagicrewProvider(provider)) {
           throw new Error(
-            `provider "${provider}" 不支持从本机浏览器导入（当前仅支持: magicrew）`,
+            `provider "${provider}" 不支持从本机浏览器导入（当前仅支持: magicrew / magicrewintl）`,
           )
         }
         if (registry.get(provider) === undefined) throw new Error(`未知 provider "${provider}"`)
+        // ⚠️ **按 provider 传 product**：国际站的 webOrigin 是 www.magicrew.ai。
+        //    用国内站 host 去读国际站的 localStorage 会恒读不到（且完全静默）。
+        const site = magicrewProductOf(provider)
+        if (site === undefined) throw new Error(`未知 provider "${provider}"`)
         const result = await importMagicrewFromLocalBrowser({
           pool,
           credentials,
+          product: site,
           nickname: rawNickname,
           ...options.fetcher === undefined ? {} : { fetcher: options.fetcher },
           warn: (message) => logger.warn(message),

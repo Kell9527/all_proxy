@@ -40,7 +40,7 @@ import type { AccountPool } from '../pool/account-pool.js'
 import type { CredentialStore, ProviderAccountEntry } from '../pool/types.js'
 import { issueMagicrewGatewayKey } from '../providers/magicrew-auth.js'
 import { readMagicrewLocalCreds } from '../providers/magicrew-local-browser.js'
-import { MAGICREW } from '../providers/magicrew-product.js'
+import { MAGICREW, MAGICREW_INTL } from '../providers/magicrew-product.js'
 import { fetchMagicrewProfile } from '../providers/magicrew-profile.js'
 
 /** 一次导入的结果（对外只回这几个字段，**绝不回显 jwt**）。 */
@@ -83,6 +83,14 @@ export type MagicrewImportFailure =
 export async function importMagicrewFromLocalBrowser(params: {
   pool: AccountPool
   credentials: CredentialStore
+  /**
+   * 站点（缺省国内站 `MAGICREW`）。
+   *
+   * ⚠️ **必须由调用方按 provider 传入**：两站的 `webOrigin` / `host` 与凭据
+   * ref 前缀都不同。用国内站的 host 去读国际站的 localStorage 会**恒读不到**
+   * （且完全静默 —— 症状与「用户没登录」同形）。
+   */
+  product?: import('../providers/magicrew-product.js').MagicrewProduct
   /** 用户显式给的昵称（空串 = 用 profile 昵称 / 手机号 / 渠道名）。 */
   nickname: string
   /** 注入的 fetch（测试替身）。 */
@@ -99,9 +107,14 @@ export async function importMagicrewFromLocalBrowser(params: {
   const readCreds = params.readCreds ?? readMagicrewLocalCreds
   const issueKey = params.issueKey ?? issueMagicrewGatewayKey
   const fetchProfile = params.profileFetcher ?? fetchMagicrewProfile
-  // ⚠️ 只传 **host**（`www.letsmagic.cn`），不带协议与路径：
-  //    `readMagicrewLocalCreds` 拿它去 leveldb 文本里找站点记录。
-  const host = MAGICREW.webOrigin.replace(/^https?:\/\//, '')
+  /**
+   * ⚠️ 站点由调用方指定（缺省国内站）。
+   *
+   * ⚠️ 只传 **host**（如 `www.letsmagic.cn`），不带协议与路径：
+   *    `readMagicrewLocalCreds` 拿它去 leveldb 文本里找站点记录。
+   */
+  const product = params.product ?? MAGICREW
+  const host = product.webOrigin.replace(/^https?:\/\//, '')
   const found = readCreds(host)
   if (found === undefined) return { kind: 'not-found' }
 
@@ -114,7 +127,7 @@ export async function importMagicrewFromLocalBrowser(params: {
     const key = await issueKey({
       jwt: found.jwt,
       organizationCode: found.organizationCode,
-      product: MAGICREW,
+      product,
       ...params.fetcher === undefined ? {} : { fetchImpl: params.fetcher },
     })
     hasApiKey = true
@@ -141,7 +154,7 @@ export async function importMagicrewFromLocalBrowser(params: {
     const profile = await fetchProfile({
       jwt: found.jwt,
       organizationCode: found.organizationCode,
-      product: MAGICREW,
+      product,
       ...params.fetcher === undefined ? {} : { fetchImpl: params.fetcher },
     })
     if (profile.nickname.length > 0) profileNickname = profile.nickname
@@ -158,15 +171,19 @@ export async function importMagicrewFromLocalBrowser(params: {
   if (phone !== undefined) credential = { ...credential, phone }
   if (profileNickname !== undefined) credential = { ...credential, nickname: profileNickname }
 
-  const ref = `MAGICREW_ACCOUNT_${randomBytes(4).toString('hex').toUpperCase()}`
+  // ⚠️ ref 前缀**按站区分**（`MAGICREW_ACCOUNT_*` / `MAGICREWINTL_ACCOUNT_*`）：
+  //    `dsh-import.ts` 的 `ACCOUNT_REF_RE` 用它反查 provider，前缀写错会让
+  //    导入来的账号"看起来建好了但归属到错误的站"。
+  const prefix = product.id === MAGICREW_INTL.id ? 'MAGICREWINTL_ACCOUNT_' : 'MAGICREW_ACCOUNT_'
+  const ref = `${prefix}${randomBytes(4).toString('hex').toUpperCase()}`
   await params.credentials.set(ref, JSON.stringify(credential))
   const expiresAt = credential['apiKeyExpiresAt']
   const entry: ProviderAccountEntry = {
-    id: `magicrew-${randomBytes(4).toString('hex')}`,
-    provider: 'magicrew',
+    id: `${product.id}-${randomBytes(4).toString('hex')}`,
+    provider: product.id,
     nickname: params.nickname.length > 0
       ? params.nickname
-      : profileNickname ?? phone ?? MAGICREW.displayName,
+      : profileNickname ?? phone ?? product.displayName,
     enabled: true,
     credentialRef: ref,
     createdAt: Date.now(),

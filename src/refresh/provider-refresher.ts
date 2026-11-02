@@ -64,7 +64,7 @@ import { refreshAccioCredential } from '../providers/accio-oauth.js'
 import { accioExpiresAtMs, type AccioCredential } from '../providers/accio.js'
 import { isAccioTerminalRefreshError } from '../providers/accio-auth.js'
 import { refreshMagicrewKey } from '../providers/magicrew-auth.js'
-import { MAGICREW } from '../providers/magicrew-product.js'
+import { MAGICREW, magicrewProductOf } from '../providers/magicrew-product.js'
 
 /** 已接线的 provider。loomy 没有 refresh 端点，属已知限制（AGENTS.md）。 */
 export const REFRESH_SUPPORTED_PROVIDERS = new Set([
@@ -73,6 +73,8 @@ export const REFRESH_SUPPORTED_PROVIDERS = new Set([
   // ⚠️ 本家续期的产物是 **api_key（2 小时）**，不是 jwt —— 与其余各家语义不同，
   // 故 `expiresAt` 写的是 api_key 的到期时刻（见 refreshMagicrew）。
   'magicrew',
+  // MagiCrew 国际站：与国内站同一套续期原语，只是 host 不同（见 refreshMagicrew）。
+  'magicrewintl',
 ])
 
 /** 刷新结果：新凭据（整体替换写回凭据存储）。 */
@@ -387,7 +389,15 @@ async function refreshAccio(credential: Record<string, unknown>, fetcher: typeof
 async function refreshMagicrew(
   credential: Record<string, unknown>,
   fetcher: typeof fetch,
+  provider: string = 'magicrew',
 ): Promise<RefreshedCredential> {
+  /**
+   * ⚠️ **必须按 provider 取站**：国际站（`magicrewintl`）的 host 是
+   * `magic-service.magicrew.ai`，用它自己的 refresh_token 才有效（两站账号
+   * 体系物理隔离）。写死国内站会让国际站续期一律 401 ⇒ 判成终态 ⇒
+   * 用户被要求重新登录（而其实只是打错了站）。
+   */
+  const product = magicrewProductOf(provider) ?? MAGICREW
   const refreshToken = credential['refreshToken']
   if (typeof refreshToken !== 'string' || refreshToken.length === 0) {
     // ⚠️ 没有 refresh_token **不抛终态**：凭据仍能用 jwt 拉目录 / 积分。
@@ -396,7 +406,7 @@ async function refreshMagicrew(
   }
   let key
   try {
-    key = await refreshMagicrewKey({ refreshToken, product: MAGICREW, fetchImpl: fetcher })
+    key = await refreshMagicrewKey({ refreshToken, product, fetchImpl: fetcher })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     // ⚠️ 终态：上游明确说这份 refresh_token 不认了 / 已被消费。
@@ -446,7 +456,9 @@ export async function refreshProviderCredential(
     case 'raccoon': return refreshRaccoon(credential, fetcher)
     case 'officeace': return refreshOfficeAce(credential)
     case 'accio': return refreshAccio(credential, fetcher)
-    case 'magicrew': return refreshMagicrew(credential, fetcher)
+    case 'magicrew':
+    case 'magicrewintl':
+      return refreshMagicrew(credential, fetcher, provider)
     case 'loomy':
       throw new Error('Loomy 没有 refresh 端点，token 过期只能重新登录（手机号验证码路径成本很低）')
     default:

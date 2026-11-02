@@ -28,9 +28,12 @@ function jsonResp(body: unknown, status = 200): Response {
 }
 
 describe('provider 续期接线', () => {
-  it('十二个可续期 provider 全部接线（loomy 除外：无 refresh 端点）', () => {
+  it('十三个可续期 provider 全部接线（loomy 除外：无 refresh 端点）', () => {
+    // ⚠️ `magicrewintl` 与 `magicrew` **各占一项**：两站账号体系物理隔离，
+    //    续期要打各自的 host（漏登记会让国际站的 api_key 永不续期，
+    //    表现是「国际站模型每 2 小时 401 一次，重登又能用」）。
     expect([...REFRESH_SUPPORTED_PROVIDERS].sort()).toEqual(
-      ['accio', 'buddy', 'cline', 'codearts', 'lobsterai', 'magicrew', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy'].sort(),
+      ['accio', 'buddy', 'cline', 'codearts', 'lobsterai', 'magicrew', 'magicrewintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy'].sort(),
     )
   })
 

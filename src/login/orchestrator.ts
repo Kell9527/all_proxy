@@ -48,6 +48,7 @@ import { startOfficeAceLoginFlow } from '../providers/officeace-login.js'
 import { startAccioLoginFlow } from '../providers/accio-login.js'
 import type { AccioRegion } from '../providers/accio-product.js'
 import { startMagicrewLoginFlow } from '../login/magicrew-login.js'
+import { MAGICREW, magicrewProductOf } from '../providers/magicrew-product.js'
 
 /**
  * 登录会话的存活上限：到点自动清理回调服务器与端口。
@@ -255,7 +256,8 @@ async function startUrlFlow(
         cancel: flow.close,
       }
     }
-    case 'magicrew': {
+    case 'magicrew':
+    case 'magicrewintl': {
       // ⚠️ **本家必须借本机 Chromium**：上游没有 OAuth 回调，凭据只存在于
       // 浏览器的 localStorage 里 ⇒ 只能「起一个独立 profile 的窗口让用户自己登，
       // 再把凭据读回来」。
@@ -266,7 +268,12 @@ async function startUrlFlow(
       //
       // ⚠️ 浏览器起不来（无 GUI / 没装 Chromium）⇒ 抛 `BrowserDeploymentError`，
       // 由前端展示「需要本机有一个 Chromium 内核浏览器」的可执行提示。
+      // ⚠️ **按 provider 传 `product`**：国际站（`magicrewintl`）的 webOrigin
+      // 是 `www.magicrew.ai`、host 是 `magic-service.magicrew.ai`。
+      // 漏传会让「打开登录页」与「读 localStorage」都指向国内站 ——
+      // 症状是「国际站点了没反应、且读不到登录态」（且完全静默）。
       const flow = await startMagicrewLoginFlow({
+        product: magicrewProductOf(provider) ?? MAGICREW,
         ...(flowOptions.log === undefined ? {} : { log: flowOptions.log }),
       })
       return {
