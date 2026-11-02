@@ -41,11 +41,12 @@
  * `~/.config/magpie` —— 那是 magpie 的落点，本插件不该依赖另一个产品的私有目录。
  */
 
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { registeredBrowserUserDataRoots } from './chromium-session.js'
+import { leveldbText } from './leveldb-reader.js'
 
 /**
  * 窗口宽度。
@@ -95,10 +96,35 @@ export function magicrewBrowserRoots(): readonly MagicrewBrowserRoot[] {
   if (process.platform === 'win32') {
     const local = process.env.LOCALAPPDATA || join(home, 'AppData', 'Local')
     const roaming = process.env.APPDATA || join(home, 'AppData', 'Roaming')
-    return [
+    return dedupeBrowserRoots([
       // ── 国际主流 ──
+      //
+      // ⚠️⚠️ **Edge 的四个通道是四个互不相干的 User Data 目录**（2026-11-02 真机报障
+      // 「MagiCrew (国际版) 我在网页登录了，为什么没识别到」）：
+      //
+      //     <local>\Microsoft\Edge         ← Stable
+      //     <local>\Microsoft\Edge Beta    ← Beta
+      //     <local>\Microsoft\Edge Dev     ← Dev
+      //     <local>\Microsoft\Edge SxS     ← Canary（「SxS」= side-by-side）
+      //
+      // 只列 Stable 时，**用户装在 Beta/Dev/Canary 上的登录态一条都读不到**，而症状
+      // 与「用户没登录」**完全同形**（`not-found` ⇒ 面板提示「请先登录」）——
+      // 用户明明刚在网页上登好，却被反过来指引去重登，永远不可能成功。
+      // 真机实测就是这样：Stable 里 `magicrew` 字样 0 命中，Beta 里
+      // `https://www.magicrew.ai` 的记录**齐全**。
+      //
+      // ⚠️ 别用「Edge SxS 已被 App Paths 覆盖」来自我安慰：`App Paths` 登记的是
+      // **可执行文件**，本模块要的是 **User Data 目录**，两条腿的取值完全不同。
+      // 旧代码把它们混为一谈，才是这条一直没被发现的真因。
       { browser: 'Edge', root: join(local, 'Microsoft', 'Edge', 'User Data') },
+      { browser: 'Edge Beta', root: join(local, 'Microsoft', 'Edge Beta', 'User Data') },
+      { browser: 'Edge Dev', root: join(local, 'Microsoft', 'Edge Dev', 'User Data') },
+      { browser: 'Edge Canary', root: join(local, 'Microsoft', 'Edge SxS', 'User Data') },
       { browser: 'Chrome', root: join(local, 'Google', 'Chrome', 'User Data') },
+      // ⚠️ 同 Edge：Chrome 的 Beta / Dev / Canary 也是**各自独立的 User Data 目录**。
+      { browser: 'Chrome Beta', root: join(local, 'Google', 'Chrome Beta', 'User Data') },
+      { browser: 'Chrome Dev', root: join(local, 'Google', 'Chrome Dev', 'User Data') },
+      { browser: 'Chrome Canary', root: join(local, 'Google', 'Chrome SxS', 'User Data') },
       { browser: 'Brave', root: join(local, 'BraveSoftware', 'Brave-Browser', 'User Data') },
       { browser: 'Chromium', root: join(local, 'Chromium', 'User Data') },
       { browser: 'Vivaldi', root: join(local, 'Vivaldi', 'User Data') },
@@ -125,24 +151,53 @@ export function magicrewBrowserRoots(): readonly MagicrewBrowserRoot[] {
       { browser: '猎豹浏览器', root: join(local, 'liebao', 'User Data') },
       { browser: 'UC浏览器', root: join(local, 'UCBrowser', 'User Data') },
       { browser: '夸克浏览器', root: join(local, 'Quark', 'User Data') },
-    ]
+    ])
   }
   if (process.platform === 'darwin') {
-    return [
+    return dedupeBrowserRoots([
       { browser: 'Chrome', root: join(home, 'Library/Application Support/Google/Chrome') },
       { browser: 'Edge', root: join(home, 'Library/Application Support/Microsoft Edge') },
       { browser: 'Brave', root: join(home, 'Library/Application Support/BraveSoftware/Brave-Browser') },
       { browser: 'Chromium', root: join(home, 'Library/Application Support/Chromium') },
       { browser: 'Vivaldi', root: join(home, 'Library/Application Support/Vivaldi') },
-    ]
+    ])
   }
-  return [
+  return dedupeBrowserRoots([
     { browser: 'Chrome', root: join(home, '.config/google-chrome') },
     { browser: 'Chromium', root: join(home, '.config/chromium') },
     { browser: 'Edge', root: join(home, '.config/microsoft-edge') },
     { browser: 'Brave', root: join(home, '.config/BraveSoftware/Brave-Browser') },
     { browser: 'Vivaldi', root: join(home, '.config/vivaldi') },
-  ]
+  ])
+}
+
+/**
+ * 按 `root` **不区分大小写**去重，保留**首次出现**的那条。
+ *
+ * ⚠️ 为什么需要它（2026-11-02 加新通道时实测发现）：`Edge SxS` 现在**既**被显式
+ * 列在候选链里（Canary 通道），**又**会被 `registeredBrowserUserDataRoots()`
+ * 经 App Paths 推导出来 —— 同一个目录出现两次。
+ *
+ * 重复本身不会读错（第二次遍历只是重复读同一份 leveldb，白费 IO），但它是一个
+ * **信号**：说明有一行是「复制粘贴后忘改名」写出来的（例如把 `Edge Beta` 抄成
+ * `Edge`，于是两条指向同一目录），而那种错会让某个通道**静默缺失**。
+ * ⇒ 在源头去重，同时用回归用例把「无重复」锁住。
+ *
+ * ⚠️ 判据用 `toLowerCase()` 而不是 `winPathEquals`：本函数跨平台，
+ *    而 `winPathEquals` 只在 win32 语义下成立（大小写不敏感 + 反斜杠归一）。
+ */
+function dedupeBrowserRoots(
+  roots: readonly MagicrewBrowserRoot[],
+): readonly MagicrewBrowserRoot[] {
+  const seen = new Set<string>()
+  const out: MagicrewBrowserRoot[] = []
+  for (const entry of roots) {
+    const key = entry.root.trim().replace(/[\\/]+$/, '').toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(entry)
+  }
+  return out
 }
 
 /** 一个 User Data 根目录下的 profile 目录名（`Default` / `Profile 1` …）。 */
@@ -155,28 +210,23 @@ export function magicrewProfilesOf(root: string): string[] {
 }
 
 /**
- * 一个 profile 的 leveldb 文本（按 **latin1** 拼）。
+ * 一个 profile 的 leveldb 文本视图。
  *
- * ⚠️ latin1 而不是 utf8：leveldb 文件是二进制，utf8 解码会把非法字节换成 U+FFFD、
- * 长度也会变 —— 而窗口是按字节位置算的。latin1 是**逐字节**映射，位置不变。
+ * ⚠️⚠️ **必须走 {@link leveldbText}（结构化解析），不能把整文件当 latin1 正则扫**。
+ *
+ * 旧实现就是后者，它能跑通纯属侥幸：只读到那些**恰好落在未压缩块里、且没被块
+ * 边界切开**的短值。而登录态 `{"key":"authorization","value":"eyJ…"}` 是 200+ 字节
+ * 的长值 —— 在真实 Chromium 数据里它落在 **snappy 压缩块**内，明文正则**必然失配**
+ * ⇒ `not-found` ⇒ 面板反过来提示「请先在浏览器里登录」。
+ * 2026-11-02 用户报障「MagiCrew (国际版)：我在网页登录了，为什么没识别到」
+ * 就是这个：用户照着提示重登一次、照样读不到（**不可能自愈**）。
+ *
+ * 本机实测对比（同一份 `User Data\Default`，22MB）：
+ * - 旧做法：读出 111 条记录（全部来自未压缩的 `.log`），`.ldb` 一条都没有
+ * - 新做法：读出 8692 条，`MAGIC:user:authorization` 与 `organizationCode` 齐全
  */
 function leveldbTextForProfile(root: string, profile: string): string {
-  const dir = join(root, profile, 'Local Storage', 'leveldb')
-  let files: string[]
-  try {
-    files = readdirSync(dir)
-  } catch {
-    return ''
-  }
-  let text = ''
-  for (const file of files) {
-    try {
-      text += readFileSync(join(dir, file)).toString('latin1')
-    } catch {
-      // 单个文件读不到（被浏览器独占 / 权限）⇒ 跳过，不影响其余文件。
-    }
-  }
-  return text
+  return leveldbText(join(root, profile, 'Local Storage', 'leveldb'))
 }
 
 /**
