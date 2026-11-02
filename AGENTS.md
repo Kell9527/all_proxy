@@ -671,6 +671,44 @@ api_key**，而签发会吊销旧 key ⇒ 不写回的话那条账号手里是�
 
 ### 三档积分 + 永久锁（`credit-expiry-rank.ts`，共享层；`magicrew-expiry-rank.ts` 只是薄转发）
 
+### 面板那一行三档文案的五条判据（`plugin-src/client/credit-expiry.js`）
+
+用户给的参考截图就是这五条同时生效的形态，本项目 2026-11-02 才补齐后三条：
+
+```
+永久 500 · 临期 3977.97（其中 100 于 9 小时 13 分钟后到期）
+  ├ 永久 = 服务端未给到期时间，不会作废
+  ├ 长期 = 有到期时间，距扣费截止还有 15 天以上
+  └ 临期 = 距扣费截止不足 15 天，优先消耗
+共 3 个资源包，3 个有效
+个人体验版: 500 / 500
+新用户专属福利: 3877.97 / 4000 · 距到期 12 天（12 天内到期）
+每日签到有礼: 100 / 100 · 距到期 1 天（1 天内到期）
+```
+
+1. **★ 倒计时是「其中」限定语，不是临期总额的期限**（`earliestExpiringAmount`）。
+   临期总额必须是**全部**临期批次之和（三档合计 === total，用户一算就平），
+   而倒计时只指向**最早那批** ⇒ 必须写成「临期 3977.97（其中 100 于 9 小时…后到期）」。
+   ⚠️ 若把倒计时直接贴在总额后面（本项目改前就是「临期 3977.97（9 小时 13 分钟）」），
+   会被读成「这 3977.97 全部在 9 小时后一起作废」—— 而实际只有 100。
+   ⚠️ 「其中」只在**最早那批量 < 临期总额**时出现（否则那两个字是废话）；
+   全无日期的批次 ⇒ **不编造倒计时**。
+2. **★ 已过期必须独立一桶**，不能留在 `expiring`。这类包是「`active: true` 但到期
+   时刻已过」—— 服务端仍算它有效、余额照返，所以**一定**会出现在 `packages` 里
+   （TRAE / Qoder 的 `active` 是硬编码 `true`）。混进临期的后果是「面板写临期 7、
+   同一个包的附注写已过期」——一条数据两个说法。守恒变四段：
+   `permanent + longTerm + expiring + expired === total`。
+3. **★ 逐包明细必须带到期附注**（`formatExpiryHint`）：只显示 `剩余 / 总额` 的话，
+   用户看不出这一包是明天作废还是一个月后，而「先花哪一笔」正是靠它决定的。
+   ⚠️ 「已过期」要在**本函数内部**就截住，否则会拼出「距到期 -3 天（已过期）」，
+   一半修好一半没修比全错更难看（`Math.ceil(-0.5) === -0` 还会写「0 天」）。
+4. **三档图例常驻**（`EXPIRY_TIER_PROVIDERS` + ≥1 个账号）：颜色本身不自明 ——
+   「永久」绿与「长期」黄的区别是「服务端到底给没给到期时间」，用户靠猜会得出
+   相反结论。文案里的天数必须用**后端下发的 `windowDays`**，写死 15 会与筛号口径分家。
+5. **判据全部走 `packageExpiryMs` 一份**：分桶、倒计时、逐包附注、选号四个出口
+   若各算一次，同一个包会给出不同结论（来源记过「分到临期桶、日期列也对、
+   标签却说不知道」的三处自相矛盾）。
+
 ⚠️ **2026-11-02 起分档实现只有一份**：`src/providers/credit-expiry-rank.ts`。
 `magicrew-expiry-rank.ts` 保留历史导出名并转发（`MagicrewExpirySelector` 那一层壳
 只多一个 `product` 维度：两站的 host / 组织码要求不同，查余额必须按站取数）。
@@ -765,9 +803,9 @@ wiring 只透传，**不要在那里再判一次**。
 `officeace-expiry-selector` / `officeace-consume-order` /
 `officeace-remote-catalog` / `qoder-catalog` /
 `raccoon-remote-catalog` / `reasoning-effort-passthrough`）。
-当前 **165 个文件 3744 条用例，全绿**（2026-11-02 实测；较上次登记 +1 文件 +15 条：
-`magicrew-dedupe.spec.ts`（9 条）+ `magicrew-import.spec.ts` 增 4 条判重用例 +
-`login-window-policy.spec.ts` 增 2 条入口覆盖断言）。
+当前 **165 个文件 3754 条用例，全绿**（2026-11-02 实测；`credit-expiry.spec.ts` 由 14 → 24 条：
+新增「已过期独立桶」「earliestExpiringAmount 只记最早那批」「其中 N 于…后到期」
+「逐包到期附注」四组；另 `magicrew-dedupe.spec.ts` 9 条、`permanent-lock-wiring.spec.ts` 30 条）。
 ⚠️ 之前登记的那 4 条「时间相关的既有失败」（`buddy-oauth.spec.ts` 1 条 +
 `officeace-expiry-selector.spec.ts` 3 条，fixture 锚在 2026-10-15）**已修**：
 把锚点改成「相对真实时钟」（`officeace` 的 `NOW` 取当前分钟、`buddy` 的促销

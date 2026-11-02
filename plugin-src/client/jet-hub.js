@@ -27,6 +27,7 @@ import {
   accioResetSeconds,
   expirySplitParts,
   formatAccioResetCountdown,
+  formatExpiryHint,
   formatNamedPoolLine,
   splitCreditsByExpiry,
 } from './credit-expiry.js';
@@ -361,13 +362,31 @@ function formatCreditCoefficient(value) {
   return value.toFixed(2);
 }
 
-/** 把一个包的明细格式化成 tooltip 的一行。 */function formatPackageLine(pkg) {
+/**
+ * 把一个包的明细格式化成 tooltip 的一行。
+ *
+ * ⚠️ **必须带「距到期 N 天（N 天内到期）」的附注**（对齐来源 `formatExpiryHint`）：
+ * 只显示 `remaining / total` 的话，用户看不出这一包是明天就作废还是要一个月后，
+ * 而「该先花哪一笔」正是看这一行决定的（用户给过的那张截图就是这个形态：
+ * 「新用户专属福利: 3877.97 / 4000 · 距到期 12 天（12 天内到期）」）。
+ *
+ * ⚠️ 附注判据走共享的 `formatExpiryHint`（同一份 `packageExpiryMs`），
+ * 不在这里另写一次天数计算 —— 否则分桶说「临期」、附注说「还有 20 天」。
+ *
+ * @param pkg - 积分包。
+ * @param windowDays - 后端随余额下发的分桶窗口；缺省用前端常量。
+ * @param now - 当前时刻（渲染时传，别用缓存值 —— 分类是时间的函数）。
+ */
+function formatPackageLine(pkg, windowDays, now) {
   const remaining = formatCredits(pkg.remaining) ?? '?';
   const total = formatCredits(pkg.total) ?? '?';
   const parts = [`${pkg.active ? '' : '[已失效] '}${pkg.name || '未命名'}: ${remaining} / ${total}`];
   // 失效包显示它自己的失效时间，有效包显示本周期结束时间
   if (!pkg.active && pkg.expiredTime) parts.push(`失效于 ${pkg.expiredTime}`);
   else if (pkg.cycleEndTime) parts.push(`本周期至 ${pkg.cycleEndTime}`);
+  // 到期附注（真·永久 ⇒ 空串 ⇒ 不追加）。⚠️ 已过期的包由它自己回「已过期」。
+  const hint = formatExpiryHint(pkg, windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS, now);
+  if (hint.length > 0) parts.push(hint);
   return parts.join(' · ');
 }
 
@@ -506,7 +525,10 @@ function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays
   }
   const total = formatCredits(balance.total) ?? '0';
   // 明细放进 title，不占版面；账号卡片本身已经信息密集了
-  const detail = (balance.packages || []).map(formatPackageLine).join('\n');
+  // 逐包明细：⚠️ 必须把 windowDays / now 传下去 —— 每包那一行要带「距到期 N 天」。
+  const detail = (balance.packages || [])
+    .map((pkg) => formatPackageLine(pkg, windowDays, Date.now()))
+    .join('\n');
   const all = balance.packages || [];
   const activeCount = all.filter(p => p.active).length;
   /**
@@ -575,20 +597,30 @@ function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays
       ? React.createElement('span', { className: 'dim-jh-creditPools' }, accioNamedPools)
       : null,
     // 三档分桶（带色调；段间用 · 分隔）。名单见上面的 EXPIRY_TIER_PROVIDERS。
+    //
+    // ⚠️ **倒计时是独立的一段文本（`part.countdown`）而不是塞进 `part.text`**
+    //    （对齐来源 `expirySplitParts`）：临期那一格写成「其中 100 于 9 小时 13
+    //    分钟后到期」时，括号里那半句是**另一批**的期限，整段塞在一起会读成
+    //    「这 3977.97 会在 9 小时后一起掉」。
     expiryParts.length > 0
       ? React.createElement('span', { className: 'dim-jh-creditPools' },
           expiryParts.map((part, index) =>
             React.createElement('span', {
               key: part.key,
               'data-tone': part.tone,
+              // 三档的口径说明（对齐来源：用户就是靠这一行图例理解颜色的）
               title: part.key === 'permanent'
-                ? '永久 = 服务端未给到期时间'
+                ? '永久 = 服务端未给到期时间，不会作废'
                 : part.key === 'longTerm'
-                  ? `长期 = 有到期时间，但距扣费截止还有 ${windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS} 天以上`
-                  : '临期 = 距扣费截止不足窗口天数，括号内是最早到期时刻的倒计时',
+                  ? `长期 = 有到期时间，距扣费截止还有 ${windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS} 天以上`
+                  : part.key === 'expired'
+                    ? '已过期 = 到期时间已过（服务端仍把它算作有效，但实际扣不到）'
+                    : '临期 = 距扣费截止不足窗口天数，优先消耗；括号内说明其中多少、何时到期',
             },
             index > 0 ? ' · ' : '',
-            part.text)))
+            part.text,
+            // 倒计时/限定语：单独一格，颜色跟随所属档位。
+            part.countdown ? `（${part.countdown}）` : '')))
       : null,
     // 资源包计数：三档/命名池已经逐包展示时不再重复（accio 恒 active，
     // 「3/3 个资源包有效」仍有信息量，故保留）。
@@ -2778,6 +2810,31 @@ function ProviderPanel({ provider, rpcCall }) {
           target: '_blank',
           rel: 'noopener noreferrer',
         }, loginUrlForManual))
+      : null,
+    // 三档口径图例（仅走三档分桶的 provider；≥1 个账号时恒显示）。
+    //
+    // ⚠️ 为什么要常驻图例（用户给的截图里就有这三行）：颜色本身不自明 ——
+    //    「永久」绿和「长期」黄的区别是「服务端到底给没给到期时间」，
+    //    用户靠猜会得出相反结论（以为长期 = 永远不会作废）。
+    //
+    // ⚠️ 必须带上**当前窗口天数**：文案里「15 天」这个数字来自后端下发，
+    //    写死会让它与实际筛号口径分家。
+    EXPIRY_TIER_PROVIDERS.includes(provider) && accounts.length > 0
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'info',
+          role: 'note',
+          'aria-label': '积分分档说明',
+        },
+        React.createElement('div', null,
+          // 纯文本（不走 markdown），口径与 `credit-expiry.js` 的三档判据逐字一致。
+          '永久 = 服务端未给到期时间，不会作废'),
+        React.createElement('div', null,
+          `长期 = 有到期时间，距扣费截止还有 ${windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS} 天以上`),
+        React.createElement('div', null,
+          `临期 = 距扣费截止不足 ${windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS} 天，优先消耗`),
+        React.createElement('div', null,
+          '已过期 = 到期时间已过（服务端仍算它有效，但实际扣不到）'))
       : null,
     // Magicrew 两站的「怎么加账号」二选一弹窗（对齐来源 `MagicrewImportModal`）。
     //

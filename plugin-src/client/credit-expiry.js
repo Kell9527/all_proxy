@@ -39,16 +39,44 @@ export function packageExpiryMs(pkg) {
 }
 
 /**
- * 把积分包按到期时间分到三档。
+ * 把积分包按到期时间分到三档（外加一个独立的「已过期」桶）。
  *
  * @param packages - `CreditBalance.packages`（可含失效包）。
  * @param windowDays - 「长期 / 临期」的分界天数。
  * @param now - 当前时刻（测试注入）。
- * @returns 三档各自剩余合计 + 最早的临期到期时刻（无临期包时为 null）。
+ * @returns 三档各自剩余合计 + 最早的临期到期时刻/批次量（无临期包时为 null/0）
+ *   + 已作废但仍 `active` 的量（`expired`，为 0 时**不出现**该键）。
  */
 export function splitCreditsByExpiry(packages, windowDays, now = Date.now()) {
   const windowMs = Math.max(0, Number(windowDays)) * 24 * 60 * 60 * 1000;
-  const split = { permanent: 0, longTerm: 0, expiring: 0, earliestExpiringAt: null };
+  /**
+   * ⚠️ `expired` 必须**独立一桶**，不能留在 `expiring` 里（来源对抗审计 B1）。
+   *
+   * 这类包是「`active: true` 但到期时刻已过」：服务端仍把它们算作有效、
+   * 余额也照常返回，于是它们**一直会出现在 `packages` 里**（可达性不是假设
+   * —— TRAE / Qoder 的 `active` 是**硬编码 true**，从不反映是否过期）。
+   *
+   * 混进 `expiring` 的后果是**面板与行为相反**：面板写「临期 7」却没有倒计时
+   * （`earliestExpiringAt` 只取未来时刻），而同一个包的附注写「已过期」——
+   * 一条数据两个说法。
+   */
+  let expired = 0;
+  const split = {
+    permanent: 0,
+    longTerm: 0,
+    expiring: 0,
+    earliestExpiringAt: null,
+    /**
+     * **最早那批**到期时刻对应的量（与 {@link earliestExpiringAt} 配对）。
+     *
+     * ⚠️ 为什么必须有它（来源 2026-10-20 报障「怎么可能全都同一天到期」）：
+     * 把窗口内**所有**批次累加成 `expiring`、而倒计时只指向**最早**那一批，
+     * 显示成「临期 20856（4 天 20 小时）」会让用户以为**这 20856 会在
+     * 4 天 20 小时后一起掉**，实际最早那批只有 19656。
+     * ⇒ 文案改成「临期 20856（其中 19656 于 4 天 20 小时后到期）」。
+     */
+    earliestExpiringAmount: 0,
+  };
   for (const pkg of packages || []) {
     if (!pkg || pkg.active !== true) continue;
     const remaining = Number(pkg.remaining);
@@ -56,16 +84,26 @@ export function splitCreditsByExpiry(packages, windowDays, now = Date.now()) {
     const end = packageExpiryMs(pkg);
     if (end === null) {
       split.permanent += remaining;
+    } else if (end <= now) {
+      // ⚠️ 已作废：**不进** `expiring`，否则面板说「临期」而它扣不到。
+      expired += remaining;
     } else if (end - now < windowMs) {
       split.expiring += remaining;
-      if (end > now && (split.earliestExpiringAt === null || end < split.earliestExpiringAt)) {
+      if (split.earliestExpiringAt === null || end < split.earliestExpiringAt) {
+        // 出现**更早**的批次 ⇒ 该量取代之前的（两批不是同一批，不能相加）。
         split.earliestExpiringAt = end;
+        split.earliestExpiringAmount = remaining;
+      } else if (end === split.earliestExpiringAt) {
+        // 同一批次（同刻并列）⇒ 累加。
+        split.earliestExpiringAmount += remaining;
       }
     } else {
       split.longTerm += remaining;
     }
   }
-  return split;
+  // ⚠️ `expired` 只在**真有已作废额度时**才出现（与「无值即不写键」同款式）：
+  //    否则每个调用方都要为「多一个恒 0 的键」改断言，而它对 0 值毫无信息量。
+  return expired > 0 ? { ...split, expired } : split;
 }
 
 /**
@@ -86,12 +124,46 @@ export function expirySplitParts(split, formatForUnit, now = Date.now()) {
   }
   if (split.expiring > 0) {
     const countdown = expiryCountdown(split.earliestExpiringAt, now);
+    /**
+     * ★ 倒计时降级成「其中」限定语（来源 2026-10-20 + 后续修正）。
+     *
+     * 两个约束必须同时满足：
+     * 1. **数字 = 临期总额**（三档合计守恒，用户一算就平）；
+     * 2. **倒计时只覆盖其中一批**，必须说清「其中」——
+     *    否则「临期 20856（4 天 20 小时）」会被读成「全部同时到期」。
+     *
+     * ⚠️ 「其中」只在**倒计时那批量 < 临期总额**时出现：否则「其中 3500 于…」
+     * 里的「其中」是废话（它本来就是全部）。
+     *
+     * ⚠️ 全无日期的临期批次（`earliestExpiringAmount === 0`）⇒ **不编造倒计时**。
+     */
+    const earliestAmount = Number.isFinite(split.earliestExpiringAmount)
+      && split.earliestExpiringAmount > 0
+      ? split.earliestExpiringAmount
+      : 0;
+    const partial = earliestAmount > 0 && earliestAmount < split.expiring;
+    const countdownText = countdown.length === 0
+      ? ''
+      : partial
+        ? `其中 ${formatForUnit(earliestAmount)} 于 ${countdown}后到期`
+        : countdown;
     parts.push({
       key: 'expiring',
-      text: countdown.length > 0
-        ? `临期 ${formatForUnit(split.expiring)}（${countdown}）`
-        : `临期 ${formatForUnit(split.expiring)}`,
+      text: `临期 ${formatForUnit(split.expiring)}`,
       tone: 'error',
+      ...(countdownText.length > 0 ? { countdown: countdownText } : {}),
+    });
+  }
+  /**
+   * ★ 「已过期」单列一段：那些额度**已经扣不到了**，但 `active` 仍是 true，
+   * 所以会一直出现在 `packages` 里。与临期**必须分开** —— 混进去会得到
+   * 「面板写临期、附注写已过期」这种一条数据两个说法。
+   */
+  if (Number.isFinite(split.expired) && split.expired > 0) {
+    parts.push({
+      key: 'expired',
+      text: `已过期 ${formatForUnit(split.expired)}`,
+      tone: 'dim',
     });
   }
   return parts;
@@ -111,6 +183,59 @@ export function expiryCountdown(earliestExpiringAt, now = Date.now()) {
   const mins = totalMinutes % 60;
   if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
   return `${mins} 分钟`;
+}
+
+/**
+ * 这个包属于哪一桶的中文标签（逐包明细的括号用）。
+ *
+ * ⚠️ **「已过期」必须先判**：`active: true` 但到期时刻已过的包会走到这里
+ * （`jet-hub.js` 的 `all = balance?.packages || []` **不过滤**），而旧实现直接
+ * `${Math.ceil(left)} 天内到期` ⇒ 渲染出 **「-3 天内到期」**，`-0.5 天` 更会因
+ * `Math.ceil` 变成「0 天内到期」。
+ * 顺序不能反：先判「未知」，再判「已过期」，最后才按窗口分档。
+ *
+ * @returns `null` = 拿不到窗口天数（调用方据退化成不显示括号）。
+ */
+export function expiryBucketLabel(pkg, windowDays, now = Date.now()) {
+  const days = Number(windowDays);
+  const left = daysUntilExpiry(pkg, now);
+  if (left === null) return '到期时间未知';
+  if (left <= 0) return '已过期';
+  if (!Number.isFinite(days)) return null;
+  return left < days ? `${Math.ceil(left)} 天内到期` : `还有 ${Math.ceil(left)} 天`;
+}
+
+/**
+ * 逐包明细那一行的**到期附注**（`距到期 N 天（N 天内到期）`）。
+ *
+ * ⚠️ 拿不到窗口天数时也要给出「距到期 N 天」—— 它本身就解释了分类依据，
+ * 比只显示一个周期结束时间更可读（套餐周期 ≠ 积分有效期）。
+ *
+ * ⚠️ **已过期必须在这里就截住**：`expiryBucketLabel` 修好「已过期」之后，
+ * 本函数仍会拼出 **「距到期 -3 天（已过期）」** —— 一半修好一半没修比全错更难看。
+ * 「还有几天到期」这个语义只在**未过期**时成立。
+ *
+ * @returns `''` = 该包没有到期时间（真·永久，不显示附注）。
+ */
+export function formatExpiryHint(pkg, windowDays, now = Date.now()) {
+  const left = daysUntilExpiry(pkg, now);
+  if (left === null) return '';
+  if (left <= 0) return '已过期';
+  const days = Math.ceil(left);
+  const label = expiryBucketLabel(pkg, windowDays, now);
+  return label ? `距到期 ${days} 天（${label}）` : `距到期 ${days} 天`;
+}
+
+/**
+ * 该包距到期还剩多少天（小数）；`null` = 服务端没给到期时间（真·永久）。
+ *
+ * ⚠️ 与 {@link packageExpiryMs} **同一份判据**（本仓红线：同一语义不得两套判据）。
+ */
+export function daysUntilExpiry(pkg, now = Date.now()) {
+  const end = packageExpiryMs(pkg);
+  if (end === null) return null;
+  const at = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
+  return (end - at) / (24 * 60 * 60 * 1000);
 }
 
 /**
