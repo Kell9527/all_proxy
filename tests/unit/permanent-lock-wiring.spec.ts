@@ -131,6 +131,59 @@ describe('共享分档层：档位与锁定可用性', () => {
     expect(ranked.map((a) => a.id)).toEqual(['x1', 'x2', 'p1', 'p2'])
     expect(accounts.map((a) => a.id)).toEqual(['p1', 'x1', 'p2', 'x2'])
   })
+
+  /**
+   * ## 临期档内按「最早到期时刻」优先（2026-11-02 用户要求）
+   *
+   * > 「并且优先使用当天过期的」
+   *
+   * 用户的原话点出一个此前的浪费：同属「临期」的两个账号，一个**今天**
+   * 23:59:59 作废、一个 12 天后作废 —— 只按手动顺序选号时，排在前面的那个
+   * 可能是 12 天后的，于是**今天到期的那笔白作废**。
+   * 「临期」这个档位本来就是「不用就没了」，档内不再细分时间等于只做了一半。
+   *
+   * ⚠️ **只有 `expiring` 档内改排序**：其余档（长期/永久）彼此差几天没有
+   * 决策意义，重排会破坏用户手动拖拽的顺序（那类是「手动排序形同虚设」缺陷）。
+   */
+  it('临期档内：当天到期的排在「12 天后到期」之前（即使后者被手动排第一）', () => {
+    const now = Date.parse('2026-11-02T12:00:00+08:00')
+    const accounts = [
+      // 手动排在第一位：12 天后到期
+      { id: 'later', expiring: 3877, earliestExpiringAt: now + 12 * 86_400_000, ok: true },
+      // 手动排在第二位：今天到期（8 小时后）
+      { id: 'today', expiring: 100, earliestExpiringAt: now + 8 * 3_600_000, ok: true },
+    ]
+    expect(rankAccountsByExpiry(accounts).map((a) => a.id)).toEqual(['today', 'later'])
+  })
+
+  it('临期档内：拿不到到期时刻的排在同档「已知更急」之后（但不降档）', () => {
+    // ⚠️ 这条锁的是 `positiveNumber` 的返回值语义：它对无效值返回 **0**，
+    //    若直接当排序键，缺时间的账号会排到**最前**（0 < 任何时刻），
+    //    与「已知最急的优先」正好相反。
+    const now = Date.parse('2026-11-02T12:00:00+08:00')
+    const accounts = [
+      { id: 'no-time', expiring: 50, earliestExpiringAt: null, ok: true },
+      { id: 'soon', expiring: 80, earliestExpiringAt: now + 3_600_000, ok: true },
+    ]
+    const ranked = rankAccountsByExpiry(accounts)
+    expect(ranked.map((a) => a.id)).toEqual(['soon', 'no-time'])
+    // 两者都仍在临期档（缺一个诊断字段不该让它降档 —— 它的临期额度是真的）。
+    for (const account of ranked) {
+      expect(creditExpiryTier(account)).toBe(CREDIT_EXPIRY_TIER.expiring)
+    }
+  })
+
+  it('长期 / 永久档内**不**按时间重排（保住手动顺序）', () => {
+    const now = Date.parse('2026-11-02T12:00:00+08:00')
+    const accounts = [
+      // 手动第一：长期，到期更晚
+      { id: 'long-later', longTerm: 900, earliestExpiringAt: now + 40 * 86_400_000, ok: true },
+      // 手动第二：长期，到期更早
+      { id: 'long-sooner', longTerm: 100, earliestExpiringAt: now + 15 * 86_400_000, ok: true },
+    ]
+    // 档内保持手动顺序 ⇒ long-later 仍在前。
+    expect(rankAccountsByExpiry(accounts).map((a) => a.id)).toEqual(['long-later', 'long-sooner'])
+  })
 })
 
 describe('Qoder 永久哨兵（253402214400000 = 9999-12-31）', () => {

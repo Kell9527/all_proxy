@@ -29,6 +29,7 @@ import {
   formatAccioResetCountdown,
   formatExpiryHint,
   formatNamedPoolLine,
+  sortPackagesForTooltip,
   splitCreditsByExpiry,
 } from './credit-expiry.js';
 import {
@@ -546,9 +547,21 @@ function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays
         error || '查询失败'));
   }
   const total = formatCredits(balance.total) ?? '0';
-  // 明细放进 title，不占版面；账号卡片本身已经信息密集了
-  // 逐包明细：⚠️ 必须把 windowDays / now 传下去 —— 每包那一行要带「距到期 N 天」。
-  const detail = (balance.packages || [])
+  /**
+   * 逐包明细（放进 title，不占版面；账号卡片本身已经信息密集了）。
+   *
+   * ⚠️⚠️ **必须走 `sortPackagesForTooltip`，不能直接 map 原始顺序**
+   * （2026-11-02 用户给的第二张截图：「hover 积分显示列表应该按照到期时间排序，
+   * 最快到期的排到最上面」）：
+   *
+   * - 后端给的 `packages` 是**上游返回顺序**，与「哪笔先作废」无关；
+   * - 它还会带上**已失效 / 剩余为 0 / 已过期**的包（三者判据独立，
+   *   `active: true` 但已过期的包真实存在）⇒ 不滤会得到一份含噪音的清单，
+   *   而「距到期 -3 天（已过期）」这种行会直接误导。
+   *
+   * ⚠️ 必须把 `windowDays` / `now` 传下去 —— 每包那一行要带「距到期 N 天」。
+   */
+  const detail = sortPackagesForTooltip(balance.packages || [], Date.now())
     .map((pkg) => formatPackageLine(pkg, windowDays, Date.now()))
     .join('\n');
   const all = balance.packages || [];
@@ -585,11 +598,51 @@ function CreditBalanceRow({ balance, error, loading, provider, extra, windowDays
       )
     : [];
 
+  /**
+   * hover 标题的**名词解释**那一段（对齐来源 `hoverGlossary`，2026-11-02 补齐）。
+   *
+   * ## ⚠️ 为什么解释要进 title，而不是只靠面板顶部的图例
+   *
+   * 面板顶部那三行图例（`ProviderPanel` 作用域）在**滚动之后**就看不到了，
+   * 而用户 hover 某个数字时正在看的就是那一行 —— 此刻「长期到底指什么」
+   * 必须在**手边**。参考实现也是这么做的（用户给的截图里 tooltip 就是
+   * 「明细 + 三行解释」的合并形态）。
+   *
+   * ## ⚠️ 只拼**当前真的渲染了**的那几条
+   *
+   * 给没走三档的 provider 挂一句「永久 = ...」是纯噪音（它根本没有这个分桶）。
+   *
+   * ## ⚠️ 每条各占**一行**（`\n` 而不是 `\n\n`）
+   *
+   * `\n\n` 是段落分隔，会在原生 tooltip 里多空一行，三档之间显得松散、
+   * 不像一组；单换行能让 `永久 = …` / `长期 = …` / `临期 = …` 等宽对齐，
+   * 用户一眼定位到要看的那条。
+   *
+   * ⚠️ 天数必须用**后端下发的 `windowDays`**（写死 15 会与筛号口径分家）。
+   */
+  const windowForGlossary = windowDays ?? CREDIT_EXPIRY_WINDOW_DAYS;
+  const hoverGlossary = expiryParts.length === 0
+    ? ''
+    : [
+        '永久 = 服务端未给到期时间，不会作废',
+        `长期 = 有到期时间，距扣费截止还有 ${windowForGlossary} 天以上`,
+        `临期 = 距扣费截止不足 ${windowForGlossary} 天，优先消耗`,
+      ].join('\n');
+
+  /**
+   * 最终 title = 名词解释 → 逐包明细（空段自动省略）。
+   *
+   * ⚠️ 明细必须排在**解释之后**：用户 hover 的第一诉求是「哪笔先作废」，
+   * 那是具体数据；解释是查词，放后面。与参考实现（`[lineText, hoverGlossary,
+   * detail]`）同序。
+   */
+  const hoverTitle = [hoverGlossary, detail].filter(Boolean).join('\n\n') || undefined;
+
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     React.createElement('dt', null, '积分'),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
-      title: detail || undefined,
+      title: hoverTitle,
     },
     React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
     isLoomyTwoPools

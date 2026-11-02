@@ -186,6 +186,61 @@ export function expiryCountdown(earliestExpiringAt, now = Date.now()) {
 }
 
 /**
+ * 逐包明细的**排序 + 过滤**（对齐来源 `formatPackageTooltip` 的核心，2026-11-02 补齐）。
+ *
+ * ## 为什么必须重排（用户给的第二张截图）
+ *
+ * > hover 积分显示列表应该按照到期时间排序，最快到期的排到最上面
+ *
+ * 后端给的 `packages` 顺序是**上游返回顺序**（打包顺序或名称顺序），与「哪笔
+ * 先作废」无关。用户要判断「现在该用哪个账号 / 先花哪一笔」，唯一有用的顺序
+ * 就是**最快到期在前**。本项目此前直接按原顺序 `map`，等于把最该看的信息
+ * 埋在末尾。
+ *
+ * ## 三条过滤（命中任一即不显示）
+ *
+ * 1. `active !== true` —— 已失效，扣不到；
+ * 2. 剩余 ≤ 0 —— 没有余额，列出来只是噪音；
+ * 3. 到期时刻已过 —— `active` 却没置 false 的包真实存在（TRAE / Qoder 的
+ *    `active` 是硬编码 `true`，本仓库记过「面板写临期、附注写已过期」）。
+ *
+ * ⚠️ **不能只按 `active` 过滤**：三个判据是**独立**的。
+ *
+ * ## 排序
+ *
+ * - 主键：到期时刻**升序**（最快到期在上）。
+ * - ⚠️ 无到期时间（真·永久）视为 `Infinity` **沉底** —— 语义上它就是
+ *   「最晚到期」，按 0 处理会跑到最上面，**恰好说反**。
+ * - 次键：同一到期时刻内按**剩余量降序**（先看还有钱的包），也让结果确定
+ *   （不依赖引擎的稳定排序）。
+ *
+ * @param packages - `balance.packages`。
+ * @param now - 当前时刻（过滤与排序都是时间的函数，渲染时传）。
+ * @returns 新数组；无可用包时 `[]`（调用方据此不挂 title）。
+ */
+export function sortPackagesForTooltip(packages, now = Date.now()) {
+  if (!Array.isArray(packages) || packages.length === 0) return [];
+  const at = Number.isFinite(now) ? now : Date.now();
+  const usable = packages.filter((pkg) => {
+    if (!pkg || pkg.active !== true) return false;
+    const remaining = Number(pkg.remaining);
+    if (!Number.isFinite(remaining) || remaining <= 0) return false;
+    const end = packageExpiryMs(pkg);
+    // 到期时刻已过 ⇒ 扣不到，不显示（`end === null` = 真·永久，保留）。
+    if (end !== null && end <= at) return false;
+    return true;
+  });
+  return [...usable].sort((a, b) => {
+    const endA = packageExpiryMs(a);
+    const endB = packageExpiryMs(b);
+    const keyA = endA === null ? Infinity : endA;
+    const keyB = endB === null ? Infinity : endB;
+    if (keyA !== keyB) return keyA - keyB;
+    return (Number(b && b.remaining) || 0) - (Number(a && a.remaining) || 0);
+  });
+}
+
+/**
  * 这个包属于哪一桶的中文标签（逐包明细的括号用）。
  *
  * ⚠️ **「已过期」必须先判**：`active: true` 但到期时刻已过的包会走到这里

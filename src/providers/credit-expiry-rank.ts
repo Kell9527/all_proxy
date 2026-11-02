@@ -184,13 +184,57 @@ export function creditTierUsable(
 }
 
 /**
- * 按到期档位排序账号（**稳定排序**：档内保持传入顺序 = 用户手动拖拽顺序）。
+ * 临期档内的排序键：**最早临期到期时刻**；拿不到时返回 `Infinity`（沉底）。
+ *
+ * ⚠️ 与 {@link positiveNumber} 分开写：那个函数对无效值返回 `0`，
+ * 直接当排序键会让「没有到期时刻」的账号排到**最前**（0 < 任何时刻），
+ * 而语义上它只是「不知道有多急」⇒ 必须排在已知急迫的后面。
+ */
+function expiryDueAtOf(account: AccountCreditExpiry): number {
+  const raw = Number(account.earliestExpiringAt)
+  return Number.isFinite(raw) && raw > 0 ? raw : Number.POSITIVE_INFINITY
+}
+
+/**
+ * 按到期档位排序账号。
+ *
+ * ## 排序规则（两层）
+ *
+ * 1. **档间**：`expiring` → `longTerm` → `permanent` → `unknown` → `empty`。
+ * 2. **`expiring` 档内**：按**最早临期到期时刻升序**（越快作废的越先上）。
+ *    其余档内**保持传入顺序** = 用户手动拖拽顺序。
+ *
+ * ## ⚠️ 为什么临期档内要按时间排（2026-11-02 用户要求）
+ *
+ * > 「并且优先使用当天过期的」
+ *
+ * 用户的原话点出了一个此前被漏掉的浪费：**同属「临期」的两个账号，一个今天
+ * 23:59:59 作废、一个 14 天后作废** —— 只按手动顺序选号时，排在前面的那个
+ * 可能正是 14 天后的，于是**今天到期的那笔白作废**。而「临期」这个档位本来
+ * 就是「不用就没了」的意思，档内不再细分时间等于只做了一半。
+ *
+ * 实测（用户面板）：账号 A 临期 100（8 小时 15 分钟后到期）、
+ * 账号 B 临期 3877（12 天后到期）—— 旧逻辑选 A 或 B 全看谁被拖在前面。
+ *
+ * ## ⚠️ 为什么**只有** `expiring` 档内改排序
+ *
+ * - `longTerm` 的到期都还在窗口之外（≥ 15 天），彼此差几天没有决策意义，
+ *   而重排会**破坏用户手动顺序**（用户拖到第一位的账号被顶掉，就是「手动排序
+ *   形同虚设」那类缺陷）。
+ * - `permanent` 没有到期时间，排不出先后。
+ * - `unknown` / `empty` 是兜底档，本来就排在末尾。
+ *
+ * ⇒ 这是**最小侵入**的改法：只在「确实会因为等而浪费」的那一档里让时间说话。
+ *
+ * ## ⚠️ 缺 `earliestExpiringAt` 的账号排在**同档有时间的之后**
+ *
+ * 拿不到最早到期时刻（查询部分失败 / 包没日期）时无法判断急迫性，
+ * 排在已知急迫的后面，但**仍留在 `expiring` 档内**——它的临期额度是真的，
+ * 不能因为缺一个诊断字段就把它降档（那会让它的临期额度照样白作废）。
+ * 同档里两个都缺时间时，回落到手动顺序。
  *
  * 用「装饰 - 排序 - 解装饰」而不是直接比较档位：`Array.prototype.sort` 在 V8
  * 里虽已稳定，但显式带原始下标可让意图自明、且不受引擎实现影响。
- *
- * ⚠️ **档内不重排**是硬要求：用户拖拽调整的顺序必须仍然生效，否则
- * 「手动排序」在这个 provider 上形同虚设（本仓库记录过同类缺陷）。
  *
  * @param accounts - 待排序账号（顺序即手动优先级）。
  * @param options - 分档选项。
@@ -201,8 +245,30 @@ export function rankAccountsByExpiry<T extends AccountCreditExpiry>(
   options: CreditExpiryOptions = {},
 ): T[] {
   return accounts
-    .map((account, index) => ({ account, index, tier: creditExpiryTier(account) }))
-    .sort((a, b) => (a.tier - b.tier) || (a.index - b.index))
+    .map((account, index) => ({
+      account,
+      index,
+      tier: creditExpiryTier(account),
+      /**
+       * 临期档内的排序键：有最早到期时刻的取它，没有的取 `Infinity`（沉底）。
+       *
+       * ⚠️ 只有 `expiring` 档用这个键（见下），其余档拿 `Infinity` 等价于
+       * 「全部并列」⇒ 回落到原始下标（手动顺序）。
+       *
+       * ⚠️ 不能写 `positiveNumber(x) ?? Infinity`：`positiveNumber` 对无效值返回
+       * **`0`**（不是 `undefined`），`??` 永远不触发 ⇒ 缺时间的账号排到**最前**，
+       * 与「已知最急的优先」正好相反。
+       */
+      dueAt: expiryDueAtOf(account),
+    }))
+    .sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier - b.tier
+      // 档内：仅 `expiring` 按到期时刻升序，其余档保持手动顺序。
+      if (a.tier === CREDIT_EXPIRY_TIER.expiring && a.dueAt !== b.dueAt) {
+        return a.dueAt - b.dueAt
+      }
+      return a.index - b.index
+    })
     .map((entry) => entry.account)
 }
 

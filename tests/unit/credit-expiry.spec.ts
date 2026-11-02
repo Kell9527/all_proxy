@@ -10,6 +10,7 @@ import {
   formatExpiryHint,
   formatNamedPoolLine,
   packageExpiryMs,
+  sortPackagesForTooltip,
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
 
@@ -206,6 +207,75 @@ describe('credit-expiry：逐包到期附注（tooltip 每行）', () => {
   it('拿不到窗口天数时仍给「距到期 N 天」（它本身就解释了分类依据）', () => {
     const p = pkg({ expiredTime: new Date(NOW + 12 * DAY).toISOString() })
     expect(formatExpiryHint(p, undefined, NOW)).toBe('距到期 12 天')
+  })
+})
+
+describe('credit-expiry：逐包明细的排序与过滤（tooltip 列表）', () => {
+  /**
+   * 用户给的第二张截图（参考实现的面板）：
+   *
+   * ```
+   * 共 3 个资源包，3 个有效
+   * 个人体验版: 500 / 500
+   * 新用户专属福利: 3877.97 / 4000 · 距到期 12 天（12 天内到期）
+   * 每日签到有礼: 100 / 100 · 距到期 1 天（1 天内到期）
+   * ```
+   *
+   * ⇒ 两个必须成立的性质：**最快到期在前**、**不可用的包不出现**。
+   */
+  it('★ 按到期时刻升序：当天到期 → 12 天后 → 永久（永久沉底）', () => {
+    const list = [
+      // 故意把永久放第一个：按原顺序 map 它就会出现在最上面（用户的抱怨）
+      pkg({ name: '永久包', remaining: 500, total: 500 }),
+      pkg({ name: '12天后', remaining: 3877.97, total: 4000, expiredTime: new Date(NOW + 12 * DAY).toISOString() }),
+      pkg({ name: '今天到期', remaining: 100, total: 100, expiredTime: new Date(NOW + 8 * 3_600_000).toISOString() }),
+    ]
+    expect(sortPackagesForTooltip(list, NOW).map((p) => p.name))
+      .toEqual(['今天到期', '12天后', '永久包'])
+  })
+
+  it('⚠️ 真·永久必须**沉底**，不能按 0 处理跑到最上面（语义上是「最晚到期」）', () => {
+    const list = [
+      pkg({ name: '永久' }),
+      pkg({ name: '远期', expiredTime: new Date(NOW + 200 * DAY).toISOString() }),
+    ]
+    expect(sortPackagesForTooltip(list, NOW).map((p) => p.name)).toEqual(['远期', '永久'])
+  })
+
+  it('三条过滤各自独立生效：失效 / 剩余为 0 / 已过期', () => {
+    const list = [
+      pkg({ name: '正常', remaining: 10, expiredTime: new Date(NOW + DAY).toISOString() }),
+      pkg({ name: '已失效', active: false }),
+      pkg({ name: '零余额', remaining: 0 }),
+      pkg({ name: '已过期', expiredTime: new Date(NOW - 3 * DAY).toISOString() }),
+    ]
+    // ⚠️「已过期」那条尤为关键：它的 `active` 仍是 true（TRAE / Qoder 硬编码），
+    //    只按 active 过滤会把它留在清单里，而它其实一分都扣不到。
+    expect(sortPackagesForTooltip(list, NOW).map((p) => p.name)).toEqual(['正常'])
+  })
+
+  it('同一到期时刻内按剩余量降序（先看还有钱的包，且结果确定）', () => {
+    const same = new Date(NOW + 5 * DAY).toISOString()
+    const list = [
+      pkg({ name: '小', remaining: 10, expiredTime: same }),
+      pkg({ name: '大', remaining: 900, expiredTime: same }),
+    ]
+    expect(sortPackagesForTooltip(list, NOW).map((p) => p.name)).toEqual(['大', '小'])
+  })
+
+  it('不可变：返回新数组，入参顺序不被改写', () => {
+    const list = [
+      pkg({ name: 'A', expiredTime: new Date(NOW + 9 * DAY).toISOString() }),
+      pkg({ name: 'B', expiredTime: new Date(NOW + DAY).toISOString() }),
+    ]
+    const out = sortPackagesForTooltip(list, NOW)
+    expect(out).not.toBe(list)
+    expect(list.map((p) => p.name)).toEqual(['A', 'B'])
+  })
+
+  it('空 / 非数组 ⇒ 空数组（调用方据此不挂 title）', () => {
+    expect(sortPackagesForTooltip([], NOW)).toEqual([])
+    expect(sortPackagesForTooltip(undefined, NOW)).toEqual([])
   })
 })
 
